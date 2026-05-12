@@ -18,7 +18,7 @@ services:
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: USE_BRD_SB
-        value: "true"
+        value: "false"
       - key: BRD_SB_WSS
         sync: false
       - key: SKIP_SQLITE
