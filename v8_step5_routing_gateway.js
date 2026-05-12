@@ -44,27 +44,17 @@ if (!SKIP_SQLITE) {
     console.log('[step5] SKIP_SQLITE=true, local sqlite writes disabled.');
 }
 
-const validLeads = [];
+// Push ALL enriched leads to Catagent — contact info is optional.
+// Hot leads (score>=90 + contact) are also written to local SQLite for fast lookup.
+const validLeads = leads.filter(l => !!l.company_name);
 
 leads.forEach(lead => {
     const hasContact = !!(lead.primary_email || lead.primary_phone);
     const isHot      = lead.confidence_score >= 90 && hasContact;
-
-    if (isHot) {
-        if (insertMain) {
-            insertMain.run(lead.company_name, lead.domain, lead.primary_email, lead.primary_phone, lead.confidence_score, lead.entity_role || null, lead.pillar, new Date().toISOString());
-        }
-        validLeads.push(lead);
-    } else if (lead.domain) {
-        if (insertQueue) {
-            insertQueue.run(lead.company_name, lead.domain, lead.confidence_score);
-        }
-        if (hasContact) {
-            if (insertMain) {
-                insertMain.run(lead.company_name, lead.domain, lead.primary_email, lead.primary_phone, lead.confidence_score, lead.entity_role || null, lead.pillar, new Date().toISOString());
-            }
-            validLeads.push(lead);
-        }
+    if (isHot && insertMain) {
+        insertMain.run(lead.company_name, lead.domain, lead.primary_email, lead.primary_phone, lead.confidence_score, lead.entity_role || null, lead.pillar, new Date().toISOString());
+    } else if (lead.domain && insertQueue) {
+        insertQueue.run(lead.company_name, lead.domain, lead.confidence_score);
     }
 });
 
@@ -124,7 +114,11 @@ function pushToCatagent(items) {
 (async () => {
     if (validLeads.length > 0) {
         console.log(`[step5] Pushing ${validLeads.length} leads to Catagent...`);
-        await pushToCatagent(validLeads);
+        const statusCode = await pushToCatagent(validLeads);
+        if (statusCode < 200 || statusCode >= 300) {
+            console.error(`[step5] Catagent push failed with HTTP ${statusCode} — aborting.`);
+            process.exit(1);
+        }
     } else {
         console.log('[step5] No valid leads to push.');
     }
