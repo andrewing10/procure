@@ -72,7 +72,8 @@ function mapToBulkL1Item(lead) {
         address_line:  lead.snippet?.slice(0, 200) || undefined,
         // Provenance metadata (new optional fields -- safe additions only)
         ...(lead.intent_signal    && { intent_signal:    lead.intent_signal }),
-        ...(lead.source_timestamp && { source_timestamp: lead.source_timestamp }),
+        ...(lead.source_timestamp    && { source_timestamp:    lead.source_timestamp }),
+        ...(lead.inference_breakdown && { inference_breakdown: lead.inference_breakdown }),
     };
 }
 

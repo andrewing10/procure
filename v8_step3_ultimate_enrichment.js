@@ -59,27 +59,64 @@ async function inferBOMGraph(leads) {
 
     for (let i = 0; i < leads.length; i += BOM_BATCH_SIZE) {
         const batch  = leads.slice(i, i + BOM_BATCH_SIZE);
-        const prompt = `As a Supply Chain Analyst, analyze these companies based on their name and snippet.
-1. Determine entity_role: "Manufacturer", "Wholesaler", "Retailer", or "Service".
-2. If Manufacturer/Assembler, deduce 3-5 upstream raw materials/components they procure (BOM). If Retailer/Wholesaler, deduce finished goods they procure.${anchorHint}
-Format: {"results": [{"name": "Exact Name", "role": "...", "pre_procurement_bom": ["item1", "item2"]}]}
-Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: l.snippet })))}`;
+        const prompt = `You are a Supply Chain Intelligence AI. Analyze each company and produce a structured L3 procurement inference.
+
+Rules:
+1. entity_role: "Manufacturer" (makes goods), "Wholesaler" (bulk buys/resells), "Retailer" (end-consumer facing), "Service" (services only).
+2. primary_materials_top3: exactly 3 upstream raw materials or components they must procure (short English snake_case, e.g. "memory_foam").${anchorHint}
+3. procurement_items: array of {category, priority(1-3), source:"bom", type:"explicit"}.
+4. confidence_tier: "High" (unambiguous), "Medium" (probable), "Low" (guessed).
+5. intent_summary: one English sentence — "<Name> is a <role> that procures <top materials> from upstream suppliers."
+6. purchase_cycle: "weekly" | "monthly" | "quarterly" | "annual" — best estimate.
+7. reason_codes: non-empty array from ["BOM_INFERENCE","ENTITY_ROLE_MANUFACTURER","ENTITY_ROLE_WHOLESALER","ENTITY_ROLE_RETAILER","ENTITY_ROLE_SERVICE","SUPPLY_CHAIN_GRAPH"].
+
+Output strict JSON only:
+{"results":[{"name":"Exact Company Name","entity_role":"...","confidence_tier":"...","primary_materials_top3":["...","...","..."],"procurement_items":[{"category":"...","priority":1,"source":"bom","type":"explicit"}],"intent_summary":"...","purchase_cycle":"...","reason_codes":["..."]}]}
+
+Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet || '').slice(0, 120) })))}`;
 
         try {
             const resData = await callGemini(prompt);
-            const bomData = JSON.parse(JSON.parse(resData).candidates[0].content.parts[0].text).results;
-            bomData.forEach(bom => {
-                const lead = batch.find(l => l.company_name === bom.name);
-                if (lead) {
-                    lead.entity_role  = bom.role;
-                    lead.inferred_bom = bom.pre_procurement_bom;
-                    if (bom.role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
-                }
+            const results = JSON.parse(JSON.parse(resData).candidates[0].content.parts[0].text).results;
+            const now = new Date().toISOString();
+            results.forEach(r => {
+                const lead = batch.find(l => l.company_name === r.name);
+                if (!lead) return;
+                lead.entity_role  = r.entity_role || 'Service';
+                lead.inferred_bom = Array.isArray(r.primary_materials_top3) ? r.primary_materials_top3 : [];
+                if (r.entity_role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
+                else if (r.entity_role === 'Wholesaler' || r.entity_role === 'Retailer') lead.confidence_score = (lead.confidence_score || 50) + 10;
+                // Full L3 breakdown — persisted to data_intel_l3_inferred via Step5→bulk API
+                lead.inference_breakdown = {
+                    category:               lead.inferred_bom[0] || null,
+                    entity_role:            r.entity_role,
+                    confidence_tier:        r.confidence_tier || 'Medium',
+                    primary_materials_top3: lead.inferred_bom,
+                    procurement_items:      Array.isArray(r.procurement_items) ? r.procurement_items : [],
+                    intent_summary:         r.intent_summary || '',
+                    purchase_cycle:         r.purchase_cycle || 'quarterly',
+                    reason_codes:           Array.isArray(r.reason_codes) ? r.reason_codes : ['BOM_INFERENCE'],
+                    model_version:          'v8-gemini-l3-v1',
+                    demand_source:          'inferred',
+                    graph_snapshot_version: 'v1',
+                    created_at:             now,
+                    rfq_draft: {
+                        title:        r.intent_summary || '',
+                        description:  r.intent_summary || '',
+                        status:       'open',
+                        visibility:   'public',
+                        source_type:  'l3_inferred',
+                        currency:     'USD',
+                        published_at: now,
+                    },
+                };
             });
             console.log(`[step3] BOM batch ${Math.floor(i / BOM_BATCH_SIZE) + 1} done`);
         } catch (e) {
             console.warn(`[step3] BOM batch ${Math.floor(i / BOM_BATCH_SIZE) + 1} failed: ${e.message}`);
         }
+    }
+
     }
     return leads;
 }
