@@ -16,36 +16,46 @@ const BRD_PROXY = process.env.BRD_PROXY || 'http://brd.superproxy.io:22225';
 const USE_PROXY = process.env.USE_PROXY === 'true';
 
 const PLAYWRIGHT_TIMEOUT = parseInt(process.env.PLAYWRIGHT_TIMEOUT || '15000', 10);
+const BOM_BATCH_SIZE     = parseInt(process.env.BOM_BATCH_SIZE || '20', 10);
 
-async function inferBOMGraph(leads) {
-    if (leads.length === 0) return leads;
-    console.log(`[step3] BOM deduction for ${leads.length} entities...`);
-
-    const prompt = `As a Supply Chain Analyst, analyze these companies based on their name and snippet.
-1. Determine entity_role: "Manufacturer", "Wholesaler", "Retailer", or "Service".
-2. If Manufacturer/Assembler, deduce 3-5 upstream raw materials/components they procure (BOM). If Retailer/Wholesaler, deduce finished goods they procure.
-Format: {"results": [{"name": "Exact Name", "role": "...", "pre_procurement_bom": ["item1", "item2"]}]}
-Input: ${JSON.stringify(leads.map(l => ({ name: l.company_name, snip: l.snippet })))}`;
-
-    const reqData = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
-    const resData = await new Promise(resolve => {
+async function callGemini(promptText) {
+    const reqData = JSON.stringify({ contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
+    return new Promise(resolve => {
         const req = https.request({ hostname: 'generativelanguage.googleapis.com', path: `/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`, method: 'POST', headers: { 'Content-Type': 'application/json' } }, res => {
             let body = ''; res.on('data', c => body += c); res.on('end', () => resolve(body));
         });
         req.on('error', () => resolve(null)); req.write(reqData); req.end();
     });
+}
 
-    try {
-        const bomData = JSON.parse(JSON.parse(resData).candidates[0].content.parts[0].text).results;
-        bomData.forEach(bom => {
-            const lead = leads.find(l => l.company_name === bom.name);
-            if (lead) {
-                lead.entity_role    = bom.role;
-                lead.inferred_bom   = bom.pre_procurement_bom;
-                if (bom.role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
-            }
-        });
-    } catch (e) { console.log(`[step3] BOM inference failed: ${e.message}`); }
+async function inferBOMGraph(leads) {
+    if (leads.length === 0) return leads;
+    console.log(`[step3] BOM deduction for ${leads.length} entities in batches of ${BOM_BATCH_SIZE}...`);
+
+    for (let i = 0; i < leads.length; i += BOM_BATCH_SIZE) {
+        const batch  = leads.slice(i, i + BOM_BATCH_SIZE);
+        const prompt = `As a Supply Chain Analyst, analyze these companies based on their name and snippet.
+1. Determine entity_role: "Manufacturer", "Wholesaler", "Retailer", or "Service".
+2. If Manufacturer/Assembler, deduce 3-5 upstream raw materials/components they procure (BOM). If Retailer/Wholesaler, deduce finished goods they procure.
+Format: {"results": [{"name": "Exact Name", "role": "...", "pre_procurement_bom": ["item1", "item2"]}]}
+Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: l.snippet })))}`;
+
+        try {
+            const resData = await callGemini(prompt);
+            const bomData = JSON.parse(JSON.parse(resData).candidates[0].content.parts[0].text).results;
+            bomData.forEach(bom => {
+                const lead = batch.find(l => l.company_name === bom.name);
+                if (lead) {
+                    lead.entity_role  = bom.role;
+                    lead.inferred_bom = bom.pre_procurement_bom;
+                    if (bom.role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
+                }
+            });
+            console.log(`[step3] BOM batch ${Math.floor(i / BOM_BATCH_SIZE) + 1} done`);
+        } catch (e) {
+            console.warn(`[step3] BOM batch ${Math.floor(i / BOM_BATCH_SIZE) + 1} failed: ${e.message}`);
+        }
+    }
     return leads;
 }
 

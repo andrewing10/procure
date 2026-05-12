@@ -52,6 +52,53 @@ async function run() {
     const b2b = await searchOrganic(`"${category}" ("b2b" OR "directory" OR "suppliers" OR "manufacturers") ${tld} -site:alibaba.com -site:globalsources.com -site:made-in-china.com`, countryCode);
     b2b.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 2 Local B2B' }));
 
+    // Pillar 3: Customs / Import Trade Records
+    // Strategy: query public import-data aggregators (ImportYeti, Volza, Panjiva public pages)
+    // and generic BoL-signal searches. All three paths degrade gracefully on 0 results.
+    console.log(`[step1] Pillar 3: Customs / Import Trade Records...`);
+    try {
+        // Path A: ImportYeti — free public importer profiles
+        const importyeti = await searchOrganic(
+            `site:importyeti.com "${category}" "${countryName}"`,
+            countryCode
+        );
+        importyeti.forEach(o => allLeads.push({
+            title:   o.title,
+            link:    o.link,
+            snippet: o.snippet,
+            pillar:  'Pillar 3 Customs/ImportYeti',
+        }));
+
+        // Path B: Volza / Panjiva public pages
+        const volza = await searchOrganic(
+            `(site:volza.com OR site:panjiva.com) "${category}" importer "${countryName}"`,
+            countryCode
+        );
+        volza.forEach(o => allLeads.push({
+            title:   o.title,
+            link:    o.link,
+            snippet: o.snippet,
+            pillar:  'Pillar 3 Customs/Volza',
+        }));
+
+        // Path C: Generic BoL / customs declaration signal
+        const bol = await searchOrganic(
+            `"${category}" ("bill of lading" OR "customs importer" OR "import record" OR "HS code") "${countryName}" -site:alibaba.com`,
+            countryCode
+        );
+        bol.forEach(o => allLeads.push({
+            title:   o.title,
+            link:    o.link,
+            snippet: o.snippet,
+            pillar:  'Pillar 3 Customs/BoL',
+        }));
+
+        const p3count = importyeti.length + volza.length + bol.length;
+        console.log(`[step1] Pillar 3: ${p3count} customs/trade signals found${p3count === 0 ? ' (no public records for this query — skipping gracefully)' : ''}.`);
+    } catch (e) {
+        console.warn(`[step1] Pillar 3 failed (non-fatal): ${e.message}`);
+    }
+
     // Pillar 4: Social
     console.log(`[step1] Pillar 4: Social...`);
     const social = await searchOrganic(`${baseQuery} "${countryName}" site:linkedin.com/company OR site:facebook.com/groups`, countryCode);
