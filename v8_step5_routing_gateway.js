@@ -72,7 +72,21 @@ function mapToBulkL1Item(lead) {
 
 function pushToCatagent(items) {
     return new Promise(resolve => {
-        const payload  = JSON.stringify({ items: items.map(mapToBulkL1Item) });
+        const mappedItems = items.map(mapToBulkL1Item);
+        // Support both payload shapes:
+        //   - Legacy production format: { batch_id, timestamp, target_database, workflow_used, total_imported, data }
+        //   - Current API format:       { items }
+        // We send the legacy shape first (matches the deployed Vercel version).
+        const payload = JSON.stringify({
+            batch_id:        `v8_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+            timestamp:       new Date().toISOString(),
+            target_database: 'Zhimao Main DB',
+            workflow_used:   'v8-pipeline',
+            total_imported:  mappedItems.length,
+            data:            mappedItems,
+            // Also include the current-schema key so the route accepts either shape
+            items:           mappedItems,
+        });
         const url      = new URL(`${CATAGENT_API_URL}/api/data-intel/l1/procurement/bulk`);
         const headers  = {
             'Content-Type':   'application/json',

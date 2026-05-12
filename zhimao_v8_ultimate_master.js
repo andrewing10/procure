@@ -46,10 +46,12 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
     const outputData = JSON.parse(fs.readFileSync(outputFile, 'utf8'));
     const count = Array.isArray(outputData)
         ? outputData.length
-        : (outputData.organic ? outputData.organic.length
-            : (outputData.data ? outputData.data.length
-                : (outputData.dorks ? outputData.dorks.length
-                    : (outputData.baseQuery ? 1 : 0))));
+        : (outputData.organic         ? outputData.organic.length
+            : (outputData.data        ? outputData.data.length
+                : (outputData.dorks   ? outputData.dorks.length
+                    : (outputData.baseQuery    ? 1
+                        : (outputData.db_injected != null ? outputData.db_injected
+                            : (outputData.status === 'success' ? 1 : 0))))));
 
     if (count === 0 && !stepName.includes("Bridge")) {
         console.warn(`[PIPELINE STOP] Step returned 0 results. Graceful halt.`);

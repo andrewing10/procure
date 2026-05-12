@@ -9,7 +9,7 @@ const [inputFile, outputFile] = process.argv.slice(2);
 const GEMINI_KEY = process.env.GEMINI_KEY;
 if (!GEMINI_KEY) { console.error('[step3] GEMINI_KEY env var is required'); process.exit(1); }
 
-// BrightData proxy â€” optional; set USE_PROXY=true in .env to enable
+// BrightData proxy â€?optional; set USE_PROXY=true in .env to enable
 const BRD_USER  = process.env.BRD_USER  || '';
 const BRD_PASS  = process.env.BRD_PASS  || '';
 const BRD_PROXY = process.env.BRD_PROXY || 'http://brd.superproxy.io:22225';
@@ -21,7 +21,7 @@ const BOM_BATCH_SIZE     = parseInt(process.env.BOM_BATCH_SIZE || '20', 10);
 async function callGemini(promptText) {
     const reqData = JSON.stringify({ contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } });
     return new Promise(resolve => {
-        const req = https.request({ hostname: 'generativelanguage.googleapis.com', path: `/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`, method: 'POST', headers: { 'Content-Type': 'application/json' } }, res => {
+        const req = https.request({ hostname: 'generativelanguage.googleapis.com', path: `/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`, method: 'POST', headers: { 'Content-Type': 'application/json' } }, res => {
             let body = ''; res.on('data', c => body += c); res.on('end', () => resolve(body));
         });
         req.on('error', () => resolve(null)); req.write(reqData); req.end();
@@ -125,9 +125,9 @@ async function run() {
                             await page.goto(contactUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
                             extractFromHTML(await page.content(), emails, phones);
                         }
-                    } catch (_) { /* contact page unreachable â€” ignore */ }
+                    } catch (_) { /* contact page unreachable â€?ignore */ }
                 }
-            } catch (e) { /* timeout / network error â€” continue */ } finally { if (page) await page.close().catch(() => {}); }
+            } catch (e) { /* timeout / network error â€?continue */ } finally { if (page) await page.close().catch(() => {}); }
 
             if (emails.size > 0) l.primary_email = Array.from(emails)[0];
             const cleanPhones = Array.from(phones).filter(p => p.length < 20);
@@ -148,7 +148,7 @@ async function run() {
 
     await browser.close();
     fs.writeFileSync(outputFile, JSON.stringify(enriched, null, 2));
-    console.log(`[step3] Done â€” ${enriched.length} enriched leads â†’ ${outputFile}`);
+    console.log(`[step3] Done â€?${enriched.length} enriched leads â†?${outputFile}`);
 }
 
 run().catch(e => { console.error(e); process.exit(1); });

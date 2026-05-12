@@ -23,7 +23,7 @@ async function run() {
         const reqData  = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, responseMimeType: 'application/json' } });
 
         const resData = await new Promise(resolve => {
-            const req = https.request({ hostname: 'generativelanguage.googleapis.com', path: `/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`, method: 'POST', headers: { 'Content-Type': 'application/json' } }, res => {
+            const req = https.request({ hostname: 'generativelanguage.googleapis.com', path: `/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`, method: 'POST', headers: { 'Content-Type': 'application/json' } }, res => {
                 let body = ''; res.on('data', c => body += c); res.on('end', () => resolve(body));
             });
             req.on('error', () => resolve(null)); req.write(reqData); req.end();
@@ -42,7 +42,7 @@ async function run() {
     }
 
     fs.writeFileSync(outputFile, JSON.stringify({ baseQuery, tld, countryName, countryCode, category }, null, 2));
-    console.log(`[step0] Orchestration written â†’ ${outputFile}`);
+    console.log(`[step0] Orchestration written â†?${outputFile}`);
 }
 
 run().catch(e => { console.error(e); process.exit(1); });
