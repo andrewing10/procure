@@ -116,8 +116,6 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
             console.warn(`[step3] BOM batch ${Math.floor(i / BOM_BATCH_SIZE) + 1} failed: ${e.message}`);
         }
     }
-
-    }
     return leads;
 }
 
