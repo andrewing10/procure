@@ -95,7 +95,23 @@ async function run() {
             console.log(`[step3] Proxy enabled: ${BRD_PROXY}`);
             launchOptions.proxy = { server: BRD_PROXY, username: BRD_USER, password: BRD_PASS };
         }
-        browser = await chromium.launch(launchOptions);
+        // Self-heal: if chromium binary is missing (e.g. Render ephemeral filesystem),
+        // install it on the spot then retry once.
+        try {
+            browser = await chromium.launch(launchOptions);
+        } catch (launchErr) {
+            if (String(launchErr.message).includes("Executable doesn't exist")) {
+                console.log("[step3] Chromium not found — installing now (first-run on this host)...");
+                require('child_process').execSync(
+                    'node ' + require('path').join(__dirname, 'node_modules', '.bin', 'playwright') + ' install chromium --with-deps',
+                    { stdio: 'inherit' }
+                );
+                console.log("[step3] Chromium install complete — retrying launch...");
+                browser = await chromium.launch(launchOptions);
+            } else {
+                throw launchErr;
+            }
+        }
     }
     const context        = await browser.newContext({ ignoreHTTPSErrors: true });
     const mobileContext  = await browser.newContext({ ignoreHTTPSErrors: true, userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36' });
