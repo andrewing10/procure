@@ -3,7 +3,7 @@ services:
     name: zhimao-v8-discovery-worker
     runtime: node
     buildCommand: npm install && npx playwright install --force chromium --with-deps
-    startCommand: node v8_discovery_worker.js
+    startCommand: npx playwright install chromium --with-deps && node v8_discovery_worker.js
     envVars:
       - key: GEMINI_KEY
         sync: false
