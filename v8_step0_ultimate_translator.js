@@ -5,7 +5,8 @@ const https = require('https');
 const [inputFile, outputFile, countryCode, ...catArgs] = process.argv.slice(2);
 const category = catArgs.join(' ') || 'Industrial';
 
-const GEMINI_KEY = process.env.GEMINI_KEY;
+const GEMINI_KEY   = process.env.GEMINI_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
 if (!GEMINI_KEY) { console.error('[step0] GEMINI_KEY env var is required'); process.exit(1); }
 
 const COUNTRY_NAMES = { mx: 'Mexico', ae: 'UAE', vn: 'Vietnam', sg: 'Singapore', us: 'United States', id: 'Indonesia', th: 'Thailand', my: 'Malaysia', sa: 'Saudi Arabia', br: 'Brazil', co: 'Colombia', de: 'Germany' };
@@ -23,7 +24,7 @@ async function run() {
         const reqData  = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, responseMimeType: 'application/json' } });
 
         const resData = await new Promise(resolve => {
-            const req = https.request({ hostname: 'generativelanguage.googleapis.com', path: `/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`, method: 'POST', headers: { 'Content-Type': 'application/json' } }, res => {
+            const req = https.request({ hostname: 'generativelanguage.googleapis.com', path: `/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`, method: 'POST', headers: { 'Content-Type': 'application/json' } }, res => {
                 let body = ''; res.on('data', c => body += c); res.on('end', () => resolve(body));
             });
             req.on('error', () => resolve(null)); req.write(reqData); req.end();
@@ -42,7 +43,7 @@ async function run() {
     }
 
     fs.writeFileSync(outputFile, JSON.stringify({ baseQuery, tld, countryName, countryCode, category }, null, 2));
-    console.log(`[step0] Orchestration written â†?${outputFile}`);
+    console.log(`[step0] Orchestration written ??${outputFile}`);
 }
 
 run().catch(e => { console.error(e); process.exit(1); });
