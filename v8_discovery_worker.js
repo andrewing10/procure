@@ -84,11 +84,13 @@ async function markRunning(jobId) {
 }
 
 async function countIntelRows(countryIso, category) {
+  // semantic_intent is text[] — ilike doesn't work on arrays.
+  // Count all rows for this country written by this pipeline run instead.
   const { count } = await supabase
     .from('data_intel_l1_companies')
     .select('company_id', { count: 'exact', head: true })
-    .ilike('country', countryIso)
-    .or(`semantic_intent.ilike.%${category}%,intent_summary.ilike.%${category}%,snippet.ilike.%${category}%`);
+    .eq('country', countryIso.toUpperCase())
+    .eq('source', 'v8-pipeline');
   return Number(count || 0);
 }
 
