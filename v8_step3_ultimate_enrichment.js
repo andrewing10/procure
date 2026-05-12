@@ -15,6 +15,8 @@ const BRD_USER  = process.env.BRD_USER  || '';
 const BRD_PASS  = process.env.BRD_PASS  || '';
 const BRD_PROXY = process.env.BRD_PROXY || 'http://brd.superproxy.io:22225';
 const USE_PROXY = process.env.USE_PROXY === 'true';
+const USE_BRD_SB = process.env.USE_BRD_SB === 'true';
+const BRD_SB_WSS = process.env.BRD_SB_WSS || '';
 
 const PLAYWRIGHT_TIMEOUT = parseInt(process.env.PLAYWRIGHT_TIMEOUT || '15000', 10);
 const BOM_BATCH_SIZE     = parseInt(process.env.BOM_BATCH_SIZE || '20', 10);
@@ -78,14 +80,23 @@ async function run() {
 
     leads = await inferBOMGraph(leads);
 
-    const launchOptions = { headless: true };
-    if (USE_PROXY) {
-        if (!BRD_USER || !BRD_PASS) { console.error('[step3] USE_PROXY=true but BRD_USER/BRD_PASS not set'); process.exit(1); }
-        console.log(`[step3] Proxy enabled: ${BRD_PROXY}`);
-        launchOptions.proxy = { server: BRD_PROXY, username: BRD_USER, password: BRD_PASS };
+    let browser;
+    if (USE_BRD_SB) {
+        if (!BRD_SB_WSS) {
+            console.error('[step3] USE_BRD_SB=true but BRD_SB_WSS not set');
+            process.exit(1);
+        }
+        console.log('[step3] Using BrightData Scraping Browser via CDP');
+        browser = await chromium.connectOverCDP(BRD_SB_WSS);
+    } else {
+        const launchOptions = { headless: true };
+        if (USE_PROXY) {
+            if (!BRD_USER || !BRD_PASS) { console.error('[step3] USE_PROXY=true but BRD_USER/BRD_PASS not set'); process.exit(1); }
+            console.log(`[step3] Proxy enabled: ${BRD_PROXY}`);
+            launchOptions.proxy = { server: BRD_PROXY, username: BRD_USER, password: BRD_PASS };
+        }
+        browser = await chromium.launch(launchOptions);
     }
-
-    const browser        = await chromium.launch(launchOptions);
     const context        = await browser.newContext({ ignoreHTTPSErrors: true });
     const mobileContext  = await browser.newContext({ ignoreHTTPSErrors: true, userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36' });
 

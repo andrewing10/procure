@@ -19,23 +19,30 @@ const [inputFile, outputFile] = process.argv.slice(2);
 
 const CATAGENT_API_URL = (process.env.CATAGENT_API_URL || '').replace(/\/$/, '');
 const CATAGENT_API_KEY = process.env.CATAGENT_API_KEY || '';
+const DISCOVERY_JOB_ID = process.env.DISCOVERY_JOB_ID || null;
+const SKIP_SQLITE = process.env.SKIP_SQLITE === 'true';
 if (!CATAGENT_API_URL) { console.error('[step5] CATAGENT_API_URL env var is required'); process.exit(1); }
 
 const leads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
 
 // ── Local SQLite ────────────────────────────────────────────────────────────
-const db = new Database('zhimao_v8_matrix.sqlite');
-db.exec(`CREATE TABLE IF NOT EXISTS main_db (
-    company_name TEXT UNIQUE, domain TEXT, country TEXT,
-    primary_email TEXT, primary_phone TEXT,
-    confidence_score INTEGER, entity_role TEXT, source TEXT, timestamp TEXT
-)`);
-db.exec(`CREATE TABLE IF NOT EXISTS enrichment_queue (
-    company_name TEXT UNIQUE, domain TEXT, score INTEGER, retries INTEGER DEFAULT 0
-)`);
-
-const insertMain  = db.prepare(`INSERT OR IGNORE INTO main_db (company_name, domain, primary_email, primary_phone, confidence_score, entity_role, source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-const insertQueue = db.prepare(`INSERT OR IGNORE INTO enrichment_queue (company_name, domain, score) VALUES (?, ?, ?)`);
+let insertMain = null;
+let insertQueue = null;
+if (!SKIP_SQLITE) {
+    const db = new Database('zhimao_v8_matrix.sqlite');
+    db.exec(`CREATE TABLE IF NOT EXISTS main_db (
+        company_name TEXT UNIQUE, domain TEXT, country TEXT,
+        primary_email TEXT, primary_phone TEXT,
+        confidence_score INTEGER, entity_role TEXT, source TEXT, timestamp TEXT
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS enrichment_queue (
+        company_name TEXT UNIQUE, domain TEXT, score INTEGER, retries INTEGER DEFAULT 0
+    )`);
+    insertMain = db.prepare(`INSERT OR IGNORE INTO main_db (company_name, domain, primary_email, primary_phone, confidence_score, entity_role, source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+    insertQueue = db.prepare(`INSERT OR IGNORE INTO enrichment_queue (company_name, domain, score) VALUES (?, ?, ?)`);
+} else {
+    console.log('[step5] SKIP_SQLITE=true, local sqlite writes disabled.');
+}
 
 const validLeads = [];
 
@@ -44,12 +51,18 @@ leads.forEach(lead => {
     const isHot      = lead.confidence_score >= 90 && hasContact;
 
     if (isHot) {
-        insertMain.run(lead.company_name, lead.domain, lead.primary_email, lead.primary_phone, lead.confidence_score, lead.entity_role || null, lead.pillar, new Date().toISOString());
+        if (insertMain) {
+            insertMain.run(lead.company_name, lead.domain, lead.primary_email, lead.primary_phone, lead.confidence_score, lead.entity_role || null, lead.pillar, new Date().toISOString());
+        }
         validLeads.push(lead);
     } else if (lead.domain) {
-        insertQueue.run(lead.company_name, lead.domain, lead.confidence_score);
+        if (insertQueue) {
+            insertQueue.run(lead.company_name, lead.domain, lead.confidence_score);
+        }
         if (hasContact) {
-            insertMain.run(lead.company_name, lead.domain, lead.primary_email, lead.primary_phone, lead.confidence_score, lead.entity_role || null, lead.pillar, new Date().toISOString());
+            if (insertMain) {
+                insertMain.run(lead.company_name, lead.domain, lead.primary_email, lead.primary_phone, lead.confidence_score, lead.entity_role || null, lead.pillar, new Date().toISOString());
+            }
             validLeads.push(lead);
         }
     }
@@ -86,6 +99,7 @@ function pushToCatagent(items) {
             data:            mappedItems,
             // Also include the current-schema key so the route accepts either shape
             items:           mappedItems,
+            discovery_job_id: DISCOVERY_JOB_ID,
         });
         const url      = new URL(`${CATAGENT_API_URL}/api/data-intel/l1/procurement/bulk`);
         const headers  = {
