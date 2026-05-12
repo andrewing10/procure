@@ -1,0 +1,19 @@
+{
+  "name": "v8-pipeline-core",
+  "version": "1.0.0",
+  "description": "Zhimao V8 Ultimate Omni-Matrix — multi-pillar B2B buyer discovery pipeline",
+  "main": "zhimao_v8_ultimate_master.js",
+  "scripts": {
+    "loop":   "node v8_infinite_loop.js",
+    "cron":   "node v8_cron_worker.js",
+    "run":    "node zhimao_v8_ultimate_master.js"
+  },
+  "dependencies": {
+    "axios":          "^1.16.0",
+    "better-sqlite3": "^12.9.0",
+    "cheerio":        "^1.2.0",
+    "dotenv":         "^17.4.2",
+    "node-fetch":     "^2.7.0",
+    "playwright":     "^1.60.0"
+  }
+}

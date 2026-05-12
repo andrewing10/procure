@@ -1,0 +1,167 @@
+{
+  "industries": {
+    "Consumer Electronics": {
+      "subcategories": [
+        "Smartphones",
+        "Laptops",
+        "Audio Equipment",
+        "Wearables",
+        "Smart Home",
+        "Accessories",
+        "Drones",
+        "Smart Wearables",
+        "TWS Earbuds",
+        "Power Banks",
+        "Smart Home Sensors",
+        "AR/VR Headsets"
+      ],
+      "b2b_intent_modifiers": [
+        "wholesaler",
+        "distributor",
+        "importer"
+      ]
+    },
+    "Industrial Machinery": {
+      "subcategories": [
+        "Packaging Machinery",
+        "Food Processing",
+        "CNC Machines",
+        "Textile Machinery",
+        "Construction Equipment"
+      ],
+      "b2b_intent_modifiers": [
+        "distributor",
+        "buyer",
+        "procurement"
+      ]
+    },
+    "Automotive Parts": {
+      "subcategories": [
+        "Engine Parts",
+        "Brake Systems",
+        "Suspension",
+        "Tires",
+        "Car Electronics",
+        "Accessories",
+        "Brake Pads",
+        "LED Headlights",
+        "Suspension Systems",
+        "EV Motors"
+      ],
+      "b2b_intent_modifiers": [
+        "distributor",
+        "importer",
+        "wholesale"
+      ]
+    },
+    "Medical & Health": {
+      "subcategories": [
+        "Medical Devices",
+        "Dental Supplies",
+        "Consumables",
+        "Hospital Furniture",
+        "Rehabilitation",
+        "Rehabilitation Equipment",
+        "Dental Consumables",
+        "Aesthetics Devices",
+        "Orthopedic Implants"
+      ],
+      "b2b_intent_modifiers": [
+        "distributor",
+        "importer",
+        "procurement"
+      ]
+    },
+    "Building Materials": {
+      "subcategories": [
+        "Flooring",
+        "Roofing",
+        "Ceramics",
+        "Sanitary Ware",
+        "Doors & Windows",
+        "Hardware"
+      ],
+      "b2b_intent_modifiers": [
+        "wholesaler",
+        "importer",
+        "contractor"
+      ]
+    },
+    "Home Appliances": {
+      "subcategories": [
+        "Mattresses & Bedding",
+        "Humidifiers & Air Purifiers",
+        "Air Conditioners",
+        "Kitchen Appliances",
+        "Washing Machines",
+        "Refrigerators"
+      ],
+      "b2b_intent_modifiers": [
+        "wholesaler",
+        "distributor",
+        "importer"
+      ]
+    },
+    "Apparel & Textiles": {
+      "subcategories": [
+        "Women Clothing",
+        "Men Clothing",
+        "Fabrics",
+        "Yarn",
+        "Footwear"
+      ],
+      "b2b_intent_modifiers": [
+        "wholesaler",
+        "importer",
+        "buyer"
+      ]
+    },
+    "Renewable Energy": {
+      "subcategories": [
+        "Solar Panels",
+        "Inverters",
+        "Wind Turbines",
+        "Energy Storage",
+        "Batteries",
+        "Solar Inverters",
+        "LifePO4 Batteries",
+        "Wind Turbine Parts",
+        "EV Charging Stations"
+      ],
+      "b2b_intent_modifiers": [
+        "distributor",
+        "installer",
+        "importer"
+      ]
+    },
+    "Agriculture & Food": {
+      "subcategories": [
+        "Fertilizers",
+        "Agricultural Machinery",
+        "Seeds",
+        "Processed Food",
+        "Beverages"
+      ],
+      "b2b_intent_modifiers": [
+        "distributor",
+        "importer",
+        "wholesaler"
+      ]
+    },
+    "Chemicals": {
+      "subcategories": [
+        "Industrial Chemicals",
+        "Agrochemicals",
+        "Plastics",
+        "Rubber",
+        "Adhesives"
+      ],
+      "b2b_intent_modifiers": [
+        "distributor",
+        "importer",
+        "buyer"
+      ]
+    }
+  },
+  "last_updated": "2026-04-21T13:29:32.992Z"
+}

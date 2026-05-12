@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Secrets — NEVER commit
+.env
+*.env
+api_credentials.*
+
+# Runtime data & session outputs
+v8_ultimate_*/
+*.sqlite
+*.log
+*.log.txt
+
+# Lead data & exports (business sensitive)
+*_output.json
+*_latest.json
+*_export.*
+*_import*.json
+*_leads*.json
+ops_hot_inbox*.json
+zhimao_main_db*
+zhimao_dead_letter*
+zhimao_regional_pool*
+zhimao_seed_intelligence.json
+zhimao_matrix_state*.json
+sweep_state.json
+global_hash_registry.json
+enrichment_queue.json
+
+# OS
+.DS_Store
+Thumbs.db
