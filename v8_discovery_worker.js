@@ -1,6 +1,17 @@
 require('dotenv').config();
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
+
+// Self-heal: ensure Playwright Chromium binary is present before the first job runs.
+// Render's build and runtime filesystems are separate; the browser cache from buildCommand
+// does not persist into the worker process. This runs once at startup (~30s on cold start).
+try {
+  console.log('[worker] ensuring playwright chromium is installed...');
+  execSync('npx playwright install chromium --with-deps', { stdio: 'inherit' });
+  console.log('[worker] playwright chromium ready');
+} catch (e) {
+  console.warn('[worker] playwright install warning (may already be present):', e.message);
+}
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
