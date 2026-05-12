@@ -33,6 +33,8 @@ async function run() {
         const prompt  = `Extract exact formal Company Name from each item.
 [CRITICAL RULES]
 1. ANTI-POLLUTION: If the snippet indicates the company is based in China, or is a Chinese exporter/supplier selling abroad, YOU MUST return null.
+2. ANTI-BLOG: If the title/snippet is a listicle, article, review, or guide (e.g. "Top 10 ...", "Best ... for ...", "How to ...", "Guide to ...", "X things you should ...", "Review:", "vs."), YOU MUST return null — we only want real buyer company entities.
+3. ANTI-PLATFORM: If the result is a known marketplace, directory platform, or aggregator (Alibaba, Amazon, Thomasnet, etc.) rather than an end-buyer company, return null.
 Format: {"results": [{"company_name": "Exact Name or null"}]}
 Input: ${JSON.stringify(batch.map(r => ({ t: r.title, s: r.snippet })))}`;
 

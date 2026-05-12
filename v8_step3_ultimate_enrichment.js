@@ -110,6 +110,22 @@ async function run() {
                     page = await context.newPage();
                     await page.goto(l.domain, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
                     extractFromHTML(await page.content(), emails, phones);
+
+                    // Auto-find and visit /contact page for richer contact data
+                    try {
+                        // Prefer exact href match first, then partial-text anchor
+                        const contactHref = await page.evaluate(() => {
+                            const anchors = Array.from(document.querySelectorAll('a[href]'));
+                            const exact   = anchors.find(a => /\/(contact|contacts|contact-us|contactus)(\/|$|\?)/i.test(a.getAttribute('href')));
+                            const loose   = exact || anchors.find(a => /contact/i.test(a.textContent.trim()));
+                            return loose ? loose.getAttribute('href') : null;
+                        });
+                        if (contactHref) {
+                            const contactUrl = contactHref.startsWith('http') ? contactHref : new URL(contactHref, l.domain).href;
+                            await page.goto(contactUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
+                            extractFromHTML(await page.content(), emails, phones);
+                        }
+                    } catch (_) { /* contact page unreachable — ignore */ }
                 }
             } catch (e) { /* timeout / network error — continue */ } finally { if (page) await page.close().catch(() => {}); }
 
