@@ -10,11 +10,11 @@ const GEMINI_KEY   = process.env.GEMINI_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
 if (!GEMINI_KEY) { console.error('[step3] GEMINI_KEY env var is required'); process.exit(1); }
 
-// BrightData proxy ??optional; set USE_PROXY=true in .env to enable
-const BRD_USER  = process.env.BRD_USER  || '';
-const BRD_PASS  = process.env.BRD_PASS  || '';
-const BRD_PROXY = process.env.BRD_PROXY || 'http://brd.superproxy.io:22225';
-const USE_PROXY = process.env.USE_PROXY === 'true';
+// BrightData proxy -- optional; set USE_PROXY=true or USE_BRD_SB=true in .env to enable
+const BRD_USER   = process.env.BRD_USER   || '';
+const BRD_PASS   = process.env.BRD_PASS   || '';
+const BRD_PROXY  = process.env.BRD_PROXY  || 'http://brd.superproxy.io:22225';
+const USE_PROXY  = process.env.USE_PROXY  === 'true';
 const USE_BRD_SB = process.env.USE_BRD_SB === 'true';
 const BRD_SB_WSS = process.env.BRD_SB_WSS || '';
 
@@ -31,15 +31,37 @@ async function callGemini(promptText) {
     });
 }
 
+// Load bom_components anchor from knowledge base
+function loadBomAnchor(leads) {
+    try {
+        if (!fs.existsSync('zhimao_supply_chain_economics.json')) return null;
+        const knowledge = JSON.parse(fs.readFileSync('zhimao_supply_chain_economics.json', 'utf8')).industries || {};
+        const sampleSnippet = leads.map(l => l.snippet || '').join(' ').toLowerCase();
+        for (const [, data] of Object.entries(knowledge)) {
+            const bom = data.bom_components;
+            if (!Array.isArray(bom) || bom.length === 0) continue;
+            const hits = bom.filter(b => sampleSnippet.includes(b.toLowerCase()));
+            if (hits.length > 0) return { name: data.name, bom };
+        }
+    } catch (_) {}
+    return null;
+}
+
 async function inferBOMGraph(leads) {
     if (leads.length === 0) return leads;
     console.log(`[step3] BOM deduction for ${leads.length} entities in batches of ${BOM_BATCH_SIZE}...`);
+
+    const bomAnchor  = loadBomAnchor(leads);
+    const anchorHint = bomAnchor
+        ? ` Anchor hint -- typical components for this industry (${bomAnchor.name}): ${bomAnchor.bom.slice(0, 6).join(', ')}.`
+        : '';
+    if (bomAnchor) console.log(`[step3] BOM anchor loaded: ${bomAnchor.name} (${bomAnchor.bom.length} components)`);
 
     for (let i = 0; i < leads.length; i += BOM_BATCH_SIZE) {
         const batch  = leads.slice(i, i + BOM_BATCH_SIZE);
         const prompt = `As a Supply Chain Analyst, analyze these companies based on their name and snippet.
 1. Determine entity_role: "Manufacturer", "Wholesaler", "Retailer", or "Service".
-2. If Manufacturer/Assembler, deduce 3-5 upstream raw materials/components they procure (BOM). If Retailer/Wholesaler, deduce finished goods they procure.
+2. If Manufacturer/Assembler, deduce 3-5 upstream raw materials/components they procure (BOM). If Retailer/Wholesaler, deduce finished goods they procure.${anchorHint}
 Format: {"results": [{"name": "Exact Name", "role": "...", "pre_procurement_bom": ["item1", "item2"]}]}
 Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: l.snippet })))}`;
 
@@ -62,16 +84,44 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: l.snippet 
     return leads;
 }
 
+// ?? Email cleaner: strip fake/exhibition/platform addresses ??????????????????
+const EMAIL_DOMAIN_BLACKLIST = new Set([
+    'messefrankfurt.com','cantonfair.org.cn','globalsources.com','alibaba.com',
+    'amazon.com','aliexpress.com','made-in-china.com','thomasnet.com',
+    'indiamart.com','tradefair.com','messe.de','koelnmesse.de','reed.co.uk',
+    'example.com','test.com','domain.com','email.com','mail.com','tempmail.com',
+]);
+const EMAIL_ROLE_PREFIXES = new Set([
+    'noreply','no-reply','donotreply','do-not-reply','webmaster','postmaster',
+    'mailer-daemon','bounce','unsubscribe','admin','support','info',
+]);
+
+function cleanEmail(raw) {
+    if (!raw) return null;
+    const em = raw.toLowerCase().trim();
+    if (!em.includes('@')) return null;
+    const [local, domain] = em.split('@');
+    if (!domain) return null;
+    if (/\.(png|jpg|jpeg|gif|svg|webp|pdf|css|js)$/i.test(em)) return null;
+    if (EMAIL_DOMAIN_BLACKLIST.has(domain)) return null;
+    const prefix = local.split('+')[0].split('.')[0];
+    if (EMAIL_ROLE_PREFIXES.has(prefix)) return null;
+    return em;
+}
+
 const extractFromHTML = (html, emails, phones) => {
     const $ = cheerio.load(html);
-    $('a[href^="mailto:"]').each((_, el) => emails.add($(el).attr('href').replace('mailto:', '').split('?')[0].trim()));
+    $('a[href^="mailto:"]').each((_, el) => {
+        const clean = cleanEmail($(el).attr('href').replace('mailto:', '').split('?')[0].trim());
+        if (clean) emails.add(clean);
+    });
     $('a[href^="tel:"]').each((_, el) => phones.add($(el).attr('href').replace('tel:', '').trim()));
     $('a[href*="wa.me/"]').each((_, el) => phones.add($(el).attr('href')));
     const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,})/g;
     let match;
     while ((match = emailRegex.exec($('body').text())) !== null) {
-        const em = match[1].toLowerCase();
-        if (!em.endsWith('.png') && !em.endsWith('.jpg') && !em.endsWith('.jpeg')) emails.add(em);
+        const clean = cleanEmail(match[1]);
+        if (clean) emails.add(clean);
     }
 };
 
@@ -101,20 +151,20 @@ async function run() {
             browser = await chromium.launch(launchOptions);
         } catch (launchErr) {
             if (String(launchErr.message).includes("Executable doesn't exist")) {
-                console.log("[step3] Chromium not found — installing now (first-run on this host)...");
+                console.log('[step3] Chromium not found -- installing now (first-run on this host)...');
                 require('child_process').execSync(
                     'node ' + require('path').join(__dirname, 'node_modules', '.bin', 'playwright') + ' install chromium',
                     { stdio: 'inherit' }
                 );
-                console.log("[step3] Chromium install complete — retrying launch...");
+                console.log('[step3] Chromium install complete -- retrying launch...');
                 browser = await chromium.launch(launchOptions);
             } else {
                 throw launchErr;
             }
         }
     }
-    const context        = await browser.newContext({ ignoreHTTPSErrors: true });
-    const mobileContext  = await browser.newContext({ ignoreHTTPSErrors: true, userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36' });
+    const context       = await browser.newContext({ ignoreHTTPSErrors: true });
+    const mobileContext = await browser.newContext({ ignoreHTTPSErrors: true, userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36' });
 
     const enriched = [];
     for (const l of leads) {
@@ -141,7 +191,6 @@ async function run() {
 
                     // Auto-find and visit /contact page for richer contact data
                     try {
-                        // Prefer exact href match first, then partial-text anchor
                         const contactHref = await page.evaluate(() => {
                             const anchors = Array.from(document.querySelectorAll('a[href]'));
                             const exact   = anchors.find(a => /\/(contact|contacts|contact-us|contactus)(\/|$|\?)/i.test(a.getAttribute('href')));
@@ -153,9 +202,9 @@ async function run() {
                             await page.goto(contactUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
                             extractFromHTML(await page.content(), emails, phones);
                         }
-                    } catch (_) { /* contact page unreachable ??ignore */ }
+                    } catch (_) { /* contact page unreachable -- ignore */ }
                 }
-            } catch (e) { /* timeout / network error ??continue */ } finally { if (page) await page.close().catch(() => {}); }
+            } catch (e) { /* timeout / network error -- continue */ } finally { if (page) await page.close().catch(() => {}); }
 
             if (emails.size > 0) l.primary_email = Array.from(emails)[0];
             const cleanPhones = Array.from(phones).filter(p => p.length < 20);
@@ -176,7 +225,7 @@ async function run() {
 
     await browser.close();
     fs.writeFileSync(outputFile, JSON.stringify(enriched, null, 2));
-    console.log(`[step3] Done ??${enriched.length} enriched leads ??${outputFile}`);
+    console.log(`[step3] Done -- ${enriched.length} enriched leads -> ${outputFile}`);
 }
 
 run().catch(e => { console.error(e); process.exit(1); });

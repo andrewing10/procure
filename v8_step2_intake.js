@@ -4,6 +4,21 @@ const https = require('https');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 
+// Load make_vs_buy_triggers from knowledge base to guide Gemini classification
+function loadIndustryContext(samplePillar) {
+    try {
+        if (!fs.existsSync('zhimao_supply_chain_economics.json')) return null;
+        const knowledge = JSON.parse(fs.readFileSync('zhimao_supply_chain_economics.json', 'utf8')).industries || {};
+        if (!samplePillar) return null;
+        for (const [name, data] of Object.entries(knowledge)) {
+            if (samplePillar.toLowerCase().includes(name.toLowerCase().split(' ')[0].toLowerCase())) {
+                return { name, ...data };
+            }
+        }
+    } catch (_) {}
+    return null;
+}
+
 const GEMINI_KEY   = process.env.GEMINI_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
 if (!GEMINI_KEY) { console.error('[step2] GEMINI_KEY env var is required'); process.exit(1); }
@@ -25,7 +40,17 @@ async function run() {
     const raw = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
     if (raw.length === 0) { fs.writeFileSync(outputFile, '[]'); return; }
 
-    console.log(`[step2] Gemini strict entity extraction ??${raw.length} items in batches of ${BATCH_SIZE}...`);
+    console.log(`[step2] Gemini strict entity extraction -- ${raw.length} items in batches of ${BATCH_SIZE}...`);
+
+    // Inject industry make_vs_buy context to improve buyer/supplier classification
+    const samplePillar = raw.find(r => r.pillar)?.pillar || '';
+    const industryCtx  = loadIndustryContext(samplePillar);
+    const triggerBlock = industryCtx?.make_vs_buy_triggers
+        ? `\nINDUSTRY CONTEXT (${industryCtx.name}):
+- BUY signals (these companies ARE buyers/importers -- accept): ${industryCtx.make_vs_buy_triggers.buy_signals.join(', ')}
+- MAKE signals (these are manufacturers -- still accept, but note): ${industryCtx.make_vs_buy_triggers.make_signals.join(', ')}`
+        : '';
+    if (industryCtx) console.log(`[step2] Industry context injected: ${industryCtx.name}`);
 
     let intakeData = [];
 
@@ -34,8 +59,8 @@ async function run() {
         const prompt  = `Extract exact formal Company Name from each item.
 [CRITICAL RULES]
 1. ANTI-POLLUTION: If the snippet indicates the company is based in China, or is a Chinese exporter/supplier selling abroad, YOU MUST return null.
-2. ANTI-BLOG: If the title/snippet is a listicle, article, review, or guide (e.g. "Top 10 ...", "Best ... for ...", "How to ...", "Guide to ...", "X things you should ...", "Review:", "vs."), YOU MUST return null ??we only want real buyer company entities.
-3. ANTI-PLATFORM: If the result is a known marketplace, directory platform, or aggregator (Alibaba, Amazon, Thomasnet, etc.) rather than an end-buyer company, return null.
+2. ANTI-BLOG: If the title/snippet is a listicle, article, review, or guide (e.g. "Top 10 ...", "Best ... for ...", "How to ...", "Guide to ...", "X things you should ...", "Review:", "vs."), YOU MUST return null -- we only want real buyer company entities.
+3. ANTI-PLATFORM: If the result is a known marketplace, directory platform, or aggregator (Alibaba, Amazon, Thomasnet, etc.) rather than an end-buyer company, return null.${triggerBlock}
 Format: {"results": [{"company_name": "Exact Name or null"}]}
 Input: ${JSON.stringify(batch.map(r => ({ t: r.title, s: r.snippet })))}`;
 
@@ -45,7 +70,7 @@ Input: ${JSON.stringify(batch.map(r => ({ t: r.title, s: r.snippet })))}`;
             const content = JSON.parse(parsed.candidates[0].content.parts[0].text).results;
             batch.forEach((r, idx) => {
                 if (content[idx]?.company_name && content[idx].company_name !== 'null') {
-                    intakeData.push({ company_name: content[idx].company_name, domain: r.link, snippet: r.snippet, phone: r.phone, pillar: r.pillar });
+                    intakeData.push({ company_name: content[idx].company_name, domain: r.link, snippet: r.snippet, phone: r.phone, pillar: r.pillar, intent_signal: r.intent_signal });
                 }
             });
             console.log(`[step2] Batch ${Math.floor(i / BATCH_SIZE) + 1}: ${content.filter(c => c?.company_name && c.company_name !== 'null').length} accepted`);
@@ -55,7 +80,7 @@ Input: ${JSON.stringify(batch.map(r => ({ t: r.title, s: r.snippet })))}`;
     }
 
     fs.writeFileSync(outputFile, JSON.stringify(intakeData, null, 2));
-    console.log(`[step2] Done ??${intakeData.length} valid entities ??${outputFile}`);
+    console.log(`[step2] Done -- ${intakeData.length} valid entities -> ${outputFile}`);
 }
 
 run().catch(e => { console.error(e); process.exit(1); });
