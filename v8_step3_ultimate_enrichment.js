@@ -103,7 +103,7 @@ async function run() {
             if (String(launchErr.message).includes("Executable doesn't exist")) {
                 console.log("[step3] Chromium not found — installing now (first-run on this host)...");
                 require('child_process').execSync(
-                    'node ' + require('path').join(__dirname, 'node_modules', '.bin', 'playwright') + ' install chromium --with-deps',
+                    'node ' + require('path').join(__dirname, 'node_modules', '.bin', 'playwright') + ' install chromium',
                     { stdio: 'inherit' }
                 );
                 console.log("[step3] Chromium install complete — retrying launch...");

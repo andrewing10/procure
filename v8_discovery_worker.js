@@ -7,7 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 // does not persist into the worker process. This runs once at startup (~30s on cold start).
 try {
   console.log('[worker] ensuring playwright chromium is installed...');
-  execSync('npx playwright install chromium --with-deps', { stdio: 'inherit' });
+  execSync('npx playwright install chromium', { stdio: 'inherit' });
   console.log('[worker] playwright chromium ready');
 } catch (e) {
   console.warn('[worker] playwright install warning (may already be present):', e.message);
