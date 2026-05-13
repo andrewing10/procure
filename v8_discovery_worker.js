@@ -83,22 +83,31 @@ async function markRunning(jobId) {
   return true;
 }
 
-async function countIntelRows(countryIso, category) {
-  // semantic_intent is text[] — ilike doesn't work on arrays.
-  // Count all rows for this country written by this pipeline run instead.
-  const { count } = await supabase
-    .from('data_intel_l1_companies')
-    .select('company_id', { count: 'exact', head: true })
-    .eq('country', countryIso.toUpperCase())
-    .eq('source', 'v8-pipeline');
-  return Number(count || 0);
+async function readResultCountFromBulk(jobId) {
+  // Bulk API (Step 5 → /api/data-intel/l1/procurement/bulk) is the single source of
+  // truth for how many rows this job actually wrote into data_intel_l1_companies.
+  // The worker only reads that value — it must not overwrite it with a country-wide count,
+  // otherwise unrelated prior runs leak into this job's reported number.
+  const { data, error } = await supabase
+    .from('discovery_jobs')
+    .select('result_count,status')
+    .eq('id', jobId)
+    .maybeSingle();
+  if (error) {
+    console.error('[worker] read result_count error:', error.message);
+    return 0;
+  }
+  return Number(data?.result_count ?? 0);
 }
 
 async function markDone(job, count) {
   const nowIso = new Date().toISOString();
+  // Only update status/completed_at. result_count was already written by Bulk API
+  // (Step 5) using the exact rows.length actually upserted in this job — that is
+  // the authoritative number and must not be overridden here.
   const { error: updateErr } = await supabase
     .from('discovery_jobs')
-    .update({ status: 'done', result_count: count, completed_at: nowIso, error_message: null })
+    .update({ status: 'done', completed_at: nowIso, error_message: null })
     .eq('id', job.id);
   if (updateErr) {
     console.error('[worker] mark done error:', updateErr.message);
@@ -159,7 +168,7 @@ async function main() {
         continue;
       }
 
-      const count = await countIntelRows(job.country_iso, job.category);
+      const count = await readResultCountFromBulk(job.id);
       await markDone(job, count);
       console.log(`[worker] job done ${job.id}, count=${count}`);
     } catch (e) {
