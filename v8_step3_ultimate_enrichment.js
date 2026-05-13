@@ -71,7 +71,11 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                 const lead = batch.find(l => l.company_name === r.name);
                 if (!lead) return;
                 lead.entity_role  = r.entity_role || 'Service';
-                lead.inferred_bom = Array.isArray(r.primary_materials_top3) ? r.primary_materials_top3 : [];
+                // Lowercase all BOM/category terms so that the zhimao Bulk API stores them
+                // in lowercase and semantic_intent.cs() matches work case-insensitively.
+                lead.inferred_bom = Array.isArray(r.primary_materials_top3)
+                    ? r.primary_materials_top3.map(s => String(s).trim().toLowerCase())
+                    : [];
                 // Boost confidence score for clear buyer roles
                 if (r.entity_role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
                 else if (r.entity_role === 'Wholesaler' || r.entity_role === 'Retailer') lead.confidence_score = (lead.confidence_score || 50) + 10;
@@ -80,8 +84,14 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                     category:              lead.inferred_bom[0] || null,
                     entity_role:           r.entity_role,
                     confidence_tier:       r.confidence_tier || 'Medium',
-                    primary_materials_top3: lead.inferred_bom,
-                    procurement_items:     Array.isArray(r.procurement_items) ? r.procurement_items : [],
+                    primary_materials_top3: lead.inferred_bom, // already lowercased above
+                    procurement_items:     Array.isArray(r.procurement_items)
+                        ? r.procurement_items.map(item =>
+                            typeof item === 'object' && item !== null
+                                ? { ...item, category: typeof item.category === 'string' ? item.category.trim().toLowerCase() : item.category }
+                                : item
+                          )
+                        : [],
                     intent_summary:        r.intent_summary || '',
                     purchase_cycle:        r.purchase_cycle || 'quarterly',
                     reason_codes:          Array.isArray(r.reason_codes) ? r.reason_codes : ['BOM_INFERENCE'],

@@ -144,10 +144,34 @@ async function markFailed(jobId, msg) {
   }
 }
 
+/**
+ * Write a heartbeat timestamp to platform_runtime_settings so that the zhimao
+ * admin panel can detect whether this worker is alive.
+ * Key: procure_worker_heartbeat  Value: ISO timestamp
+ * Non-fatal: if the upsert fails we just log and continue.
+ */
+async function writeHeartbeat() {
+  const { error } = await supabase
+    .from('platform_runtime_settings')
+    .upsert(
+      { key: 'procure_worker_heartbeat', value_json: new Date().toISOString() },
+      { onConflict: 'key' },
+    );
+  if (error) {
+    console.warn('[worker] heartbeat write error:', error.message);
+  }
+}
+
 async function main() {
   console.log('[worker] discovery worker started');
+  // Write initial heartbeat on startup so admin can see the worker came online.
+  await writeHeartbeat();
+
   while (true) {
     try {
+      // Heartbeat every loop so admin panel shows last-seen time.
+      await writeHeartbeat();
+
       const job = await pickPendingJob();
       if (!job) {
         await sleep(POLL_MS);

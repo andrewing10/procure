@@ -110,6 +110,8 @@ function mapToBulkL1Item(lead) {
     };
 }
 
+// Push to Catagent (zhimao) Bulk API.
+// 返回 { statusCode, body } 以便上层判定 L1 是否落库 + L3 是否分裂失败。
 function pushToCatagent(items) {
     return new Promise(resolve => {
         const mappedItems = items.map(mapToBulkL1Item);
@@ -124,37 +126,79 @@ function pushToCatagent(items) {
             workflow_used:   'v8-pipeline',
             total_imported:  mappedItems.length,
             data:            mappedItems,
-            // Also include the current-schema key so the route accepts either shape
             items:           mappedItems,
             discovery_job_id: DISCOVERY_JOB_ID,
         });
-        const url      = new URL(`${CATAGENT_API_URL}/api/data-intel/l1/procurement/bulk`);
+
+        let url;
+        try {
+            url = new URL(`${CATAGENT_API_URL}/api/data-intel/l1/procurement/bulk`);
+        } catch (e) {
+            console.error(`[step5] invalid CATAGENT_API_URL: ${CATAGENT_API_URL} (${e.message})`);
+            return resolve({ statusCode: 0, body: null });
+        }
+
         const headers  = {
             'Content-Type':   'application/json',
             'Content-Length': Buffer.byteLength(payload),
         };
-        if (CATAGENT_API_KEY) headers['Authorization'] = `Bearer ${CATAGENT_API_KEY}`;
+        if (CATAGENT_API_KEY) {
+            headers['Authorization'] = `Bearer ${CATAGENT_API_KEY}`;
+        } else {
+            console.warn('[step5] CATAGENT_API_KEY is empty — Bulk API will reject with 401.');
+        }
 
-        const req = https.request({ hostname: url.hostname, path: url.pathname, method: 'POST', headers }, res => {
-            let body = ''; res.on('data', c => body += c);
+        // 必须显式传 port（默认 443 也得传，否则非标准端口会失败），
+        // 并把 search/query 也带上，杜绝 URL 含 ?xxx 时丢失参数。
+        const requestOptions = {
+            hostname: url.hostname,
+            port:     url.port || (url.protocol === 'http:' ? 80 : 443),
+            path:     url.pathname + (url.search || ''),
+            method:   'POST',
+            headers,
+        };
+
+        const transport = url.protocol === 'http:' ? require('http') : https;
+        const req = transport.request(requestOptions, res => {
+            let body = '';
+            res.on('data', c => body += c);
             res.on('end', () => {
-                console.log(`[step5] Catagent response: ${res.statusCode}`);
-                try { console.log('[step5]', JSON.parse(body)); } catch { console.log('[step5]', body.slice(0, 200)); }
-                resolve(res.statusCode);
+                let parsed = null;
+                try { parsed = JSON.parse(body); } catch { /* keep null */ }
+                console.log(`[step5] Catagent HTTP ${res.statusCode}`);
+                if (parsed) {
+                    console.log('[step5] body:', JSON.stringify(parsed));
+                } else if (body) {
+                    console.log('[step5] body(raw):', body.slice(0, 500));
+                }
+                resolve({ statusCode: res.statusCode, body: parsed });
             });
         });
-        req.on('error', e => { console.error(`[step5] Catagent push failed: ${e.message}`); resolve(0); });
-        req.write(payload); req.end();
+        req.on('error', e => {
+            console.error(`[step5] Catagent push transport error: ${e.message}`);
+            resolve({ statusCode: 0, body: null });
+        });
+        req.write(payload);
+        req.end();
     });
 }
 
 (async () => {
     if (validLeads.length > 0) {
-        console.log(`[step5] Pushing ${validLeads.length} leads to Catagent...`);
-        const statusCode = await pushToCatagent(validLeads);
+        console.log(`[step5] Pushing ${validLeads.length} leads to Catagent at ${CATAGENT_API_URL}...`);
+        const { statusCode, body } = await pushToCatagent(validLeads);
         if (statusCode < 200 || statusCode >= 300) {
-            console.error(`[step5] Catagent push failed with HTTP ${statusCode} — aborting.`);
+            console.error(`[step5] Catagent push FAILED with HTTP ${statusCode} — aborting.`);
+            console.error('[step5] Hint: 401=missing/wrong CATAGENT_API_KEY · 404=wrong CATAGENT_API_URL · 500=DB schema mismatch (run latest migrations).');
             process.exit(1);
+        }
+        // L1 已成功，但 L3 子写入可能失败 — Bulk API 现在会在 body.l3_error 报告。
+        if (body && body.l3_error) {
+            console.error(`[step5] L1 ok (${body.qualified}), but L3 partial failure: ${body.l3_error.message}`);
+            console.error('[step5] L3 故障常见原因：data_intel_l3_inferred 表/列不全，请确认最新 schema 迁移已部署。');
+            // 不 exit(1)：L1 已写入，让 worker 标 done 并保留 error_message。
+        } else if (body) {
+            console.log(`[step5] All written: L1.qualified=${body.qualified}, L3=${body.l3_written}/${body.l3_attempted}`);
         }
     } else {
         console.log('[step5] No valid leads to push.');
