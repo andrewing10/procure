@@ -38,7 +38,7 @@ if (!SKIP_SQLITE) {
     db.exec(`CREATE TABLE IF NOT EXISTS enrichment_queue (
         company_name TEXT UNIQUE, domain TEXT, score INTEGER, retries INTEGER DEFAULT 0
     )`);
-    insertMain = db.prepare(`INSERT OR IGNORE INTO main_db (company_name, domain, primary_email, primary_phone, confidence_score, entity_role, source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+    insertMain = db.prepare(`INSERT OR IGNORE INTO main_db (company_name, domain, country, primary_email, primary_phone, confidence_score, entity_role, source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     insertQueue = db.prepare(`INSERT OR IGNORE INTO enrichment_queue (company_name, domain, score) VALUES (?, ?, ?)`);
 } else {
     console.log('[step5] SKIP_SQLITE=true, local sqlite writes disabled.');
@@ -84,7 +84,19 @@ leads.forEach(lead => {
     const hasContact = !!(lead.primary_email || lead.primary_phone);
     const isHot      = lead.confidence_score >= 90 && hasContact;
     if (isHot && insertMain) {
-        insertMain.run(lead.company_name, lead.domain, lead.primary_email, lead.primary_phone, lead.confidence_score, lead.entity_role || null, lead.pillar, new Date().toISOString());
+        // country 列已经在 CREATE TABLE 里声明，但历史 INSERT 漏填会让整列为 NULL —
+        // 现在补齐，避免后续按国家做本地分析/重跑时拿到空值。
+        insertMain.run(
+            lead.company_name,
+            lead.domain,
+            lead.country || null,
+            lead.primary_email,
+            lead.primary_phone,
+            lead.confidence_score,
+            lead.entity_role || null,
+            lead.pillar,
+            new Date().toISOString(),
+        );
     } else if (lead.domain && insertQueue) {
         insertQueue.run(lead.company_name, lead.domain, lead.confidence_score);
     }
@@ -110,22 +122,34 @@ function mapToBulkL1Item(lead) {
     };
 }
 
-// Push to Catagent (zhimao) Bulk API.
+// Bulk API 的硬上限是 2000 条/次（zhimao route.ts payload_too_large=2000）。
+// 这里取 1000 作为单批阈值，留足缓冲：
+//   - 避免边界 off-by-one
+//   - 单批 payload 大约 1~2MB，对 Vercel/Render 都更友好
+//   - 让一批失败时丢失面更小，便于人工/自动重抓
+const BULK_BATCH_SIZE = Number(process.env.STEP5_BATCH_SIZE) > 0
+    ? Number(process.env.STEP5_BATCH_SIZE)
+    : 1000;
+
+// 单次请求的硬超时（毫秒）。Vercel cold start + 大批 upsert 偶尔会超 30s，
+// 但永远等下去会拖死整个 cron worker，60s 是经验值。
+const REQUEST_TIMEOUT_MS = Number(process.env.STEP5_REQUEST_TIMEOUT_MS) > 0
+    ? Number(process.env.STEP5_REQUEST_TIMEOUT_MS)
+    : 60_000;
+
+// Push a single batch to Catagent (zhimao) Bulk API.
 // 返回 { statusCode, body } 以便上层判定 L1 是否落库 + L3 是否分裂失败。
-function pushToCatagent(items) {
+function pushBatchToCatagent(items, batchIndex, batchTotal) {
     return new Promise(resolve => {
         const mappedItems = items.map(mapToBulkL1Item);
-        // Support both payload shapes:
-        //   - Legacy production format: { batch_id, timestamp, target_database, workflow_used, total_imported, data }
-        //   - Current API format:       { items }
-        // We send the legacy shape first (matches the deployed Vercel version).
+        // payload 只发 items —— zhimao Bulk API 已统一以 items 为主，旧的 data
+        // 字段重复同一份数组，等于把 payload 体积凭空翻倍，删掉。
         const payload = JSON.stringify({
-            batch_id:        `v8_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+            batch_id:        `v8_${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${batchIndex}of${batchTotal}`,
             timestamp:       new Date().toISOString(),
             target_database: 'Zhimao Main DB',
             workflow_used:   'v8-pipeline',
             total_imported:  mappedItems.length,
-            data:            mappedItems,
             items:           mappedItems,
             discovery_job_id: DISCOVERY_JOB_ID,
         });
@@ -159,46 +183,105 @@ function pushToCatagent(items) {
         };
 
         const transport = url.protocol === 'http:' ? require('http') : https;
+        let settled = false;
+        const settleOnce = (val) => { if (!settled) { settled = true; resolve(val); } };
+
         const req = transport.request(requestOptions, res => {
             let body = '';
             res.on('data', c => body += c);
             res.on('end', () => {
                 let parsed = null;
                 try { parsed = JSON.parse(body); } catch { /* keep null */ }
-                console.log(`[step5] Catagent HTTP ${res.statusCode}`);
+                console.log(`[step5] batch ${batchIndex}/${batchTotal} Catagent HTTP ${res.statusCode}`);
                 if (parsed) {
-                    console.log('[step5] body:', JSON.stringify(parsed));
+                    console.log(`[step5] batch ${batchIndex}/${batchTotal} body:`, JSON.stringify(parsed));
                 } else if (body) {
-                    console.log('[step5] body(raw):', body.slice(0, 500));
+                    console.log(`[step5] batch ${batchIndex}/${batchTotal} body(raw):`, body.slice(0, 500));
                 }
-                resolve({ statusCode: res.statusCode, body: parsed });
+                settleOnce({ statusCode: res.statusCode, body: parsed });
             });
         });
+
+        // 60s 硬超时：服务端没回响应就主动断开，避免 cron worker 永远挂起。
+        req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+            console.error(`[step5] batch ${batchIndex}/${batchTotal} request timeout after ${REQUEST_TIMEOUT_MS}ms — destroying.`);
+            req.destroy(new Error('request_timeout'));
+        });
         req.on('error', e => {
-            console.error(`[step5] Catagent push transport error: ${e.message}`);
-            resolve({ statusCode: 0, body: null });
+            console.error(`[step5] batch ${batchIndex}/${batchTotal} Catagent push transport error: ${e.message}`);
+            settleOnce({ statusCode: 0, body: null });
         });
         req.write(payload);
         req.end();
     });
 }
 
+// Top-level orchestrator: 按 BULK_BATCH_SIZE 切片，逐批 push。
+// 任一批 5xx/transport 错误都直接 return failure，上层 main 决定是否 exit(1)。
+// 任一批返回 l3_error，仅累计、不中断（与之前行为一致：L1 已写、L3 部分失败不致命）。
+async function pushToCatagentBatched(items) {
+    const total = items.length;
+    if (total === 0) return { ok: true, attempted: 0, qualified: 0, l3WrittenSum: 0, l3AttemptedSum: 0, l3Errors: [] };
+
+    const batchTotal = Math.ceil(total / BULK_BATCH_SIZE);
+    let qualifiedSum = 0;
+    let l3WrittenSum = 0;
+    let l3AttemptedSum = 0;
+    const l3Errors = [];
+
+    for (let batchIndex = 1; batchIndex <= batchTotal; batchIndex++) {
+        const start = (batchIndex - 1) * BULK_BATCH_SIZE;
+        const slice = items.slice(start, start + BULK_BATCH_SIZE);
+        console.log(`[step5] pushing batch ${batchIndex}/${batchTotal} (${slice.length} leads, total=${total})`);
+
+        const { statusCode, body } = await pushBatchToCatagent(slice, batchIndex, batchTotal);
+
+        if (statusCode < 200 || statusCode >= 300) {
+            console.error(`[step5] batch ${batchIndex}/${batchTotal} FAILED with HTTP ${statusCode}.`);
+            console.error('[step5] Hint: 401=missing/wrong CATAGENT_API_KEY · 404=wrong CATAGENT_API_URL · 413=batch too large (lower STEP5_BATCH_SIZE) · 500=DB schema mismatch (run latest migrations).');
+            return {
+                ok: false,
+                failedBatch: batchIndex,
+                batchTotal,
+                statusCode,
+                attempted: start + slice.length,
+                qualified: qualifiedSum,
+                l3WrittenSum,
+                l3AttemptedSum,
+                l3Errors,
+            };
+        }
+
+        if (body && typeof body === 'object') {
+            qualifiedSum    += Number(body.qualified)    || 0;
+            l3WrittenSum    += Number(body.l3_written)   || 0;
+            l3AttemptedSum  += Number(body.l3_attempted) || 0;
+            if (body.l3_error) {
+                l3Errors.push({ batch: `${batchIndex}/${batchTotal}`, ...body.l3_error });
+            }
+        }
+    }
+
+    return { ok: true, attempted: total, qualified: qualifiedSum, l3WrittenSum, l3AttemptedSum, l3Errors };
+}
+
 (async () => {
     if (validLeads.length > 0) {
-        console.log(`[step5] Pushing ${validLeads.length} leads to Catagent at ${CATAGENT_API_URL}...`);
-        const { statusCode, body } = await pushToCatagent(validLeads);
-        if (statusCode < 200 || statusCode >= 300) {
-            console.error(`[step5] Catagent push FAILED with HTTP ${statusCode} — aborting.`);
-            console.error('[step5] Hint: 401=missing/wrong CATAGENT_API_KEY · 404=wrong CATAGENT_API_URL · 500=DB schema mismatch (run latest migrations).');
+        console.log(`[step5] Pushing ${validLeads.length} leads to Catagent at ${CATAGENT_API_URL} (batch size=${BULK_BATCH_SIZE}, request timeout=${REQUEST_TIMEOUT_MS}ms)...`);
+        const result = await pushToCatagentBatched(validLeads);
+
+        if (!result.ok) {
+            console.error(`[step5] aborting after batch ${result.failedBatch}/${result.batchTotal}; cumulative qualified=${result.qualified}, attempted=${result.attempted}/${validLeads.length}.`);
             process.exit(1);
         }
-        // L1 已成功，但 L3 子写入可能失败 — Bulk API 现在会在 body.l3_error 报告。
-        if (body && body.l3_error) {
-            console.error(`[step5] L1 ok (${body.qualified}), but L3 partial failure: ${body.l3_error.message}`);
+
+        // 所有批都 2xx。L3 partial failure 仅记录、不致命（保持原行为）。
+        if (result.l3Errors.length > 0) {
+            console.error(`[step5] L1 ok (qualified=${result.qualified}), L3 partial failures across ${result.l3Errors.length} batch(es):`);
+            for (const e of result.l3Errors) console.error(`  - batch ${e.batch}: ${e.message}`);
             console.error('[step5] L3 故障常见原因：data_intel_l3_inferred 表/列不全，请确认最新 schema 迁移已部署。');
-            // 不 exit(1)：L1 已写入，让 worker 标 done 并保留 error_message。
-        } else if (body) {
-            console.log(`[step5] All written: L1.qualified=${body.qualified}, L3=${body.l3_written}/${body.l3_attempted}`);
+        } else {
+            console.log(`[step5] All written: L1.qualified=${result.qualified}, L3=${result.l3WrittenSum}/${result.l3AttemptedSum}`);
         }
     } else {
         console.log('[step5] No valid leads to push.');
