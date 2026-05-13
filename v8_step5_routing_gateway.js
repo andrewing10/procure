@@ -1,13 +1,13 @@
 /**
- * Step 5 -- Routing & Persistence Gateway
+ * Step 5 — Routing & Persistence Gateway
  *
  * 1. Writes hot leads (score >= 90 with contact) to local SQLite main_db
  * 2. Queues lower-score leads for future enrichment
  * 3. Pushes all leads with contact info to the Catagent API (BulkL1Item format)
  *
  * Required env vars:
- *   CATAGENT_API_URL   -- e.g. https://catagent.vercel.app
- *   CATAGENT_API_KEY   -- internal API key / CRON_SECRET
+ *   CATAGENT_API_URL   — e.g. https://catagent.vercel.app
+ *   CATAGENT_API_KEY   — internal API key / CRON_SECRET
  */
 require('dotenv').config();
 const fs       = require('fs');
@@ -25,7 +25,7 @@ if (!CATAGENT_API_URL) { console.error('[step5] CATAGENT_API_URL env var is requ
 
 const leads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
 
-// -- Local SQLite ------------------------------------------------------------
+// ── Local SQLite ────────────────────────────────────────────────────────────
 let insertMain = null;
 let insertQueue = null;
 if (!SKIP_SQLITE) {
@@ -44,9 +44,41 @@ if (!SKIP_SQLITE) {
     console.log('[step5] SKIP_SQLITE=true, local sqlite writes disabled.');
 }
 
-// Push ALL enriched leads to Catagent -- contact info is optional.
-// Hot leads (score>=90 + contact) are also written to local SQLite for fast lookup.
-const validLeads = leads.filter(l => !!l.company_name);
+// ── Quality Gate (P0) ───────────────────────────────────────────────────────
+// Centralized "qualified-or-veto" rules — a record is only shipped downstream
+// if EVERY criterion below holds. This is the upstream half of the unified
+// quality SLA enforced jointly with Bulk API (quality_grade) and the search
+// layer (.neq quality_grade unqualified).
+//
+// Required:
+//   1) company_name present
+//   2) at least one contact channel: primary_email | primary_phone | domain
+//   3) L3 inference is actionable: confidence_tier ∈ {High, Medium}
+//                                  AND procurement_items length >= 1
+//
+// Records failing ANY rule are dropped here and never enter the L1 table —
+// preventing "paid to unlock an empty card" / "drone-on-palm-farm" failures.
+function isQualifiedLead(l) {
+    if (!l || !l.company_name) return false;
+    const hasContact = !!(l.primary_email || l.primary_phone || l.domain);
+    if (!hasContact) return false;
+    const ib = l.inference_breakdown;
+    // L3 breakdown is optional — when present, it must meet quality criteria.
+    if (ib && typeof ib === 'object') {
+        const tier = String(ib.confidence_tier || '').toLowerCase();
+        if (tier === 'low') return false;
+        const items = Array.isArray(ib.procurement_items) ? ib.procurement_items : [];
+        if (items.length < 1) return false;
+    }
+    return true;
+}
+
+const totalLeads = leads.length;
+const validLeads = leads.filter(isQualifiedLead);
+const droppedQuality = totalLeads - validLeads.length;
+if (droppedQuality > 0) {
+    console.log(`[step5] quality-gate veto: dropped ${droppedQuality} / ${totalLeads} leads (no contact, low L3 confidence, or empty procurement_items).`);
+}
 
 leads.forEach(lead => {
     const hasContact = !!(lead.primary_email || lead.primary_phone);
@@ -58,21 +90,22 @@ leads.forEach(lead => {
     }
 });
 
-// -- Catagent API Push (BulkL1Item format) -----------------------------------
+// ── Catagent API Push (BulkL1Item format) ───────────────────────────────────
 function mapToBulkL1Item(lead) {
     return {
-        name:          lead.company_name || '',
-        country:       lead.country      || '',
-        domain:        lead.domain       || undefined,
-        primary_email: lead.primary_email || undefined,
-        primary_phone: lead.primary_phone || undefined,
-        categories:    lead.inferred_bom  || undefined,
-        place_type:    lead.entity_role   || undefined,
+        name:                 lead.company_name || '',
+        country:              lead.country      || '',
+        domain:               lead.domain       || undefined,
+        primary_email:        lead.primary_email || undefined,
+        primary_phone:        lead.primary_phone || undefined,
+        categories:           lead.inferred_bom  || undefined,
+        place_type:           lead.entity_role   || undefined,
         // snippet used as address hint when no structured address available
-        address_line:  lead.snippet?.slice(0, 200) || undefined,
-        // Provenance metadata (new optional fields -- safe additions only)
+        address_line:         lead.snippet?.slice(0, 200) || undefined,
+        // Provenance metadata (optional fields — safe additions only)
         ...(lead.intent_signal    && { intent_signal:    lead.intent_signal }),
-        ...(lead.source_timestamp    && { source_timestamp:    lead.source_timestamp }),
+        ...(lead.source_timestamp && { source_timestamp: lead.source_timestamp }),
+        // L3 supply-chain inference (written to data_intel_l3_inferred by the bulk API)
         ...(lead.inference_breakdown && { inference_breakdown: lead.inference_breakdown }),
     };
 }
@@ -85,14 +118,14 @@ function pushToCatagent(items) {
         //   - Current API format:       { items }
         // We send the legacy shape first (matches the deployed Vercel version).
         const payload = JSON.stringify({
-            batch_id:         `v8_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
-            timestamp:        new Date().toISOString(),
-            target_database:  'Zhimao Main DB',
-            workflow_used:    'v8-pipeline',
-            total_imported:   mappedItems.length,
-            data:             mappedItems,
+            batch_id:        `v8_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+            timestamp:       new Date().toISOString(),
+            target_database: 'Zhimao Main DB',
+            workflow_used:   'v8-pipeline',
+            total_imported:  mappedItems.length,
+            data:            mappedItems,
             // Also include the current-schema key so the route accepts either shape
-            items:            mappedItems,
+            items:           mappedItems,
             discovery_job_id: DISCOVERY_JOB_ID,
         });
         const url      = new URL(`${CATAGENT_API_URL}/api/data-intel/l1/procurement/bulk`);
@@ -120,12 +153,12 @@ function pushToCatagent(items) {
         console.log(`[step5] Pushing ${validLeads.length} leads to Catagent...`);
         const statusCode = await pushToCatagent(validLeads);
         if (statusCode < 200 || statusCode >= 300) {
-            console.error(`[step5] Catagent push failed with HTTP ${statusCode} -- aborting.`);
+            console.error(`[step5] Catagent push failed with HTTP ${statusCode} — aborting.`);
             process.exit(1);
         }
     } else {
         console.log('[step5] No valid leads to push.');
     }
     fs.writeFileSync(outputFile, JSON.stringify({ status: 'success', db_injected: validLeads.length }, null, 2));
-    console.log(`[step5] Done -> ${outputFile}`);
+    console.log(`[step5] Done → ${outputFile}`);
 })();

@@ -10,11 +10,11 @@ const GEMINI_KEY   = process.env.GEMINI_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
 if (!GEMINI_KEY) { console.error('[step3] GEMINI_KEY env var is required'); process.exit(1); }
 
-// BrightData proxy -- optional; set USE_PROXY=true or USE_BRD_SB=true in .env to enable
-const BRD_USER   = process.env.BRD_USER   || '';
-const BRD_PASS   = process.env.BRD_PASS   || '';
-const BRD_PROXY  = process.env.BRD_PROXY  || 'http://brd.superproxy.io:22225';
-const USE_PROXY  = process.env.USE_PROXY  === 'true';
+// BrightData proxy ??optional; set USE_PROXY=true in .env to enable
+const BRD_USER  = process.env.BRD_USER  || '';
+const BRD_PASS  = process.env.BRD_PASS  || '';
+const BRD_PROXY = process.env.BRD_PROXY || 'http://brd.superproxy.io:22225';
+const USE_PROXY = process.env.USE_PROXY === 'true';
 const USE_BRD_SB = process.env.USE_BRD_SB === 'true';
 const BRD_SB_WSS = process.env.BRD_SB_WSS || '';
 
@@ -31,31 +31,18 @@ async function callGemini(promptText) {
     });
 }
 
-// Load bom_components anchor from knowledge base
-function loadBomAnchor(leads) {
-    try {
-        if (!fs.existsSync('zhimao_supply_chain_economics.json')) return null;
-        const knowledge = JSON.parse(fs.readFileSync('zhimao_supply_chain_economics.json', 'utf8')).industries || {};
-        const sampleSnippet = leads.map(l => l.snippet || '').join(' ').toLowerCase();
-        for (const [, data] of Object.entries(knowledge)) {
-            const bom = data.bom_components;
-            if (!Array.isArray(bom) || bom.length === 0) continue;
-            const hits = bom.filter(b => sampleSnippet.includes(b.toLowerCase()));
-            if (hits.length > 0) return { name: data.name, bom };
-        }
-    } catch (_) {}
-    return null;
-}
-
-async function inferBOMGraph(leads) {
+/**
+ * L3 Supply Chain Inference (replaces legacy inferBOMGraph).
+ *
+ * Each lead gets a structured `inference_breakdown` (mirrors data_intel_l3_inferred schema)
+ * plus the flat fields kept for backwards compatibility:
+ *   lead.entity_role      — "Manufacturer" | "Wholesaler" | "Retailer" | "Service"
+ *   lead.inferred_bom     — string[] of top procurement materials (for L1 semantic_intent)
+ *   lead.inference_breakdown — full L3 JSON written to data_intel_l3_inferred
+ */
+async function inferL3SupplyChain(leads) {
     if (leads.length === 0) return leads;
-    console.log(`[step3] BOM deduction for ${leads.length} entities in batches of ${BOM_BATCH_SIZE}...`);
-
-    const bomAnchor  = loadBomAnchor(leads);
-    const anchorHint = bomAnchor
-        ? ` Anchor hint -- typical components for this industry (${bomAnchor.name}): ${bomAnchor.bom.slice(0, 6).join(', ')}.`
-        : '';
-    if (bomAnchor) console.log(`[step3] BOM anchor loaded: ${bomAnchor.name} (${bomAnchor.bom.length} components)`);
+    console.log(`[step3] L3 supply-chain inference for ${leads.length} entities (batch=${BOM_BATCH_SIZE})...`);
 
     for (let i = 0; i < leads.length; i += BOM_BATCH_SIZE) {
         const batch  = leads.slice(i, i + BOM_BATCH_SIZE);
@@ -63,9 +50,9 @@ async function inferBOMGraph(leads) {
 
 Rules:
 1. entity_role: "Manufacturer" (makes goods), "Wholesaler" (bulk buys/resells), "Retailer" (end-consumer facing), "Service" (services only).
-2. primary_materials_top3: exactly 3 upstream raw materials or components they must procure (short English snake_case, e.g. "memory_foam").${anchorHint}
+2. primary_materials_top3: exactly 3 upstream raw materials or finished goods they must procure. Use short English snake_case keys (e.g. "memory_foam", "pocket_springs", "fabric_ticking").
 3. procurement_items: array of {category, priority(1-3), source:"bom", type:"explicit"}.
-4. confidence_tier: "High" (unambiguous), "Medium" (probable), "Low" (guessed).
+4. confidence_tier: "High" (role is unambiguous), "Medium" (probable), "Low" (guessed).
 5. intent_summary: one English sentence — "<Name> is a <role> that procures <top materials> from upstream suppliers."
 6. purchase_cycle: "weekly" | "monthly" | "quarterly" | "annual" — best estimate.
 7. reason_codes: non-empty array from ["BOM_INFERENCE","ENTITY_ROLE_MANUFACTURER","ENTITY_ROLE_WHOLESALER","ENTITY_ROLE_RETAILER","ENTITY_ROLE_SERVICE","SUPPLY_CHAIN_GRAPH"].
@@ -77,29 +64,31 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
 
         try {
             const resData = await callGemini(prompt);
-            const results = JSON.parse(JSON.parse(resData).candidates[0].content.parts[0].text).results;
+            const parsed  = JSON.parse(resData);
+            const results = JSON.parse(parsed.candidates[0].content.parts[0].text).results;
             const now = new Date().toISOString();
             results.forEach(r => {
                 const lead = batch.find(l => l.company_name === r.name);
                 if (!lead) return;
                 lead.entity_role  = r.entity_role || 'Service';
                 lead.inferred_bom = Array.isArray(r.primary_materials_top3) ? r.primary_materials_top3 : [];
+                // Boost confidence score for clear buyer roles
                 if (r.entity_role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
                 else if (r.entity_role === 'Wholesaler' || r.entity_role === 'Retailer') lead.confidence_score = (lead.confidence_score || 50) + 10;
-                // Full L3 breakdown — persisted to data_intel_l3_inferred via Step5→bulk API
+                // Attach full L3 breakdown for later persistence
                 lead.inference_breakdown = {
-                    category:               lead.inferred_bom[0] || null,
-                    entity_role:            r.entity_role,
-                    confidence_tier:        r.confidence_tier || 'Medium',
+                    category:              lead.inferred_bom[0] || null,
+                    entity_role:           r.entity_role,
+                    confidence_tier:       r.confidence_tier || 'Medium',
                     primary_materials_top3: lead.inferred_bom,
-                    procurement_items:      Array.isArray(r.procurement_items) ? r.procurement_items : [],
-                    intent_summary:         r.intent_summary || '',
-                    purchase_cycle:         r.purchase_cycle || 'quarterly',
-                    reason_codes:           Array.isArray(r.reason_codes) ? r.reason_codes : ['BOM_INFERENCE'],
-                    model_version:          'v8-gemini-l3-v1',
-                    demand_source:          'inferred',
-                    graph_snapshot_version: 'v1',
-                    created_at:             now,
+                    procurement_items:     Array.isArray(r.procurement_items) ? r.procurement_items : [],
+                    intent_summary:        r.intent_summary || '',
+                    purchase_cycle:        r.purchase_cycle || 'quarterly',
+                    reason_codes:          Array.isArray(r.reason_codes) ? r.reason_codes : ['BOM_INFERENCE'],
+                    model_version:         'v8-gemini-l3-v1',
+                    demand_source:         'inferred',
+                    graph_snapshot_version:'v1',
+                    created_at:            now,
                     rfq_draft: {
                         title:        r.intent_summary || '',
                         description:  r.intent_summary || '',
@@ -111,59 +100,31 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                     },
                 };
             });
-            console.log(`[step3] BOM batch ${Math.floor(i / BOM_BATCH_SIZE) + 1} done`);
+            console.log(`[step3] L3 batch ${Math.floor(i / BOM_BATCH_SIZE) + 1} done`);
         } catch (e) {
-            console.warn(`[step3] BOM batch ${Math.floor(i / BOM_BATCH_SIZE) + 1} failed: ${e.message}`);
+            console.warn(`[step3] L3 batch ${Math.floor(i / BOM_BATCH_SIZE) + 1} failed: ${e.message}`);
         }
     }
     return leads;
 }
 
-// ?? Email cleaner: strip fake/exhibition/platform addresses ??????????????????
-const EMAIL_DOMAIN_BLACKLIST = new Set([
-    'messefrankfurt.com','cantonfair.org.cn','globalsources.com','alibaba.com',
-    'amazon.com','aliexpress.com','made-in-china.com','thomasnet.com',
-    'indiamart.com','tradefair.com','messe.de','koelnmesse.de','reed.co.uk',
-    'example.com','test.com','domain.com','email.com','mail.com','tempmail.com',
-]);
-const EMAIL_ROLE_PREFIXES = new Set([
-    'noreply','no-reply','donotreply','do-not-reply','webmaster','postmaster',
-    'mailer-daemon','bounce','unsubscribe','admin','support','info',
-]);
-
-function cleanEmail(raw) {
-    if (!raw) return null;
-    const em = raw.toLowerCase().trim();
-    if (!em.includes('@')) return null;
-    const [local, domain] = em.split('@');
-    if (!domain) return null;
-    if (/\.(png|jpg|jpeg|gif|svg|webp|pdf|css|js)$/i.test(em)) return null;
-    if (EMAIL_DOMAIN_BLACKLIST.has(domain)) return null;
-    const prefix = local.split('+')[0].split('.')[0];
-    if (EMAIL_ROLE_PREFIXES.has(prefix)) return null;
-    return em;
-}
-
 const extractFromHTML = (html, emails, phones) => {
     const $ = cheerio.load(html);
-    $('a[href^="mailto:"]').each((_, el) => {
-        const clean = cleanEmail($(el).attr('href').replace('mailto:', '').split('?')[0].trim());
-        if (clean) emails.add(clean);
-    });
+    $('a[href^="mailto:"]').each((_, el) => emails.add($(el).attr('href').replace('mailto:', '').split('?')[0].trim()));
     $('a[href^="tel:"]').each((_, el) => phones.add($(el).attr('href').replace('tel:', '').trim()));
     $('a[href*="wa.me/"]').each((_, el) => phones.add($(el).attr('href')));
     const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,})/g;
     let match;
     while ((match = emailRegex.exec($('body').text())) !== null) {
-        const clean = cleanEmail(match[1]);
-        if (clean) emails.add(clean);
+        const em = match[1].toLowerCase();
+        if (!em.endsWith('.png') && !em.endsWith('.jpg') && !em.endsWith('.jpeg')) emails.add(em);
     }
 };
 
 async function run() {
     let leads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
 
-    leads = await inferBOMGraph(leads);
+    leads = await inferL3SupplyChain(leads);
 
     let browser;
     if (USE_BRD_SB) {
@@ -186,20 +147,20 @@ async function run() {
             browser = await chromium.launch(launchOptions);
         } catch (launchErr) {
             if (String(launchErr.message).includes("Executable doesn't exist")) {
-                console.log('[step3] Chromium not found -- installing now (first-run on this host)...');
+                console.log("[step3] Chromium not found — installing now (first-run on this host)...");
                 require('child_process').execSync(
                     'node ' + require('path').join(__dirname, 'node_modules', '.bin', 'playwright') + ' install chromium',
                     { stdio: 'inherit' }
                 );
-                console.log('[step3] Chromium install complete -- retrying launch...');
+                console.log("[step3] Chromium install complete — retrying launch...");
                 browser = await chromium.launch(launchOptions);
             } else {
                 throw launchErr;
             }
         }
     }
-    const context       = await browser.newContext({ ignoreHTTPSErrors: true });
-    const mobileContext = await browser.newContext({ ignoreHTTPSErrors: true, userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36' });
+    const context        = await browser.newContext({ ignoreHTTPSErrors: true });
+    const mobileContext  = await browser.newContext({ ignoreHTTPSErrors: true, userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36' });
 
     const enriched = [];
     for (const l of leads) {
@@ -226,6 +187,7 @@ async function run() {
 
                     // Auto-find and visit /contact page for richer contact data
                     try {
+                        // Prefer exact href match first, then partial-text anchor
                         const contactHref = await page.evaluate(() => {
                             const anchors = Array.from(document.querySelectorAll('a[href]'));
                             const exact   = anchors.find(a => /\/(contact|contacts|contact-us|contactus)(\/|$|\?)/i.test(a.getAttribute('href')));
@@ -237,9 +199,9 @@ async function run() {
                             await page.goto(contactUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
                             extractFromHTML(await page.content(), emails, phones);
                         }
-                    } catch (_) { /* contact page unreachable -- ignore */ }
+                    } catch (_) { /* contact page unreachable ??ignore */ }
                 }
-            } catch (e) { /* timeout / network error -- continue */ } finally { if (page) await page.close().catch(() => {}); }
+            } catch (e) { /* timeout / network error ??continue */ } finally { if (page) await page.close().catch(() => {}); }
 
             if (emails.size > 0) l.primary_email = Array.from(emails)[0];
             const cleanPhones = Array.from(phones).filter(p => p.length < 20);
@@ -260,7 +222,7 @@ async function run() {
 
     await browser.close();
     fs.writeFileSync(outputFile, JSON.stringify(enriched, null, 2));
-    console.log(`[step3] Done -- ${enriched.length} enriched leads -> ${outputFile}`);
+    console.log(`[step3] Done ??${enriched.length} enriched leads ??${outputFile}`);
 }
 
 run().catch(e => { console.error(e); process.exit(1); });
