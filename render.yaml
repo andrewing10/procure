@@ -28,22 +28,25 @@ services:
         sync: false
       - key: BRD_PASS
         sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
       - key: BRD_PROXY
         value: "http://brd.superproxy.io:33335"
       - key: USE_BRD_SB
         value: "false"
       - key: BRD_SB_WSS
         sync: false
-      # ── Catagent / Zhimao ────────────────────────────────────────────
-      - key: CATAGENT_API_URL
-        value: https://www.procureradar.com
-      - key: CATAGENT_API_KEY
+      # ── CRM B2 emit（可选，与 zhimao apps/web 一致）────────────────────
+      - key: ZHIMAO_APP_URL
         sync: false
-      # ── Supabase ─────────────────────────────────────────────────────
-      - key: SUPABASE_URL
+      - key: CRM_WATCH_EMIT_SECRET
         sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
+      - key: DISCOVERY_COMPLETION_NOTIFY
+        value: "supabase"
+      - key: CRM_WATCH_EMIT_ON_FAILURE
+        value: "false"
       # ── 运行模式 ────────────────────────────────────────────────────
       # SKIP_SQLITE=true：Render 默认用 ephemeral 文件系统，SQLite 重启后清零。
       # 因此 enrichment_queue / main_db 在生产环境无持久化价值。

@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('./load-env');
 const fs      = require('fs');
 const { chromium } = require('playwright');
 const cheerio = require('cheerio');
@@ -71,8 +71,8 @@ function flushDomainCache() {
 /**
  * L3 Supply Chain Inference (Gemini).
  *
- * Now runs batches in parallel with bounded concurrency, hard timeouts, and
- * exponential backoff retry. A single 429 no longer stalls every later batch.
+ * Batches run in parallel with bounded concurrency, timeouts, and retry.
+ * Each lead gets `inference_breakdown` for Step5 / L1, plus entity_role and inferred_bom.
  */
 async function inferL3SupplyChain(leads) {
     if (leads.length === 0) return leads;

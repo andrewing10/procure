@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('./load-env');
 const { spawn, execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -132,9 +132,8 @@ async function markRunning(jobId) {
 }
 
 async function readResultCountFromBulk(jobId) {
-  // Bulk API (Step 5 → /api/data-intel/l1/procurement/bulk) is the single source of
-  // truth for how many rows this job actually wrote into data_intel_l1_companies.
-  // The worker only reads that value — it must not overwrite it with a country-wide count,
+  // Step 5 (Supabase direct L1 ingest) sets discovery_jobs.result_count when DISCOVERY_JOB_ID is set.
+  // The worker reads that value here — it must not overwrite with a country-wide count,
   // otherwise unrelated prior runs leak into this job's reported number.
   const { data, error } = await supabase
     .from('discovery_jobs')
@@ -150,9 +149,8 @@ async function readResultCountFromBulk(jobId) {
 
 async function markDone(job, count) {
   const nowIso = new Date().toISOString();
-  // Only update status/completed_at. result_count was already written by Bulk API
-  // (Step 5) using the exact rows.length actually upserted in this job — that is
-  // the authoritative number and must not be overridden here.
+  // Only update status/completed_at. result_count was already written by Step 5 direct ingest
+  // (resolved lead count for this job) and must not be overridden here.
   const { error: updateErr } = await supabase
     .from('discovery_jobs')
     .update({ status: 'done', completed_at: nowIso, error_message: null })

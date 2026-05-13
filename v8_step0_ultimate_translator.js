@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('./load-env');
 const fs    = require('fs');
 const https = require('https');
 

@@ -1,0 +1,20 @@
+[
+  {
+    "company_name": "Procure Smoke Test Co",
+    "country": "mx",
+    "domain": "https://example-smoke-procure.invalid",
+    "primary_email": "smoke+procure@test.invalid",
+    "confidence_score": 85,
+    "entity_role": "Wholesaler",
+    "snippet": "Smoke test row from procure repo — safe to delete.",
+    "inferred_bom": ["memory_foam", "fabric_ticking"],
+    "inference_breakdown": {
+      "confidence_tier": "High",
+      "procurement_items": [
+        { "category": "foam", "priority": 1, "source": "bom", "type": "explicit" }
+      ],
+      "intent_summary": "Smoke test wholesaler.",
+      "purchase_cycle": "quarterly"
+    }
+  }
+]

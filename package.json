@@ -7,7 +7,8 @@
     "loop":   "node v8_infinite_loop.js",
     "cron":   "node v8_cron_worker.js",
     "run":    "node zhimao_v8_ultimate_master.js",
-    "worker": "node v8_discovery_worker.js"
+    "worker": "node v8_discovery_worker.js",
+    "smoke:step5": "node scripts/step5_smoke.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.50.3",

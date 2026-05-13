@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('./load-env');
 const fs = require('fs');
 const { pMap, callGeminiJson, preFilterRawLeads } = require('./v8_lib_concurrency');
 const { isJunkName } = require('./v8_quality_gate');

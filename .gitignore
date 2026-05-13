@@ -3,6 +3,7 @@ node_modules/
 
 # Secrets — NEVER commit
 .env
+.env.local
 *.env
 api_credentials.*
 

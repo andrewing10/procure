@@ -87,7 +87,7 @@ runAssertedStep("2. Strict Entity Intake", "v8_step2_intake.js", fileBus.t1_raw_
 
 // PHASE 3: L3 Supply-Chain Inference + Contact Extraction
 // Gemini infers entity_role, BOM (primary_materials_top3), procurement_items, confidence_tier,
-// intent_summary — stored as inference_breakdown (written to data_intel_l3_inferred by Step5→API).
+// intent_summary — stored as inference_breakdown (L1 column via Step5 Supabase ingest).
 runAssertedStep("3. L3 Supply-Chain Inference & Contact Extraction", "v8_step3_ultimate_enrichment.js", fileBus.t2_intake, fileBus.t3_enriched);
 
 // PHASE 3.5 (Optional): 税号/工商注册反向验证（置信度加权，加分不减分）
@@ -106,7 +106,7 @@ if (process.env.TAX_VERIFY_ENABLED === 'true') {
 // PHASE 4: Global Dedupe & Schema Normalization
 runAssertedStep("4. Global Dedupe", "v8_step4_dedupe.js", fileBus.t3_enriched, fileBus.t4_deduped, `"${countryCode}"`);
 
-// PHASE 5: Routing Gateway → Catagent API
+// PHASE 5: Routing Gateway → Supabase L1 + graph edges
 runAssertedStep("5. Routing & Persistence Gateway", "v8_step5_routing_gateway.js", fileBus.t4_deduped, fileBus.t5_final);
 
 console.log(`\n[V8 PIPELINE COMPLETE] Session: ${sessionId}`);
