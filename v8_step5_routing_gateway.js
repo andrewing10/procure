@@ -14,6 +14,7 @@ const fs       = require('fs');
 const https    = require('https');
 const Database = require('better-sqlite3');
 const crypto   = require('crypto');
+const { evaluateLead } = require('./v8_quality_gate');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 
@@ -30,13 +31,19 @@ let insertMain = null;
 let insertQueue = null;
 if (!SKIP_SQLITE) {
     const db = new Database('zhimao_v8_matrix.sqlite');
+    // 唯一约束为 (company_name, country) — 与 zhimao DB 的 UNIQUE(name_canonical, country) 对齐。
+    // 跨国同名公司（如"Samsung"在 KR 和 VN）是不同实体，不能合并。
+    // 注：若本地已有旧 main_db 表（仅 company_name UNIQUE），需手动 DROP TABLE main_db 重建。
     db.exec(`CREATE TABLE IF NOT EXISTS main_db (
-        company_name TEXT UNIQUE, domain TEXT, country TEXT,
+        company_name TEXT NOT NULL, domain TEXT, country TEXT NOT NULL DEFAULT '',
         primary_email TEXT, primary_phone TEXT,
-        confidence_score INTEGER, entity_role TEXT, source TEXT, timestamp TEXT
+        confidence_score INTEGER, entity_role TEXT, source TEXT, timestamp TEXT,
+        UNIQUE(company_name, country)
     )`);
     db.exec(`CREATE TABLE IF NOT EXISTS enrichment_queue (
-        company_name TEXT UNIQUE, domain TEXT, score INTEGER, retries INTEGER DEFAULT 0
+        company_name TEXT NOT NULL, domain TEXT, country TEXT NOT NULL DEFAULT '',
+        score INTEGER, retries INTEGER DEFAULT 0,
+        UNIQUE(company_name, country)
     )`);
     insertMain = db.prepare(`INSERT OR IGNORE INTO main_db (company_name, domain, country, primary_email, primary_phone, confidence_score, entity_role, source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     insertQueue = db.prepare(`INSERT OR IGNORE INTO enrichment_queue (company_name, domain, score) VALUES (?, ?, ?)`);
@@ -44,40 +51,31 @@ if (!SKIP_SQLITE) {
     console.log('[step5] SKIP_SQLITE=true, local sqlite writes disabled.');
 }
 
-// ── Quality Gate (P0) ───────────────────────────────────────────────────────
-// Centralized "qualified-or-veto" rules — a record is only shipped downstream
-// if EVERY criterion below holds. This is the upstream half of the unified
-// quality SLA enforced jointly with Bulk API (quality_grade) and the search
-// layer (.neq quality_grade unqualified).
+// ── Quality Gate (P0) — 与 zhimao computeQualityGrade 完全对齐 ───────────────
+// 使用 v8_quality_gate.js（镜像 zhimao/apps/web/lib/data-intel/quality.ts）。
 //
-// Required:
-//   1) company_name present
-//   2) at least one contact channel: primary_email | primary_phone | domain
-//   3) L3 inference is actionable: confidence_tier ∈ {High, Medium}
-//                                  AND procurement_items length >= 1
+// 规则对齐的意义：
+//   V8 在此处拦截的数据 ≡ zhimao 在搜索层用 .neq(quality_grade,unqualified) 隐藏的数据。
+//   两端规则一致 → 不再出现"上传消耗配额但展示不了"的浪费，也不再有"能展示但内容为空卡"的客诉。
 //
-// Records failing ANY rule are dropped here and never enter the L1 table —
-// preventing "paid to unlock an empty card" / "drone-on-palm-farm" failures.
-function isQualifiedLead(l) {
-    if (!l || !l.company_name) return false;
-    const hasContact = !!(l.primary_email || l.primary_phone || l.domain);
-    if (!hasContact) return false;
-    const ib = l.inference_breakdown;
-    // L3 breakdown is optional — when present, it must meet quality criteria.
-    if (ib && typeof ib === 'object') {
-        const tier = String(ib.confidence_tier || '').toLowerCase();
-        if (tier === 'low') return false;
-        const items = Array.isArray(ib.procurement_items) ? ib.procurement_items : [];
-        if (items.length < 1) return false;
-    }
-    return true;
-}
+// grade 分布统计帮助运营判断数据管线健康度：
+//   premium   — 高置信 L3 + 真实联系方式（解锁 30 分）
+//   qualified — 有联系方式（解锁 10 分）
+//   unqualified — 丢弃，不上传
 
 const totalLeads = leads.length;
-const validLeads = leads.filter(isQualifiedLead);
+const gradeStats = { premium: 0, qualified: 0, unqualified: 0 };
+const validLeads = leads.filter(lead => {
+    const { qualified, grade } = evaluateLead(lead);
+    gradeStats[grade] = (gradeStats[grade] || 0) + 1;
+    lead._quality_grade = grade; // 附加到 lead 供日志使用
+    return qualified;
+});
 const droppedQuality = totalLeads - validLeads.length;
 if (droppedQuality > 0) {
-    console.log(`[step5] quality-gate veto: dropped ${droppedQuality} / ${totalLeads} leads (no contact, low L3 confidence, or empty procurement_items).`);
+    console.log(`[step5] quality-gate veto: dropped ${droppedQuality}/${totalLeads} (unqualified). grade distribution: premium=${gradeStats.premium} qualified=${gradeStats.qualified} unqualified=${gradeStats.unqualified}`);
+} else {
+    console.log(`[step5] quality-gate pass: ${validLeads.length}/${totalLeads}. premium=${gradeStats.premium} qualified=${gradeStats.qualified}`);
 }
 
 leads.forEach(lead => {

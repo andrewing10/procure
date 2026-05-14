@@ -1,6 +1,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const { pMap, callGeminiJson, preFilterRawLeads } = require('./v8_lib_concurrency');
+const { isJunkName } = require('./v8_quality_gate');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 
@@ -56,20 +57,23 @@ async function processBatch(batch, batchIndex, batchTotal, triggerBlock) {
     }
     const results = Array.isArray(parsed?.results) ? parsed.results : [];
     const accepted = [];
+    let junkNameDropped = 0;
     batch.forEach((r, idx) => {
         const cn = results[idx]?.company_name;
-        if (cn && cn !== 'null' && typeof cn === 'string' && cn.trim()) {
-            accepted.push({
-                company_name: cn.trim(),
-                domain:        r.link,
-                snippet:       r.snippet,
-                phone:         r.phone,
-                pillar:        r.pillar,
-                intent_signal: r.intent_signal,
-            });
-        }
+        if (!cn || cn === 'null' || typeof cn !== 'string' || !cn.trim()) return;
+        const name = cn.trim();
+        // 用与 zhimao quality_gate 对齐的 isJunkName 过滤，避免垃圾名进入 Step3 浪费 Gemini
+        if (isJunkName(name)) { junkNameDropped += 1; return; }
+        accepted.push({
+            company_name: name,
+            domain:        r.link,
+            snippet:       r.snippet,
+            phone:         r.phone,
+            pillar:        r.pillar,
+            intent_signal: r.intent_signal,
+        });
     });
-    console.log(`[step2] Batch ${batchIndex}/${batchTotal}: ${accepted.length}/${batch.length} accepted (${Date.now() - startedAt}ms)`);
+    console.log(`[step2] Batch ${batchIndex}/${batchTotal}: ${accepted.length}/${batch.length} accepted, junk_name_dropped=${junkNameDropped} (${Date.now() - startedAt}ms)`);
     return { accepted, failed: false };
 }
 
