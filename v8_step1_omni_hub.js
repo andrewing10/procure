@@ -19,6 +19,8 @@ const [inputFile, outputFile, countryCode] = process.argv.slice(2);
 const API_KEY = process.env.SERPER_API_KEY;
 if (!API_KEY) { console.error('[step1] SERPER_API_KEY env var is required'); process.exit(1); }
 
+const GMAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
+
 // ── Deep Paging：由 Cron 传入的第几次扫描，转换为 Serper 搜索页码 ────────────
 // sweep 1 → page 1（结果 1-20）
 // sweep 2 → page 2（结果 21-40）
@@ -113,6 +115,69 @@ function fetchPlaces(query, gl) {
   return serperPost('/places', { q: query, gl }).then(r => r.places || []);
 }
 
+// ─── Google Places API（原生，优先于 Serper /places）──────────────────────
+// Text Search → Place Details（补电话+官网），最多 20 条，并发限 5 个 Details
+// 失败静默降级：返回 [] 触发 Serper /places 兜底
+function httpsGet(url) {
+  return new Promise(resolve => {
+    https.get(url, r => {
+      let data = ''; r.on('data', c => data += c);
+      r.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
+    }).on('error', () => resolve({}));
+  });
+}
+
+async function fetchGooglePlacesNative(query, gl) {
+  if (!GMAPS_KEY) return null; // 无 key，触发 Serper 兜底
+
+  const tsUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json`
+    + `?query=${encodeURIComponent(query)}`
+    + `&region=${gl.toLowerCase()}`
+    + `&key=${GMAPS_KEY}`;
+  const tsRes = await httpsGet(tsUrl).catch(() => ({}));
+  if (tsRes.status !== 'OK' || !Array.isArray(tsRes.results) || tsRes.results.length === 0) return null;
+
+  const raw = tsRes.results.slice(0, 20);
+  const detailFields = 'name,formatted_address,formatted_phone_number,website,business_status,rating,user_ratings_total';
+
+  // 并发最多 5 个 Place Details（保持在 Google QPS 内）
+  const pLimit = 5;
+  const enriched = [];
+  for (let i = 0; i < raw.length; i += pLimit) {
+    const batch = raw.slice(i, i + pLimit);
+    const details = await Promise.all(batch.map(async p => {
+      if (!p.place_id) return p;
+      const dtUrl = `https://maps.googleapis.com/maps/api/place/details/json`
+        + `?place_id=${encodeURIComponent(p.place_id)}`
+        + `&fields=${detailFields}`
+        + `&key=${GMAPS_KEY}`;
+      const dt = await httpsGet(dtUrl).catch(() => ({}));
+      if (dt.status === 'OK' && dt.result) return { ...p, ...dt.result };
+      return p;
+    }));
+    enriched.push(...details);
+  }
+  return enriched;
+}
+
+// P1 Pillar 专用：先走 Google Places 原生，失败回 Serper /places
+async function fetchPlacesWithFallback(query, gl) {
+  const native = await fetchGooglePlacesNative(query, gl).catch(() => null);
+  if (native && native.length > 0) {
+    return native.map(p => ({
+      title:       p.name || '',
+      website:     p.website || '',
+      phoneNumber: p.formatted_phone_number || '',
+      address:     p.formatted_address || p.vicinity || '',
+      rating:      p.rating,
+      business_status: p.business_status,
+      _source: 'google_places_native',
+    }));
+  }
+  // Serper 兜底
+  return fetchPlaces(query, gl);
+}
+
 function searchOrganic(query, gl, num = 20, page = SEARCH_PAGE) {
   // page=1 时不传（Serper 默认），page≥2 时传入实现真正的深水区翻页
   const body = page > 1
@@ -183,9 +248,9 @@ async function run() {
       const q = SEARCH_PAGE % 2 === 0
         ? `${category} procurement manager OR buyer OR purchasing ${countryName}`
         : `${category} wholesaler OR distributor OR importer in ${countryName}`;
-      return fetchPlaces(q, cc).then(ps => ps
+      return fetchPlacesWithFallback(q, cc).then(ps => ps
         .filter(p => p.website || p.phoneNumber)
-        .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'MAP_VERIFIED_BUYER' }))
+        .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'MAP_VERIFIED_BUYER', _gmaps_source: p._source || 'serper_places' }))
       );
     })(),
 
@@ -193,9 +258,9 @@ async function run() {
       const q = SEARCH_PAGE % 2 === 0
         ? `${category} import export agent OR sourcing company ${countryName}`
         : `${category} trading company OR import export in ${countryName}`;
-      return fetchPlaces(q, cc).then(ps => ps
+      return fetchPlacesWithFallback(q, cc).then(ps => ps
         .filter(p => p.website || p.phoneNumber)
-        .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'TRADING_COMPANY' }))
+        .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'TRADING_COMPANY', _gmaps_source: p._source || 'serper_places' }))
       );
     })(),
 

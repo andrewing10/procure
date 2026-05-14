@@ -17,6 +17,8 @@ const OPENAI_KEY   = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL   || 'gpt-4o';
 if (!GEMINI_KEY) { console.error('[step3] GEMINI_KEY env var is required'); process.exit(1); }
 
+const GMAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
+
 // Browser / proxy config (unchanged) ─────────────────────────────────────────
 const BRD_USER  = process.env.BRD_USER  || '';
 const BRD_PASS  = process.env.BRD_PASS  || '';
@@ -254,10 +256,76 @@ const extractFromHTML = (html, emails, phones) => {
     }
 };
 
+// ─── Google Places API：按公司名称查电话 + 官网（节省 Playwright 资源）────────
+// 策略：有 GMAPS_KEY + 公司名 → findplacefromtext，命中返回 {phone, website}
+// 无 key 或查无 → null（不阻塞主流程）
+const https2 = require('https');
+function httpsGetStep3(url) {
+    return new Promise(resolve => {
+        https2.get(url, r => {
+            let data = ''; r.on('data', c => data += c);
+            r.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
+        }).on('error', () => resolve({}));
+    });
+}
+
+async function lookupContactViaGooglePlaces(companyName, countryIso) {
+    if (!GMAPS_KEY || !companyName) return null;
+    try {
+        const q = encodeURIComponent(`${companyName}${countryIso ? ' ' + countryIso : ''}`);
+        const findUrl = `https://maps.googleapis.com/maps/api/place/findplacefromtext/json`
+            + `?input=${q}&inputtype=textquery`
+            + `&fields=place_id,name,business_status`
+            + `&key=${GMAPS_KEY}`;
+        const findRes = await httpsGetStep3(findUrl);
+        if (findRes.status !== 'OK' || !findRes.candidates?.length) return null;
+
+        const placeId = findRes.candidates[0].place_id;
+        if (!placeId) return null;
+
+        const detUrl = `https://maps.googleapis.com/maps/api/place/details/json`
+            + `?place_id=${encodeURIComponent(placeId)}`
+            + `&fields=name,formatted_phone_number,website,business_status`
+            + `&key=${GMAPS_KEY}`;
+        const detRes = await httpsGetStep3(detUrl);
+        if (detRes.status !== 'OK' || !detRes.result) return null;
+
+        const r = detRes.result;
+        const phone   = r.formatted_phone_number || null;
+        const website = r.website || null;
+        if (!phone && !website) return null;
+        return { phone, website, business_status: r.business_status || null, source: 'google_places' };
+    } catch (_) { return null; }
+}
+
 async function extractContactForLead(lead, contexts) {
     let score = lead.confidence_score || 50;
     lead.primary_email = lead.primary_email || lead.email || null;
     lead.primary_phone = lead.primary_phone || lead.phone || null;
+
+    // ── ❶ Google Places API 预填充（比 Playwright 快 10-50x，节省代理配额）────
+    // 只对还缺电话/官网的 lead 执行，且必须有公司名
+    if (GMAPS_KEY && lead.company_name && (!lead.primary_phone || !lead.domain)) {
+        const gmapsResult = await lookupContactViaGooglePlaces(lead.company_name, lead.country_iso || '');
+        if (gmapsResult) {
+            if (gmapsResult.phone && !lead.primary_phone) {
+                lead.primary_phone = gmapsResult.phone;
+                score += 20;
+            }
+            if (gmapsResult.website && !lead.domain) {
+                lead.domain = gmapsResult.website;
+                score += 15;
+            }
+            if (gmapsResult.business_status === 'OPERATIONAL') score += 10;
+            lead._gmaps_contact_filled = true;
+            console.log(`[step3] Google Places prefill: ${lead.company_name} → phone=${gmapsResult.phone || 'none'} website=${gmapsResult.website || 'none'}`);
+            // 如果电话和官网都补全了，跳过 Playwright（大幅节约时间）
+            if (lead.primary_phone && lead.domain) {
+                lead.confidence_score = Math.min(score, 100);
+                return lead;
+            }
+        }
+    }
 
     // ── 缓存命中：跳过 Playwright，直接使用已缓存的联系方式 ──────────────────
     if (lead.domain && lead.domain.startsWith('http')) {
