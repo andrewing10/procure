@@ -2,6 +2,62 @@ require('dotenv').config();
 const fs    = require('fs');
 const https = require('https');
 
+// ── P0 垃圾域名黑名单（与 zhimao lib/data-intel/quality.ts 保持一致） ─────────
+const JUNK_DOMAIN_HOSTS = new Set([
+  'scribd.com','www.scribd.com',
+  'reddit.com','www.reddit.com','old.reddit.com',
+  'quora.com','www.quora.com',
+  'alibaba.com','www.alibaba.com','m.alibaba.com',
+  'aliexpress.com','www.aliexpress.com',
+  '1688.com','www.1688.com',
+  'taobao.com','www.taobao.com',
+  'jd.com','www.jd.com',
+  'pinduoduo.com',
+  'linkedin.com','www.linkedin.com',
+  'facebook.com','www.facebook.com','m.facebook.com',
+  'twitter.com','www.twitter.com','x.com',
+  'instagram.com','www.instagram.com',
+  'youtube.com','www.youtube.com',
+  'tiktok.com','www.tiktok.com',
+  'pinterest.com','www.pinterest.com',
+  'made-in-china.com','www.made-in-china.com',
+  'globalsources.com','www.globalsources.com',
+  'tradeindia.com','www.tradeindia.com',
+  'tradekey.com','www.tradekey.com',
+  'exportersindia.com','www.exportersindia.com',
+  'ec21.com','www.ec21.com',
+  'ecplaza.net','www.ecplaza.net',
+  'kompass.com','www.kompass.com',
+  'yellowpages.com','www.yellowpages.com',
+  'yelp.com','www.yelp.com',
+  'amazon.com','www.amazon.com',
+  'ebay.com','www.ebay.com',
+  'etsy.com','www.etsy.com',
+  'importyeti.com','www.importyeti.com',
+  'volza.com','www.volza.com',
+  'panjiva.com','www.panjiva.com',
+  'tradesparq.com',
+  'bing.com','www.bing.com',
+  'google.com','www.google.com',
+  'wikipedia.org','en.wikipedia.org',
+]);
+const JUNK_DOMAIN_PATTERNS = [
+  /scribd\./i, /1688\.com/i, /wikip/i, /fandom\.com/i,
+  /blogspot\./i, /wordpress\.com/i, /medium\.com/i,
+];
+
+/** 返回 true 说明这条 lead 是垃圾，应丢弃 */
+function isJunkLead(lead) {
+  if (!lead || !lead.link) return false;
+  try {
+    const url = lead.link.trim().toLowerCase();
+    const domain = url.replace(/^https?:\/\//,'').replace(/\/.*/,'').replace(/:\d+$/,'');
+    if (JUNK_DOMAIN_HOSTS.has(domain)) return true;
+    if (JUNK_DOMAIN_PATTERNS.some(p => p.test(domain))) return true;
+  } catch(_) {}
+  return false;
+}
+
 const [inputFile, outputFile, countryCode] = process.argv.slice(2);
 
 const API_KEY = process.env.SERPER_API_KEY;
@@ -147,8 +203,16 @@ async function run() {
     const nowIso = new Date().toISOString();
     allLeads.forEach(l => { l.source_timestamp = l.source_timestamp || nowIso; });
 
-    fs.writeFileSync(outputFile, JSON.stringify(allLeads, null, 2));
-    console.log(`[step1] Done -- ${allLeads.length} raw leads written -> ${outputFile}`);
+    // P0 出口过滤：丢弃垃圾域名 leads（不影响无 link 的 Pillar 0/1 结果）
+    const beforeFilter = allLeads.length;
+    const filteredLeads = allLeads.filter(l => !isJunkLead(l));
+    const junkCount = beforeFilter - filteredLeads.length;
+    if (junkCount > 0) {
+        console.log(`[step1] P0 junk filter: removed ${junkCount}/${beforeFilter} leads (junk domains)`);
+    }
+
+    fs.writeFileSync(outputFile, JSON.stringify(filteredLeads, null, 2));
+    console.log(`[step1] Done -- ${filteredLeads.length} clean leads written -> ${outputFile}`);
 }
 
 run().catch(e => { console.error(e); process.exit(1); });
