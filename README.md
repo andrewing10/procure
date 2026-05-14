@@ -44,3 +44,7 @@ See `.env.example` for the full list with descriptions.
 ## Step 5 — Supabase L1 ingest
 
 Qualified leads are written by `v8_direct_l1_ingest.js`: upsert `data_intel_l1_companies` on `(name_canonical, country)` with `ignoreDuplicates`, then insert `PURCHASES` edges into `data_intel_graph_edges` from `inferred_bom`. When `DISCOVERY_JOB_ID` is set, `discovery_jobs.result_count` is updated. Field mapping lives in `buildL1Row()` in that module.
+
+## Discovery worker — CRM `crm-watch/emit` (B2)
+
+`v8_discovery_worker.js` can call zhimao `POST /api/internal/crm-watch/emit` after a job succeeds (and optionally on failure). Configure `ZHIMAO_APP_URL` + `CRM_WATCH_EMIT_SECRET`, and set `DISCOVERY_COMPLETION_NOTIFY` to `emit` (HTTP only), `supabase` (legacy `notifications` insert only, default), or `both`. See `.env.example` and `v8_crm_watch_emit.js`.

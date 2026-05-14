@@ -1,6 +1,11 @@
 require('./load-env');
 const { spawn, execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
+const {
+  emitDiscoveryJobCompleted,
+  emitDiscoveryJobFailed,
+  discoveryCompletionNotifyMode,
+} = require('./v8_crm_watch_emit');
 
 // Self-heal: ensure Playwright Chromium binary is present before the first job runs.
 // Render's build and runtime filesystems are separate; the browser cache from buildCommand
@@ -159,7 +164,9 @@ async function markDone(job, count) {
     console.error('[worker] mark done error:', updateErr.message);
   }
 
-  if (job.requested_by) {
+  const notifyMode = discoveryCompletionNotifyMode();
+
+  if ((notifyMode === 'supabase' || notifyMode === 'both') && job.requested_by) {
     const { error: notifyErr } = await supabase.from('notifications').insert({
       recipient_user_id: job.requested_by,
       notification_type: 'discovery_complete',
@@ -174,9 +181,25 @@ async function markDone(job, count) {
       console.error('[worker] notify error:', notifyErr.message);
     }
   }
+
+  if (notifyMode === 'emit' || notifyMode === 'both') {
+    const emitRes = await emitDiscoveryJobCompleted(job);
+    if (emitRes.skipped) {
+      if (emitRes.reason && emitRes.reason !== 'missing_zhimao_app_url_or_emit_secret') {
+        console.warn('[worker] crm-watch emit skipped:', emitRes.reason);
+      }
+    } else if (!emitRes.ok) {
+      console.error('[worker] crm-watch emit failed:', emitRes.error || emitRes.status, emitRes.data || '');
+    } else if (emitRes.data && typeof emitRes.data === 'object' && emitRes.data.deduped) {
+      console.log('[worker] crm-watch emit deduped=true');
+    } else {
+      console.log('[worker] crm-watch emit ok');
+    }
+  }
 }
 
-async function markFailed(jobId, msg) {
+async function markFailed(job, msg) {
+  const jobId = job.id;
   const { error } = await supabase
     .from('discovery_jobs')
     .update({
@@ -187,6 +210,19 @@ async function markFailed(jobId, msg) {
     .eq('id', jobId);
   if (error) {
     console.error('[worker] mark failed error:', error.message);
+  }
+
+  if (process.env.CRM_WATCH_EMIT_ON_FAILURE === 'true') {
+    const emitRes = await emitDiscoveryJobFailed(job, String(msg || 'pipeline_failed'));
+    if (emitRes.skipped) {
+      if (emitRes.reason && emitRes.reason !== 'missing_zhimao_app_url_or_emit_secret') {
+        console.warn('[worker] crm-watch failed emit skipped:', emitRes.reason);
+      }
+    } else if (!emitRes.ok) {
+      console.error('[worker] crm-watch failed emit:', emitRes.error || emitRes.status);
+    } else {
+      console.log('[worker] crm-watch failed emit ok');
+    }
   }
 }
 
@@ -243,11 +279,13 @@ async function main() {
       const sweepCount = Number(jobMeta?.sweep_count ?? 0) + 1;
 
       const reweightPolicies = await readReweightPolicies(job);
-      console.log(`[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`);
+      console.log(
+        `[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`,
+      );
       const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount, job, reweightPolicies);
 
       if (exitCode === PIPELINE_EXIT.CRASH) {
-        await markFailed(job.id, 'pipeline_exit_non_zero');
+        await markFailed(job, 'pipeline_exit_non_zero');
         await sleep(1000);
         continue;
       }
