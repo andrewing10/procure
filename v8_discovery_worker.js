@@ -64,7 +64,14 @@ async function pickPendingJob() {
     .limit(1)
     .maybeSingle();
   if (error) {
-    console.error('[worker] select pending job error:', error.message);
+    // PostgREST schema cache 刚 migration 后短暂失效，"schema cache" 关键字代表可自愈错误
+    // 额外等 30s 让 PostgREST 完成 cache reload，避免每 15s 刷屏
+    if (error.message && error.message.toLowerCase().includes('schema cache')) {
+      console.warn('[worker] select pending job error (schema cache refreshing, waiting 30s):', error.message);
+      await sleep(30_000);
+    } else {
+      console.error('[worker] select pending job error:', error.message);
+    }
     return null;
   }
   return data || null;
@@ -165,7 +172,11 @@ async function writeHeartbeat() {
       { onConflict: 'key' },
     );
   if (error) {
-    console.warn('[worker] heartbeat write error:', error.message);
+    if (error.message && error.message.toLowerCase().includes('schema cache')) {
+      console.warn('[worker] heartbeat write error (schema cache refreshing):', error.message);
+    } else {
+      console.warn('[worker] heartbeat write error:', error.message);
+    }
   }
 }
 

@@ -8,11 +8,13 @@ const [inputFile, outputFile] = process.argv.slice(2);
 const SKIP_L3_INFERENCE = process.env.SKIP_L3_INFERENCE === 'true';
 
 const GEMINI_KEY   = process.env.GEMINI_KEY;
-// Step3 L3 供应链推断是最复杂的 LLM 任务 → 用最强旗舰 Pro 模型
-const GEMINI_MODEL = process.env.GEMINI_MODEL      || 'gemini-3.1-pro-preview';
+// Step3 L3 供应链推断是最复杂的 LLM 任务
+// gemini-2.5-flash-preview-04-17 在 2026-05 是速度/质量最均衡的可用模型；
+// 如需最高精度可设 GEMINI_MODEL=gemini-2.5-pro-preview-05-06（更慢）
+const GEMINI_MODEL = process.env.GEMINI_MODEL      || 'gemini-2.5-flash-preview-04-17';
 const OPENAI_KEY   = process.env.OPENAI_API_KEY || '';
-// L3 推断是最复杂的任务，兜底用最强模型 gpt-5.5
-const OPENAI_MODEL = process.env.OPENAI_MODEL   || 'gpt-5.5';
+// L3 推断是最复杂的任务，兜底用最强模型 gpt-4o（gpt-5.5 仅在部分账户可用）
+const OPENAI_MODEL = process.env.OPENAI_MODEL   || 'gpt-4o';
 if (!GEMINI_KEY) { console.error('[step3] GEMINI_KEY env var is required'); process.exit(1); }
 
 // Browser / proxy config (unchanged) ─────────────────────────────────────────
@@ -29,9 +31,12 @@ const PLAYWRIGHT_TIMEOUT  = parseInt(process.env.PLAYWRIGHT_TIMEOUT || '10000', 
 // Tuning knobs --------------------------------------------------------------
 //   BOM_BATCH_SIZE / L3_CONCURRENCY  → Gemini L3 inference parallelism
 //   STEP3_PAGE_CONCURRENCY           → Playwright contact extraction parallelism
-const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '10', 10));
+// batch size 减小到 5（默认）：更短 prompt = Gemini 响应更快，减少超时率
+// 如需高吞吐可在 .env 中设 BOM_BATCH_SIZE=10（需稳定的 Gemini Pro 配额）
+const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '5',  10));
 const L3_CONCURRENCY        = Math.max(1, parseInt(process.env.L3_CONCURRENCY || '3',  10));
-const L3_TIMEOUT_MS         = Math.max(5_000, parseInt(process.env.L3_TIMEOUT_MS || '30000', 10));
+// L3 timeout 提升到 60s：gemini-2.5-flash 通常 10-20s，但高负载时可达 50s+
+const L3_TIMEOUT_MS         = Math.max(5_000, parseInt(process.env.L3_TIMEOUT_MS || '60000', 10));
 const L3_MAX_RETRIES        = Math.max(0, parseInt(process.env.L3_MAX_RETRIES || '3', 10));
 // 并发数提升：4 → 8（在有代理或高带宽环境下可进一步调高至 12）
 const PAGE_CONCURRENCY      = Math.max(1, parseInt(process.env.STEP3_PAGE_CONCURRENCY || '8', 10));

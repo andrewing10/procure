@@ -138,19 +138,19 @@ async function requestJsonWithRetry({
 
 // ─── callGeminiJson ─────────────────────────────────────────────────────────
 // 模型分级策略（按任务复杂度）：
-//   复杂任务（L3 供应链推断）→ GEMINI_MODEL=gemini-3.1-pro-preview（env 默认）
-//   简单任务（翻译/名称提取）→ GEMINI_FAST_MODEL=gemini-3.1-flash-lite（env 快速模式）
+//   复杂任务（L3 供应链推断）→ GEMINI_MODEL=gemini-2.5-flash-preview-04-17（env 默认）
+//   简单任务（翻译/名称提取）→ GEMINI_FAST_MODEL=gemini-2.0-flash-lite（env 快速模式）
 //   所有 Gemini 失败后      → OpenAI gpt-4o 自动兜底（OPENAI_API_KEY）
 async function callGeminiJson(promptText, {
     apiKey,
-    model = 'gemini-3.1-pro-preview',
+    model = 'gemini-2.5-flash-preview-04-17',
     temperature = 0.1,
-    timeoutMs = 25_000,
+    timeoutMs = 60_000,
     maxRetries = 3,
     label = 'gemini',
     openaiApiKey = process.env.OPENAI_API_KEY || '',
-    // 兜底模型默认 gpt-5.5（2026-04 最新旗舰）
-    openaiModel  = process.env.OPENAI_MODEL    || 'gpt-5.5',
+    // 兜底模型：gpt-4o（广泛可用）；如账户支持 gpt-5.5 可在 env 中覆盖
+    openaiModel  = process.env.OPENAI_MODEL    || 'gpt-4o',
     disableFallback = false,
 } = {}) {
     if (!apiKey) throw new Error('GEMINI_KEY required');
