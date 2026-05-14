@@ -22,6 +22,12 @@ const CATAGENT_API_URL = (process.env.CATAGENT_API_URL || '').replace(/\/$/, '')
 const CATAGENT_API_KEY = process.env.CATAGENT_API_KEY || '';
 const DISCOVERY_JOB_ID = process.env.DISCOVERY_JOB_ID || null;
 const SKIP_SQLITE = process.env.SKIP_SQLITE === 'true';
+const FALLBACK_PATH = process.env.OPS_FALLBACK_PATH || 'ops_hot_inbox_fallback.json';
+
+// 种子库反哺路径 — 高置信线索写回后供 Pillar0 下轮激活，并驱动 Lookalike 裂变
+const SEED_PATH           = 'zhimao_seed_intelligence.json';
+// 置信度门槛：>= 90 且有联系方式 → 种子级，值得在下轮 Pillar0 激活并做 Lookalike
+const SEED_CONFIDENCE_MIN = Number(process.env.SEED_CONFIDENCE_MIN) || 90;
 if (!CATAGENT_API_URL) { console.error('[step5] CATAGENT_API_URL env var is required'); process.exit(1); }
 
 const leads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
@@ -46,9 +52,33 @@ if (!SKIP_SQLITE) {
         UNIQUE(company_name, country)
     )`);
     insertMain = db.prepare(`INSERT OR IGNORE INTO main_db (company_name, domain, country, primary_email, primary_phone, confidence_score, entity_role, source, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-    insertQueue = db.prepare(`INSERT OR IGNORE INTO enrichment_queue (company_name, domain, score) VALUES (?, ?, ?)`);
+    insertQueue = db.prepare(`INSERT OR IGNORE INTO enrichment_queue (company_name, domain, country, score) VALUES (?, ?, ?, ?)`);
 } else {
     console.log('[step5] SKIP_SQLITE=true, local sqlite writes disabled.');
+}
+
+function writeFallbackInbox(items, reason) {
+    if (!Array.isArray(items) || items.length === 0) return;
+    let existing = [];
+    try {
+        if (fs.existsSync(FALLBACK_PATH)) {
+            existing = JSON.parse(fs.readFileSync(FALLBACK_PATH, 'utf8'));
+            if (!Array.isArray(existing)) existing = [];
+        }
+    } catch (_) {
+        existing = [];
+    }
+
+    const now = new Date().toISOString();
+    const records = items.map((lead) => ({
+        reason,
+        created_at: now,
+        discovery_job_id: DISCOVERY_JOB_ID,
+        lead,
+    }));
+    existing.push(...records);
+    fs.writeFileSync(FALLBACK_PATH, JSON.stringify(existing, null, 2));
+    console.warn(`[step5] fallback inbox appended: +${records.length} -> ${FALLBACK_PATH} (total=${existing.length})`);
 }
 
 // ── Quality Gate (P0) — 与 zhimao computeQualityGrade 完全对齐 ───────────────
@@ -63,14 +93,64 @@ if (!SKIP_SQLITE) {
 //   qualified — 有联系方式（解锁 10 分）
 //   unqualified — 丢弃，不上传
 
+// ── 区域专属高价值源置信度加权 ───────────────────────────────────────────────
+// 来自 Pillar10 VerifiedSource（seznam.cz/b2bbrazil/thomasnet 等）的线索：
+//   verified_source_boost 已由 Step1 附加到 lead，在质量门前统一应用
+let _sourceRegistry = null;
+try {
+    if (fs.existsSync('zhimao_verified_source_registry.json')) {
+        _sourceRegistry = JSON.parse(fs.readFileSync('zhimao_verified_source_registry.json', 'utf8'));
+    }
+} catch (_) {}
+
+function applySourceBoost(lead) {
+    // Pillar10 命中时已附带 verified_source_boost
+    const pillarBoost = Number(lead.verified_source_boost || 0);
+    // tax_verified 由 v8_tax_verifier.js 标记（若在流水线中启用）
+    const taxBoost    = lead.tax_verified ? 35 : 0;
+    let total         = pillarBoost + taxBoost;
+
+    // ── 产品规格"95分满级组合触发"规则 ────────────────────────────────────────
+    // 当多个高质量维度同时命中时，将 confidence_score 强制提升到 95（而不只是叠加）
+    // 对应产品描述：黄页有名字 + 社交媒体有决策人 + AliceWeb 海关记录 → 95分
+    const hasHVC = lead.verified_source_id;                              // 命中高价值源
+    const hasTax = lead.tax_verified;                                    // 税务验证通过
+    const hasBOL = lead.intent_signal === 'BOL_SIGNAL' ||
+                   lead.intent_signal === 'CUSTOMS_SIGNAL';              // 海关信号
+    const hasDecisionMaker = lead.intent_signal === 'PROCUREMENT_DECISION_MAKER'; // 决策人
+    const hasContact = !!(lead.primary_email || lead.primary_phone);     // 有联系方式
+    const ib = lead.inference_breakdown;
+    const hasHighL3 = ib && ib.confidence_tier === 'High';               // L3高置信
+
+    // 满级条件：同时满足 ≥2 个独立维度
+    const dimensionCount = [hasHVC, hasTax || hasBOL, hasDecisionMaker, hasContact && hasHighL3]
+        .filter(Boolean).length;
+
+    if (dimensionCount >= 2) {
+        const prev = Number(lead.confidence_score ?? 60) + total;
+        const forced = Math.max(prev, 92); // 至少 92 分，封顶 100
+        lead.confidence_score = Math.min(100, forced);
+        lead._combo_triggered = true;
+        return lead;
+    }
+
+    if (total > 0) {
+        const prev = Number(lead.confidence_score ?? 60);
+        lead.confidence_score = Math.min(100, prev + total);
+    }
+    return lead;
+}
+
 const totalLeads = leads.length;
 const gradeStats = { premium: 0, qualified: 0, unqualified: 0 };
-const validLeads = leads.filter(lead => {
-    const { qualified, grade } = evaluateLead(lead);
-    gradeStats[grade] = (gradeStats[grade] || 0) + 1;
-    lead._quality_grade = grade; // 附加到 lead 供日志使用
-    return qualified;
-});
+const validLeads = leads
+    .map(applySourceBoost) // 先加权，再过质量门
+    .filter(lead => {
+        const { qualified, grade } = evaluateLead(lead);
+        gradeStats[grade] = (gradeStats[grade] || 0) + 1;
+        lead._quality_grade = grade; // 附加到 lead 供日志使用
+        return qualified;
+    });
 const droppedQuality = totalLeads - validLeads.length;
 if (droppedQuality > 0) {
     console.log(`[step5] quality-gate veto: dropped ${droppedQuality}/${totalLeads} (unqualified). grade distribution: premium=${gradeStats.premium} qualified=${gradeStats.qualified} unqualified=${gradeStats.unqualified}`);
@@ -78,7 +158,9 @@ if (droppedQuality > 0) {
     console.log(`[step5] quality-gate pass: ${validLeads.length}/${totalLeads}. premium=${gradeStats.premium} qualified=${gradeStats.qualified}`);
 }
 
-leads.forEach(lead => {
+// 仅对 validLeads（已过质量门）做本地 SQLite 分流，避免 unqualified 数据
+// 污染本地分析库和 enrichment_queue（否则队列会被无价值条目永远占满）
+validLeads.forEach(lead => {
     const hasContact = !!(lead.primary_email || lead.primary_phone);
     const isHot      = lead.confidence_score >= 90 && hasContact;
     if (isHot && insertMain) {
@@ -96,19 +178,81 @@ leads.forEach(lead => {
             new Date().toISOString(),
         );
     } else if (lead.domain && insertQueue) {
-        insertQueue.run(lead.company_name, lead.domain, lead.confidence_score);
+        // 有域名但分数未达热铅门槛 → 进 enrichment_queue 等待二次 Playwright 补全联系
+        insertQueue.run(lead.company_name, lead.domain, lead.country || '', lead.confidence_score);
     }
 });
 
+// ── 种子库反哺写回（闭环核心）────────────────────────────────────────────────
+// 设计逻辑：
+//   1. 选出本轮 hot leads（confidence >= 90 且有联系方式）
+//   2. 追加写入 zhimao_seed_intelligence.json（去重，已有 domain 不重复写）
+//   3. 下轮 Step1 Pillar0 读取后激活这些种子
+//   4. Cron expandSparseIndustries 读取种子品类后可做 Lookalike 裂变
+(function writeSeedFeedback() {
+    const hotLeads = leads.filter(l =>
+        l.confidence_score >= SEED_CONFIDENCE_MIN &&
+        (l.primary_email || l.primary_phone) &&
+        l.company_name && l.domain
+    );
+    if (hotLeads.length === 0) return;
+
+    let seeds = [];
+    try {
+        if (fs.existsSync(SEED_PATH)) {
+            seeds = JSON.parse(fs.readFileSync(SEED_PATH, 'utf8'));
+        }
+    } catch { seeds = []; }
+
+    // 已有种子的 domain 集合（去重基准）
+    const existingDomains = new Set(seeds.map(s => (s.domain || '').toLowerCase()));
+    let added = 0;
+    for (const lead of hotLeads) {
+        const domainKey = (lead.domain || '').toLowerCase();
+        if (!domainKey || existingDomains.has(domainKey)) continue;
+        seeds.push({
+            company_name:    lead.company_name,
+            domain:          lead.domain,
+            country:         lead.country   || '',
+            category:        lead.category  || lead.pillar || '',
+            primary_email:   lead.primary_email  || null,
+            primary_phone:   lead.primary_phone  || null,
+            confidence_score: lead.confidence_score,
+            entity_role:     lead.entity_role    || null,
+            seed_source:     'v8_auto_feedback',
+            seeded_at:       new Date().toISOString(),
+        });
+        existingDomains.add(domainKey);
+        added++;
+    }
+    if (added > 0) {
+        fs.writeFileSync(SEED_PATH, JSON.stringify(seeds, null, 2));
+        console.log(`[step5] 🌱 Seed feedback: +${added} new seeds → ${SEED_PATH} (total=${seeds.length}). Next run Pillar0 will activate them.`);
+    }
+})();
+
 // ── Catagent API Push (BulkL1Item format) ───────────────────────────────────
 function mapToBulkL1Item(lead) {
+    // categories 语义：采购品类/行业标签（字符串数组），
+    // 不应用 inferred_bom（BOM 材料键名，格式不同）。
+    // 优先取 L3 推断的 procurement_items，降级到 pillar/category 来源标签。
+    const ib = lead.inference_breakdown;
+    let categories;
+    if (ib && Array.isArray(ib.procurement_items) && ib.procurement_items.length > 0) {
+        categories = ib.procurement_items.slice(0, 5);       // L3 推断的采购品类（最多 5 个）
+    } else if (lead.category && typeof lead.category === 'string') {
+        categories = [lead.category];                         // 来自 Step0 的品类标签
+    } else if (lead.pillar && typeof lead.pillar === 'string') {
+        categories = [lead.pillar];                           // 降级：pillar 名称作为品类
+    }
+
     return {
         name:                 lead.company_name || '',
         country:              lead.country      || '',
         domain:               lead.domain       || undefined,
         primary_email:        lead.primary_email || undefined,
         primary_phone:        lead.primary_phone || undefined,
-        categories:           lead.inferred_bom  || undefined,
+        categories:           categories || undefined,
         place_type:           lead.entity_role   || undefined,
         // snippet used as address hint when no structured address available
         address_line:         lead.snippet?.slice(0, 200) || undefined,
@@ -287,6 +431,7 @@ async function pushToCatagentBatched(items) {
                 batchTotal,
                 statusCode: lastStatusCode,
                 attempted: start + slice.length,
+                failedItems: slice,
                 qualified: qualifiedSum,
                 l3WrittenSum,
                 l3AttemptedSum,
@@ -314,6 +459,12 @@ async function pushToCatagentBatched(items) {
 
         if (!result.ok) {
             console.error(`[step5] aborting after batch ${result.failedBatch}/${result.batchTotal}; cumulative qualified=${result.qualified}, attempted=${result.attempted}/${validLeads.length}.`);
+            const failed = Array.isArray(result.failedItems) ? result.failedItems : [];
+            if (failed.length > 0) {
+                writeFallbackInbox(failed, `catagent_push_failed_http_${result.statusCode}`);
+            } else {
+                writeFallbackInbox(validLeads, `catagent_push_failed_http_${result.statusCode}_unknown_slice`);
+            }
             process.exit(1);
         }
 

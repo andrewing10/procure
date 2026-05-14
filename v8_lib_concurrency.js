@@ -137,6 +137,10 @@ async function requestJsonWithRetry({
 }
 
 // ─── callGeminiJson ─────────────────────────────────────────────────────────
+// 模型分级策略（按任务复杂度）：
+//   复杂任务（L3 供应链推断）→ GEMINI_MODEL=gemini-3.1-pro-preview（env 默认）
+//   简单任务（翻译/名称提取）→ GEMINI_FAST_MODEL=gemini-3.1-flash-lite（env 快速模式）
+//   所有 Gemini 失败后      → OpenAI gpt-4o 自动兜底（OPENAI_API_KEY）
 async function callGeminiJson(promptText, {
     apiKey,
     model = 'gemini-3.1-pro-preview',
@@ -144,30 +148,76 @@ async function callGeminiJson(promptText, {
     timeoutMs = 25_000,
     maxRetries = 3,
     label = 'gemini',
+    openaiApiKey = process.env.OPENAI_API_KEY || '',
+    // 兜底模型默认 gpt-5.5（2026-04 最新旗舰）
+    openaiModel  = process.env.OPENAI_MODEL    || 'gpt-5.5',
+    disableFallback = false,
 } = {}) {
     if (!apiKey) throw new Error('GEMINI_KEY required');
-    const reqBody = JSON.stringify({
-        contents: [{ parts: [{ text: promptText }] }],
-        generationConfig: { temperature, responseMimeType: 'application/json' },
-    });
-    const r = await requestJsonWithRetry({
-        hostname: 'generativelanguage.googleapis.com',
-        path: `/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        method: 'POST',
-        body: reqBody,
-        timeoutMs,
-        maxRetries,
-        label,
-    });
-    if (r.error) throw new Error(`gemini_failed: ${r.error.message}`);
-    if (!r.json) throw new Error(`gemini_parse_failed: status=${r.statusCode}, body=${(r.raw || '').slice(0, 200)}`);
-    if (r.json.error) throw new Error(`gemini_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
-    const text = r.json?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error(`gemini_empty_candidate: status=${r.statusCode}`);
+
+    // ── 1. 尝试 Gemini ────────────────────────────────────────────────────────
+    let geminiError = null;
     try {
-        return JSON.parse(text);
-    } catch (e) {
-        throw new Error(`gemini_text_not_json: ${e.message}; head=${String(text).slice(0, 200)}`);
+        const reqBody = JSON.stringify({
+            contents: [{ parts: [{ text: promptText }] }],
+            generationConfig: { temperature, responseMimeType: 'application/json' },
+        });
+        const r = await requestJsonWithRetry({
+            hostname: 'generativelanguage.googleapis.com',
+            path: `/v1beta/models/${model}:generateContent?key=${apiKey}`,
+            method: 'POST',
+            body: reqBody,
+            timeoutMs,
+            maxRetries,
+            label,
+        });
+        if (r.error) throw new Error(`gemini_failed: ${r.error.message}`);
+        if (!r.json) throw new Error(`gemini_parse_failed: status=${r.statusCode}, body=${(r.raw || '').slice(0, 200)}`);
+        if (r.json.error) throw new Error(`gemini_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
+        const text = r.json?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) throw new Error(`gemini_empty_candidate: status=${r.statusCode}`);
+        try { return JSON.parse(text); }
+        catch (e) { throw new Error(`gemini_text_not_json: ${e.message}; head=${String(text).slice(0, 200)}`); }
+    } catch (err) {
+        geminiError = err;
+        console.warn(`[${label}] Gemini failed (${err.message.slice(0, 120)})`);
+    }
+
+    // ── 2. OpenAI 兜底（Gemini 限流/错误时自动切换）────────────────────────────
+    if (disableFallback || !openaiApiKey) {
+        throw geminiError;
+    }
+    console.warn(`[${label}] → Falling back to OpenAI ${openaiModel}...`);
+    try {
+        const oaBody = JSON.stringify({
+            model: openaiModel,
+            temperature,
+            response_format: { type: 'json_object' },
+            messages: [
+                { role: 'system', content: 'You are a B2B procurement data extraction assistant. Always respond with valid JSON.' },
+                { role: 'user',   content: promptText },
+            ],
+        });
+        const r = await requestJsonWithRetry({
+            hostname: 'api.openai.com',
+            path: '/v1/chat/completions',
+            method: 'POST',
+            headers: { Authorization: `Bearer ${openaiApiKey}` },
+            body: oaBody,
+            timeoutMs: timeoutMs + 10_000, // OpenAI 通常比 Gemini 慢，给额外余量
+            maxRetries: 2,
+            label: `${label}/openai-fallback`,
+        });
+        if (r.error) throw new Error(`openai_failed: ${r.error.message}`);
+        if (!r.json) throw new Error(`openai_parse_failed: status=${r.statusCode}`);
+        if (r.json.error) throw new Error(`openai_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
+        const text = r.json?.choices?.[0]?.message?.content;
+        if (!text) throw new Error('openai_empty_response');
+        const result = JSON.parse(text);
+        console.log(`[${label}] OpenAI fallback succeeded`);
+        return result;
+    } catch (oaErr) {
+        throw new Error(`both_llm_failed: gemini=(${geminiError.message.slice(0, 80)}), openai=(${oaErr.message.slice(0, 80)})`);
     }
 }
 

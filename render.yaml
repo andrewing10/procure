@@ -5,21 +5,69 @@ services:
     buildCommand: npm install
     startCommand: node v8_discovery_worker.js
     envVars:
+      # ── LLM ──────────────────────────────────────────────────────────
       - key: GEMINI_KEY
         sync: false
+      - key: GEMINI_MODEL
+        value: "gemini-3.1-pro-preview"
+      - key: GEMINI_FAST_MODEL
+        value: "gemini-3.1-flash-lite"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: "gpt-5.5"
+      - key: OPENAI_FAST_MODEL
+        value: "gpt-4.1-mini"
+      # ── 搜索 ─────────────────────────────────────────────────────────
       - key: SERPER_API_KEY
         sync: false
-      - key: CATAGENT_API_URL
-        value: https://www.procureradar.com
-      - key: CATAGENT_API_KEY
+      # ── 住宅IP代理（BrightData）─────────────────────────────────────
+      - key: USE_PROXY
+        value: "true"
+      - key: BRD_USER
         sync: false
-      - key: SUPABASE_URL
+      - key: BRD_PASS
         sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
+      - key: BRD_PROXY
+        value: "http://brd.superproxy.io:33335"
       - key: USE_BRD_SB
         value: "false"
       - key: BRD_SB_WSS
         sync: false
+      # ── Catagent / Zhimao ────────────────────────────────────────────
+      - key: CATAGENT_API_URL
+        value: https://www.procureradar.com
+      - key: CATAGENT_API_KEY
+        sync: false
+      # ── Supabase ─────────────────────────────────────────────────────
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # ── 运行模式 ────────────────────────────────────────────────────
+      # SKIP_SQLITE=true：Render 默认用 ephemeral 文件系统，SQLite 重启后清零。
+      # 因此 enrichment_queue / main_db 在生产环境无持久化价值。
+      # 若要启用本地 SQLite（挂载持久卷场景），改为 false 并挂载 /data 卷，
+      # 同时把 v8_enrichment_queue_worker.js 注册为独立 worker 服务。
       - key: SKIP_SQLITE
         value: "true"
+      - key: PLAYWRIGHT_TIMEOUT
+        value: "12000"
+      - key: STEP3_PAGE_CONCURRENCY
+        value: "8"
+      # ── enrichment_queue 配置（仅在 SKIP_SQLITE=false 时生效）────────────
+      - key: ENRICH_QUEUE_BATCH_SIZE
+        value: "30"
+      - key: ENRICH_QUEUE_MAX_RETRIES
+        value: "5"
+      - key: ENRICH_PROMOTE_SCORE
+        value: "70"
+      # ── 税号/工商注册反向验证（关闭=仅读注册表做置信度加权，开启=主动 HTTP 验证）──
+      # 开启后 Step3.5 会对拉美/非洲公司逐一查询 CNPJ/RUC/NIT 等官方数据库
+      # 注意：税务系统查询有频率限制，CONCURRENCY 不宜超过 3
+      - key: TAX_VERIFY_ENABLED
+        value: "false"
+      - key: TAX_VERIFY_CONCURRENCY
+        value: "3"
+      - key: TAX_VERIFY_TIMEOUT_MS
+        value: "5000"

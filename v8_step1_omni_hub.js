@@ -2,59 +2,14 @@ require('dotenv').config();
 const fs    = require('fs');
 const https = require('https');
 
-// ── P0 垃圾域名黑名单（与 zhimao lib/data-intel/quality.ts 保持一致） ─────────
-const JUNK_DOMAIN_HOSTS = new Set([
-  'scribd.com','www.scribd.com',
-  'reddit.com','www.reddit.com','old.reddit.com',
-  'quora.com','www.quora.com',
-  'alibaba.com','www.alibaba.com','m.alibaba.com',
-  'aliexpress.com','www.aliexpress.com',
-  '1688.com','www.1688.com',
-  'taobao.com','www.taobao.com',
-  'jd.com','www.jd.com',
-  'pinduoduo.com',
-  'linkedin.com','www.linkedin.com',
-  'facebook.com','www.facebook.com','m.facebook.com',
-  'twitter.com','www.twitter.com','x.com',
-  'instagram.com','www.instagram.com',
-  'youtube.com','www.youtube.com',
-  'tiktok.com','www.tiktok.com',
-  'pinterest.com','www.pinterest.com',
-  'made-in-china.com','www.made-in-china.com',
-  'globalsources.com','www.globalsources.com',
-  'tradeindia.com','www.tradeindia.com',
-  'tradekey.com','www.tradekey.com',
-  'exportersindia.com','www.exportersindia.com',
-  'ec21.com','www.ec21.com',
-  'ecplaza.net','www.ecplaza.net',
-  'kompass.com','www.kompass.com',
-  'yellowpages.com','www.yellowpages.com',
-  'yelp.com','www.yelp.com',
-  'amazon.com','www.amazon.com',
-  'ebay.com','www.ebay.com',
-  'etsy.com','www.etsy.com',
-  'importyeti.com','www.importyeti.com',   // 聚合站点：内容有价值但 URL 是垃圾 → 见 Pillar 3 修复说明
-  'volza.com','www.volza.com',
-  'panjiva.com','www.panjiva.com',
-  'tradesparq.com',
-  'bing.com','www.bing.com',
-  'google.com','www.google.com',
-  'wikipedia.org','en.wikipedia.org',
-  'wikidata.org',
-]);
-const JUNK_DOMAIN_PATTERNS = [
-  /scribd\./i, /1688\.com/i, /wikip/i, /fandom\.com/i,
-  /blogspot\./i, /wordpress\.com/i, /medium\.com/i,
-  /substack\.com/i,
-];
+// ── 垃圾域名判断统一从 v8_quality_gate 引入，与 zhimao 主系统保持单源同步 ────
+// 不再在此文件维护独立黑名单，避免两处列表漂移浪费 Serper 配额
+const { isJunkDomain } = require('./v8_quality_gate');
 
 function isJunkLead(lead) {
   if (!lead || !lead.link) return false;
   try {
-    const domain = lead.link.trim().toLowerCase()
-      .replace(/^https?:\/\//, '').replace(/\/.*/, '').replace(/:\d+$/, '');
-    if (JUNK_DOMAIN_HOSTS.has(domain)) return true;
-    if (JUNK_DOMAIN_PATTERNS.some(p => p.test(domain))) return true;
+    return isJunkDomain(lead.link);
   } catch(_) {}
   return false;
 }
@@ -63,6 +18,14 @@ const [inputFile, outputFile, countryCode] = process.argv.slice(2);
 
 const API_KEY = process.env.SERPER_API_KEY;
 if (!API_KEY) { console.error('[step1] SERPER_API_KEY env var is required'); process.exit(1); }
+
+// ── Deep Paging：由 Cron 传入的第几次扫描，转换为 Serper 搜索页码 ────────────
+// sweep 1 → page 1（结果 1-20）
+// sweep 2 → page 2（结果 21-40）
+// sweep 5 → page 5（结果 81-100，长尾冰山数据）
+// 让同一个 [category × country] 网格每次 cron 运行都挖到新数据
+const SWEEP_COUNT  = Math.max(1, parseInt(process.env.SWEEP_COUNT || '1', 10));
+const SEARCH_PAGE  = SWEEP_COUNT; // 1-based Serper page
 
 // ─── Serper helpers ────────────────────────────────────────────────────────
 function serperPost(path, body) {
@@ -86,8 +49,12 @@ function fetchPlaces(query, gl) {
   return serperPost('/places', { q: query, gl }).then(r => r.places || []);
 }
 
-function searchOrganic(query, gl, num = 20) {
-  return serperPost('/search', { q: query, gl, num }).then(r => r.organic || []);
+function searchOrganic(query, gl, num = 20, page = SEARCH_PAGE) {
+  // page=1 时不传（Serper 默认），page≥2 时传入实现真正的深水区翻页
+  const body = page > 1
+    ? { q: query, gl, num, page }
+    : { q: query, gl, num };
+  return serperPost('/search', body).then(r => r.organic || []);
 }
 
 // ─── Lead builders ─────────────────────────────────────────────────────────
@@ -96,6 +63,19 @@ function fromOrganic(results, pillar, intent_signal) {
     title: o.title, link: o.link, snippet: o.snippet,
     pillar, ...(intent_signal ? { intent_signal } : {}),
   }));
+}
+
+// ─── 区域专属数据源注册表（单源加载，避免每次 run() 重读文件）──────────────
+let _verifiedSourceRegistry = null;
+function getVerifiedSources() {
+  if (_verifiedSourceRegistry) return _verifiedSourceRegistry;
+  const regPath = 'zhimao_verified_source_registry.json';
+  try {
+    if (fs.existsSync(regPath)) {
+      _verifiedSourceRegistry = JSON.parse(fs.readFileSync(regPath, 'utf8'));
+    }
+  } catch (_) { _verifiedSourceRegistry = { sources: {} }; }
+  return _verifiedSourceRegistry || { sources: {} };
 }
 
 // ─── 主函数：全 Pillar 并行执行 ────────────────────────────────────────────
@@ -129,18 +109,29 @@ async function run() {
     }),
 
     // ── P1: Google Maps/Places（最可靠买家信号：业务类型注册为进口商/批发商） ─
-    // 返回真实公司网站，命中率最高
-    p1_maps_dist: fetchPlaces(`${category} wholesaler OR distributor OR importer in ${countryName}`, cc)
-      .then(ps => ps
+    // 返回真实公司网站，命中率最高。
+    // 深分页策略：Places 不支持 page 参数，改用 query 轮换（SEARCH_PAGE 奇偶 / 不同身份词）
+    // 避免每次 cron 重复拉取相同 20 条结果。
+    p1_maps_dist: (() => {
+      // sweep 偶数：换成 "supplier procurement" 等买家特征词，避免每轮相同 20 条
+      const q = SEARCH_PAGE % 2 === 0
+        ? `${category} procurement manager OR buyer OR purchasing ${countryName}`
+        : `${category} wholesaler OR distributor OR importer in ${countryName}`;
+      return fetchPlaces(q, cc).then(ps => ps
         .filter(p => p.website || p.phoneNumber)
         .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'MAP_VERIFIED_BUYER' }))
-      ),
+      );
+    })(),
 
-    p1_maps_trading: fetchPlaces(`${category} trading company OR import export in ${countryName}`, cc)
-      .then(ps => ps
+    p1_maps_trading: (() => {
+      const q = SEARCH_PAGE % 2 === 0
+        ? `${category} import export agent OR sourcing company ${countryName}`
+        : `${category} trading company OR import export in ${countryName}`;
+      return fetchPlaces(q, cc).then(ps => ps
         .filter(p => p.website || p.phoneNumber)
         .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'TRADING_COMPANY' }))
-      ),
+      );
+    })(),
 
     // ── P2: 公司官网直接搜索（在目标国TLD下找自述为进口商/批发商的公司） ─────
     // 关键：用 site:.vn 等TLD直接找公司网站，不找聚合站
@@ -221,10 +212,99 @@ async function run() {
       `"${category}" ("private label" OR "OEM buyer" OR "contract manufacturing") ${countryName}`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 8 B2B', 'PRIVATE_LABEL')),
+
+    // ── P10: 区域专属高壁垒数据源定向搜索 ─────────────────────────────────────
+    // 核心护城河：这些来源不是 Google 烂大街结果，而是各国本土商业数据库、
+    // 海关系统、政府工商注册表、行业协会名录。
+    // 命中这些来源的公司，经过交叉验证后置信度可比普通 Serper 搜索高 15-40 点。
+    p10_verified_sources: Promise.resolve().then(() => {
+      const registry = getVerifiedSources();
+      const allSourceGroups = Object.values(registry.sources || {});
+      const allSources = allSourceGroups.flat();
+
+      // 只取覆盖当前国家的来源，最多选 4 个（避免 Serper 配额超限）
+      const applicableSources = allSources
+        .filter(src => Array.isArray(src.countries) && src.countries.includes(cc))
+        .sort((a, b) => (b.source_confidence_boost || 0) - (a.source_confidence_boost || 0))
+        .slice(0, 4);
+
+      if (applicableSources.length === 0) return [];
+
+      // 对每个适用的来源并发发起定向搜索
+      return Promise.all(
+        applicableSources.map(src => {
+          // 把 search_strategy 模板里的 ${category} 替换为实际品类
+          const q = (src.search_strategy || `site:${src.domain} "${category}"`)
+            .replace(/\$\{category\}/g, category)
+            .replace(/\$\{countryName\}/g, countryName);
+
+          return searchOrganic(q, cc, 20).then(r =>
+            r.map(o => ({
+              ...o,
+              pillar:                  'Pillar 10 VerifiedSource',
+              intent_signal:           src.intent_signals?.[0] || 'VERIFIED_SOURCE',
+              verified_source_id:      src.id,
+              verified_source_domain:  src.domain,
+              verified_source_boost:   src.source_confidence_boost || 0,
+            }))
+          ).catch(() => []);
+        })
+      ).then(arrs => arrs.flat());
+    }),
+
+    // ── P11: LinkedIn 采购决策人 X 光透视 ────────────────────────────────────
+    // 设计逻辑：LinkedIn URL 在垃圾名单里会被域名过滤器过滤，所以不能直接用 LinkedIn URL。
+    // 改为：搜 LinkedIn 职位页/公司页，仅从 snippet 中提取【公司名+采购头衔】信号
+    // 由 Step2 LLM 的 extractCompanyFromSnippet 负责从 snippet 里抽公司名。
+    // 最终 lead.domain 不是 linkedin.com，而是 Step2 推断出的空域名（待 Step3 补全）。
+    p11_linkedin_decision: searchOrganic(
+      `site:linkedin.com/in "${category}" ("Procurement Director" OR "Category Manager" OR "Sourcing Manager" OR "Import Manager" OR "Head of Purchasing") ${countryName}`,
+      cc, 20
+    ).then(r => r.map(o => ({
+      title:         o.title,
+      link:          null,           // 不传 linkedin URL，避免被垃圾过滤器清除
+      snippet:       o.snippet,      // snippet 里有公司名和职位，供 Step2 LLM 提取
+      pillar:        'Pillar 11 LinkedIn',
+      intent_signal: 'PROCUREMENT_DECISION_MAKER',
+      source_url:    o.link,         // 保留原始 URL 供溯源，但不作为公司 domain
+    }))),
+
+    // ── P9: Lookalike 裂变（种子反哺闭环核心）────────────────────────────────
+    // 设计逻辑：
+    //   Pillar0 把种子激活为 lead → Step5 把高置信 lead 写回 seed JSON
+    //   → 下轮 Pillar9 用新种子搜"它的竞品是谁/同行是谁" → 找到同生态位买家
+    // 这形成了一个"越用越深，自动扩网"的闭环。
+    p9_lookalike: Promise.resolve().then(() => {
+      const SEED_PATH = 'zhimao_seed_intelligence.json';
+      try {
+        if (!fs.existsSync(SEED_PATH)) return [];
+        const seeds = JSON.parse(fs.readFileSync(SEED_PATH, 'utf8'));
+        // 只取本国 + 本品类相关的种子，随机挑最多 3 个做 Lookalike 查询（避免 Serper 超额）
+        const relevant = seeds.filter(s =>
+          s.country?.toLowerCase() === cc.toLowerCase() &&
+          (!s.category || s.category.toLowerCase().includes(category.toLowerCase().split(' ')[0]))
+        ).slice(0, 3);
+        if (relevant.length === 0) return [];
+
+        // 对每个种子并发搜它的竞品和同类公司
+        return Promise.all(
+          relevant.map(seed =>
+            searchOrganic(
+              `"${category}" companies like "${seed.company_name}" OR competitors "${seed.company_name}" ${countryName} importer wholesaler`,
+              cc, 20
+            ).then(r => r.map(o => ({
+              ...o, pillar: 'Pillar 9 Lookalike',
+              intent_signal: 'LOOKALIKE', seed_company: seed.company_name,
+            })))
+          )
+        ).then(arrs => arrs.flat());
+      } catch { return []; }
+    }),
   };
 
   // ── 全并行执行（等最慢的那一路） ──────────────────────────────────────────
-  console.log(`[step1] Launching ${Object.keys(pillarPromises).length} pillars in parallel for "${category}" in ${countryName}...`);
+  const depthLabel = SEARCH_PAGE === 1 ? '浅层(p1)' : `深水区(p${SEARCH_PAGE} ≈ 第${(SEARCH_PAGE-1)*20+1}-${SEARCH_PAGE*20}条)`;
+  console.log(`[step1] Launching ${Object.keys(pillarPromises).length} pillars in parallel for "${category}" in ${countryName} [${depthLabel}]...`);
   const startedAt = Date.now();
 
   const results = await Promise.allSettled(Object.values(pillarPromises));

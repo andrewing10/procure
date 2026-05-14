@@ -54,8 +54,13 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
                             : (outputData.status === 'success' ? 1 : 0))))));
 
     if (count === 0 && !stepName.includes("Bridge")) {
-        console.warn(`[PIPELINE STOP] Step returned 0 results. Graceful halt.`);
-        process.exit(0);
+        // exit(2) = "graceful stop, no data" — 与 exit(0)=完全成功 / exit(1)=崩溃 语义区分
+        // discovery_worker 和 cron_worker 读取此 exit code：
+        //   0 → 全量写入成功
+        //   1 → 脚本崩溃 / 配置错误
+        //   2 → 流水线正常但本轮该网格无新数据（不计为失败，但不应标记 job 为 done）
+        console.warn(`[PIPELINE STOP] Step "${stepName}" returned 0 results — graceful stop (exit 2).`);
+        process.exit(2);
     }
 
     console.log(`[ASSERTION PASSED] ${outputFile} validated with ${count} records.`);
@@ -84,6 +89,19 @@ runAssertedStep("2. Strict Entity Intake", "v8_step2_intake.js", fileBus.t1_raw_
 // Gemini infers entity_role, BOM (primary_materials_top3), procurement_items, confidence_tier,
 // intent_summary — stored as inference_breakdown (written to data_intel_l3_inferred by Step5→API).
 runAssertedStep("3. L3 Supply-Chain Inference & Contact Extraction", "v8_step3_ultimate_enrichment.js", fileBus.t2_intake, fileBus.t3_enriched);
+
+// PHASE 3.5 (Optional): 税号/工商注册反向验证（置信度加权，加分不减分）
+// 由 TAX_VERIFY_ENABLED=true 环境变量激活；默认关闭，不影响主流水线稳定性
+const fileBus_t3v_verified = `${sessionId}/03b_tax_verified.json`;
+if (process.env.TAX_VERIFY_ENABLED === 'true') {
+    runAssertedStep(
+        "3.5 Tax Registry Cross-Verify (Bridge)",
+        "v8_tax_verifier.js",
+        fileBus.t3_enriched,
+        fileBus_t3v_verified
+    );
+    fileBus.t3_enriched = fileBus_t3v_verified; // 后续步骤读取已加权文件
+}
 
 // PHASE 4: Global Dedupe & Schema Normalization
 runAssertedStep("4. Global Dedupe", "v8_step4_dedupe.js", fileBus.t3_enriched, fileBus.t4_deduped, `"${countryCode}"`);

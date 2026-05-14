@@ -15,6 +15,24 @@ function normaliseDomain(raw) {
     }
 }
 
+/**
+ * 公司名规范化函数，与 zhimao DB name_canonical 口径对齐。
+ * 去除尾部法律后缀（Ltd / LLC / Inc 等），多空格压缩，全小写。
+ * 目的：让"ABC Trading Ltd" 和 "ABC Trading Limited" 共享同一个去重 key，
+ * 避免同公司不同写法在 bulk API ON CONFLICT(name_canonical,country) 冲突。
+ */
+const LEGAL_SUFFIX_RE = /[\s,\.\-]*(ltd\.?|limited|llc\.?|l\.l\.c\.?|inc\.?|incorporated|corp\.?|corporation|co\.?|company|gmbh|s\.a\.?|b\.v\.?|pty\.?|plc\.?|sdn\.? bhd\.?|pvt\.? ltd\.?|joint stock|j\.s\.c|as|aps|ab|oy|nv|kk|ag)\.?\s*$/i;
+
+function canonicalizeName(raw) {
+    if (!raw) return '';
+    return raw
+        .trim()
+        .toLowerCase()
+        .replace(LEGAL_SUFFIX_RE, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 // 去重键与 zhimao DB 唯一约束保持一致：(name_canonical, country)。
 // 旧键 (name + domain) 会导致同名同国不同域名的公司通过去重后进入同批次，
 // 在 bulk API 的 ON CONFLICT(name_canonical,country) 中互相冲突（整批失败）。
@@ -23,7 +41,7 @@ function normaliseDomain(raw) {
 const seen    = new Map(); // key → lead
 for (const l of leads) {
     if (!l.company_name) continue;
-    const nameKey = l.company_name.toLowerCase().trim();
+    const nameKey = canonicalizeName(l.company_name);
     const countryKey = (country || 'unknown').toUpperCase();
     const key = `${nameKey}|${countryKey}`;
     const existing = seen.get(key);

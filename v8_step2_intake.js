@@ -21,7 +21,11 @@ function loadIndustryContext(samplePillar) {
 }
 
 const GEMINI_KEY   = process.env.GEMINI_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+// Step2 仅做公司名称提取和垃圾过滤，是简单任务 → 用 Flash-Lite（快 5-10x，省费用）
+const GEMINI_MODEL   = process.env.GEMINI_FAST_MODEL  || process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite';
+const OPENAI_KEY     = process.env.OPENAI_API_KEY     || '';
+// 名称提取兜底用快速低成本模型
+const OPENAI_FAST_MODEL = process.env.OPENAI_FAST_MODEL || 'gpt-4.1-mini';
 if (!GEMINI_KEY) { console.error('[step2] GEMINI_KEY env var is required'); process.exit(1); }
 
 // 调小默认 batch（20）：减少单批 token 占用 → 降低 429 风险；提高语义解析准确率。
@@ -50,6 +54,8 @@ async function processBatch(batch, batchIndex, batchTotal, triggerBlock) {
             apiKey: GEMINI_KEY, model: GEMINI_MODEL,
             timeoutMs: TIMEOUT_MS, maxRetries: MAX_RETRIES,
             label: `step2/b${batchIndex}`,
+            openaiApiKey: OPENAI_KEY,
+            openaiModel:  OPENAI_FAST_MODEL,
         });
     } catch (e) {
         console.warn(`[step2] Batch ${batchIndex}/${batchTotal} FAILED after ${Date.now() - startedAt}ms: ${e.message}`);

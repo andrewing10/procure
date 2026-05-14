@@ -5,9 +5,14 @@ const cheerio = require('cheerio');
 const { pMap, callGeminiJson } = require('./v8_lib_concurrency');
 
 const [inputFile, outputFile] = process.argv.slice(2);
+const SKIP_L3_INFERENCE = process.env.SKIP_L3_INFERENCE === 'true';
 
 const GEMINI_KEY   = process.env.GEMINI_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+// Step3 L3 供应链推断是最复杂的 LLM 任务 → 用最强旗舰 Pro 模型
+const GEMINI_MODEL = process.env.GEMINI_MODEL      || 'gemini-3.1-pro-preview';
+const OPENAI_KEY   = process.env.OPENAI_API_KEY || '';
+// L3 推断是最复杂的任务，兜底用最强模型 gpt-5.5
+const OPENAI_MODEL = process.env.OPENAI_MODEL   || 'gpt-5.5';
 if (!GEMINI_KEY) { console.error('[step3] GEMINI_KEY env var is required'); process.exit(1); }
 
 // Browser / proxy config (unchanged) ─────────────────────────────────────────
@@ -102,6 +107,8 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                 apiKey: GEMINI_KEY, model: GEMINI_MODEL, temperature: 0.2,
                 timeoutMs: L3_TIMEOUT_MS, maxRetries: L3_MAX_RETRIES,
                 label: `step3/L3.b${batchIndex}`,
+                openaiApiKey: OPENAI_KEY,
+                openaiModel:  OPENAI_MODEL,
             });
         } catch (e) {
             console.warn(`[step3] L3 batch ${batchIndex}/${batchTotal} FAILED after ${Date.now() - startedAt}ms: ${e.message}`);
@@ -162,16 +169,82 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
     return leads;
 }
 
-// ─── Cheap HTML field extractors (unchanged behavior) ───────────────────────
+// ─── 反检测 User-Agent 池（保持最新 Chrome 版本，避免被识别为过期机器人） ──────
+const UA_POOL_DESKTOP = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+];
+const UA_POOL_MOBILE = [
+  'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+];
+const VIEWPORT_POOL = [
+  { width: 1920, height: 1080 },
+  { width: 1440, height: 900  },
+  { width: 1366, height: 768  },
+  { width: 1536, height: 864  },
+];
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+// navigator.webdriver 和自动化特征注入脚本
+// 在页面加载前执行，覆盖 Playwright 暴露的机器人特征
+const STEALTH_INIT_SCRIPT = `
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+  window.chrome = { runtime: {} };
+  const orig = navigator.permissions.query.bind(navigator.permissions);
+  navigator.permissions.query = (params) =>
+    params.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : orig(params);
+`;
+
+// ── WhatsApp 号码规范化（统一输出 +country_code + 纯数字格式） ──────────────
+function normalizeWhatsApp(raw) {
+    if (!raw) return null;
+    // wa.me/+601XXXXXXXX 或 wa.me/601XXXXXXXX 或 tel:+601XXXXXXXX
+    const digits = raw.replace(/^.*wa\.me\//i, '').replace(/^tel:/i, '').replace(/[^0-9+]/g, '');
+    if (digits.length < 7) return null;
+    return digits.startsWith('+') ? digits : `+${digits}`;
+}
+
+// ─── HTML 字段提取（邮箱、电话、WhatsApp 专项提取）────────────────────────
 const extractFromHTML = (html, emails, phones) => {
     const $ = cheerio.load(html);
-    $('a[href^="mailto:"]').each((_, el) => emails.add($(el).attr('href').replace('mailto:', '').split('?')[0].trim()));
-    $('a[href^="tel:"]').each((_, el) => phones.add($(el).attr('href').replace('tel:', '').trim()));
-    $('a[href*="wa.me/"]').each((_, el) => phones.add($(el).attr('href')));
+
+    $('a[href^="mailto:"]').each((_, el) => {
+        const em = $(el).attr('href').replace('mailto:', '').split('?')[0].trim().toLowerCase();
+        if (em.includes('@')) emails.add(em);
+    });
+
+    $('a[href^="tel:"]').each((_, el) => {
+        phones.add($(el).attr('href').replace('tel:', '').trim());
+    });
+
+    // WhatsApp 链接专项：wa.me / api.whatsapp.com / WhatsApp 按钮文本附近的号码
+    $('a[href*="wa.me/"], a[href*="api.whatsapp.com/send"], a[href*="whatsapp.com/"]').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        const wap = normalizeWhatsApp(href);
+        if (wap) phones.add(wap); // WhatsApp 号码入 phones（统一格式）
+    });
+
+    // 文本正则兜底：匹配 +CountryCode+数字格式的电话号
+    const bodyText = $('body').text();
+    const phoneRegex = /(\+\d{1,3}[\s\-.]?\(?\d{1,4}\)?[\s\-.]?\d{3,4}[\s\-.]?\d{4,6})/g;
+    let m;
+    while ((m = phoneRegex.exec(bodyText)) !== null) {
+        const num = m[1].replace(/[\s\-.()']/g, '');
+        if (num.replace(/\D/g, '').length >= 7) phones.add(num);
+    }
+
     const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,})/g;
-    let match;
-    while ((match = emailRegex.exec($('body').text())) !== null) {
-        const em = match[1].toLowerCase();
+    while ((m = emailRegex.exec(bodyText)) !== null) {
+        const em = m[1].toLowerCase();
         if (!em.endsWith('.png') && !em.endsWith('.jpg') && !em.endsWith('.jpeg')) emails.add(em);
     }
 };
@@ -256,20 +329,43 @@ async function extractContactForLead(lead, contexts) {
 
 async function run() {
     let leads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
-
-    leads = await inferL3SupplyChain(leads);
+    if (SKIP_L3_INFERENCE) {
+        console.log('[step3] SKIP_L3_INFERENCE=true, skipping L3 inference and only extracting contacts.');
+    } else {
+        leads = await inferL3SupplyChain(leads);
+    }
 
     let browser;
     if (USE_BRD_SB) {
         if (!BRD_SB_WSS) { console.error('[step3] USE_BRD_SB=true but BRD_SB_WSS not set'); process.exit(1); }
-        console.log('[step3] Using BrightData Scraping Browser via CDP');
+        console.log('[step3] Using BrightData Scraping Browser via CDP (反检测最强模式)');
         browser = await chromium.connectOverCDP(BRD_SB_WSS);
     } else {
-        const launchOptions = { headless: true };
+        // ── 启动参数：隐藏自动化特征，绕过 Cloudflare / Akamai 基础检测 ─────────
+        const launchOptions = {
+            headless: true,
+            args: [
+                '--disable-blink-features=AutomationControlled',  // 最关键：隐藏自动化标识
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--window-size=1920,1080',
+                '--disable-infobars',
+                '--disable-extensions',
+            ],
+            ignoreDefaultArgs: ['--enable-automation'],           // 移除 Playwright 默认的自动化标志
+        };
         if (USE_PROXY) {
             if (!BRD_USER || !BRD_PASS) { console.error('[step3] USE_PROXY=true but BRD_USER/BRD_PASS not set'); process.exit(1); }
-            console.log(`[step3] Proxy enabled: ${BRD_PROXY}`);
+            console.log(`[step3] 住宅IP代理已启用: ${BRD_PROXY}`);
             launchOptions.proxy = { server: BRD_PROXY, username: BRD_USER, password: BRD_PASS };
+        } else {
+            console.warn('[step3] ⚠️  USE_PROXY=false：使用本机IP。欧美大企业站点可能被 Cloudflare 拦截。');
+            console.warn('[step3] ⚠️  建议：设置 USE_PROXY=true + BRD_USER/BRD_PASS 以启用住宅IP代理。');
         }
         try {
             browser = await chromium.launch(launchOptions);
@@ -287,11 +383,42 @@ async function run() {
             }
         }
     }
-    const desktopCtx = await browser.newContext({ ignoreHTTPSErrors: true });
-    const mobileCtx  = await browser.newContext({
+
+    // ── 反检测 Context 配置：随机 UA + 视口 + 语言头 + stealth 脚本注入 ─────────
+    const desktopUA = pick(UA_POOL_DESKTOP);
+    const mobileUA  = pick(UA_POOL_MOBILE);
+    const viewport  = pick(VIEWPORT_POOL);
+
+    const desktopCtx = await browser.newContext({
         ignoreHTTPSErrors: true,
-        userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
+        userAgent: desktopUA,
+        viewport,
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
+        extraHTTPHeaders: {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+        },
     });
+    const mobileCtx = await browser.newContext({
+        ignoreHTTPSErrors: true,
+        userAgent: mobileUA,
+        viewport: { width: 390, height: 844 },
+        locale: 'en-US',
+        extraHTTPHeaders: {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'sec-ch-ua-mobile': '?1',
+        },
+    });
+
+    // ── stealth 脚本：在每个页面加载前注入，覆盖 Playwright 暴露的机器人标识 ────
+    await desktopCtx.addInitScript(STEALTH_INIT_SCRIPT);
+    await mobileCtx.addInitScript(STEALTH_INIT_SCRIPT);
+
+    console.log(`[step3] Browser ready. UA=${desktopUA.slice(0, 60)}...`);
 
     console.log(`[step3] Contact extraction over ${leads.length} leads, page concurrency=${PAGE_CONCURRENCY}, page timeout=${PLAYWRIGHT_TIMEOUT}ms`);
     const overallStart = Date.now();

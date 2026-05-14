@@ -30,7 +30,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function runPipeline(countryIso, category, jobId) {
+// exit code 约定（master 与 worker 共同维护）：
+//   0 → 全量写入成功
+//   1 → 脚本崩溃 / 配置错误 → markFailed
+//   2 → 本轮无新数据（graceful stop）→ markDone 但标记 result_count 来自 bulk 侧
+const PIPELINE_EXIT = { SUCCESS: 0, CRASH: 1, NO_DATA: 2 };
+
+function runPipeline(countryIso, category, jobId, sweepCount = 1) {
   return new Promise((resolve) => {
     const child = spawn(
       'node',
@@ -40,11 +46,12 @@ function runPipeline(countryIso, category, jobId) {
         env: {
           ...process.env,
           DISCOVERY_JOB_ID: String(jobId),
+          SWEEP_COUNT:       String(sweepCount),
         },
       },
     );
-    child.on('close', (code) => resolve(code === 0));
-    child.on('error', () => resolve(false));
+    child.on('close', (code) => resolve(code ?? 1));
+    child.on('error', () => resolve(PIPELINE_EXIT.CRASH));
   });
 }
 
@@ -184,17 +191,37 @@ async function main() {
         continue;
       }
 
-      console.log(`[worker] running job ${job.id}: ${job.category} / ${job.country_iso}`);
-      const ok = await runPipeline(job.country_iso, job.category, job.id);
-      if (!ok) {
+      // 读取该 job 的历史 sweep 次数，传入流水线做深分页
+      const { data: jobMeta } = await supabase
+        .from('discovery_jobs')
+        .select('sweep_count')
+        .eq('id', job.id)
+        .maybeSingle();
+      const sweepCount = Number(jobMeta?.sweep_count ?? 0) + 1;
+
+      console.log(`[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount})`);
+      const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount);
+
+      if (exitCode === PIPELINE_EXIT.CRASH) {
         await markFailed(job.id, 'pipeline_exit_non_zero');
         await sleep(1000);
         continue;
       }
 
+      // exit(2) = no new data this sweep — still mark done, update sweep_count
+      if (exitCode === PIPELINE_EXIT.NO_DATA) {
+        console.log(`[worker] job ${job.id} sweep=${sweepCount}: no new data (graceful stop).`);
+      }
+
+      // 更新 sweep_count 方便下轮深分页
+      await supabase
+        .from('discovery_jobs')
+        .update({ sweep_count: sweepCount })
+        .eq('id', job.id);
+
       const count = await readResultCountFromBulk(job.id);
       await markDone(job, count);
-      console.log(`[worker] job done ${job.id}, count=${count}`);
+      console.log(`[worker] job done ${job.id}, count=${count}, sweep=${sweepCount}`);
     } catch (e) {
       console.error('[worker] loop error:', e instanceof Error ? e.message : e);
     }
