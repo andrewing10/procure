@@ -58,6 +58,36 @@ const JUNK_DOMAIN_HOSTS = new Set([
     'yahoo.com', 'answers.yahoo.com',
     'wikipedia.org', 'en.wikipedia.org',
     'wikidata.org',
+    // ── 新闻媒体（不是买家）─────────────────────────────────────────────────
+    // 新加坡
+    'zaobao.com.sg', 'www.zaobao.com.sg', 'zaobao.sg',
+    'straitstimes.com', 'www.straitstimes.com',
+    'channelnewsasia.com', 'www.channelnewsasia.com',
+    'todayonline.com', 'www.todayonline.com',
+    'businesstimes.com.sg', 'www.businesstimes.com.sg',
+    'mothership.sg', 'www.mothership.sg',
+    'stomp.straitstimes.com', 'stomp.com.sg',
+    '8world.com', 'www.8world.com',
+    'beritaharian.sg', 'www.beritaharian.sg',
+    'tamilmurasu.com.sg', 'tnp.sg',
+    // 马来西亚
+    'thestar.com.my', 'www.thestar.com.my',
+    'nst.com.my', 'www.nst.com.my',
+    'malaymail.com', 'www.malaymail.com',
+    'sinchew.com.my', 'www.sinchew.com.my',
+    // 全球媒体
+    'bbc.com', 'www.bbc.com', 'bbc.co.uk',
+    'cnn.com', 'www.cnn.com',
+    'reuters.com', 'www.reuters.com',
+    'bloomberg.com', 'www.bloomberg.com',
+    'ft.com', 'www.ft.com',
+    'wsj.com', 'www.wsj.com',
+    'theguardian.com', 'www.theguardian.com',
+    'techcrunch.com', 'www.techcrunch.com',
+    'forbes.com', 'www.forbes.com',
+    'businessinsider.com', 'www.businessinsider.com',
+    'nytimes.com', 'www.nytimes.com',
+    'washingtonpost.com', 'www.washingtonpost.com',
 ]);
 
 const JUNK_DOMAIN_PATTERNS = [
@@ -152,19 +182,48 @@ function computeQualityGrade({ nameCanonical, domain, primaryEmail, primaryPhone
     return 'qualified';
 }
 
+// ── 已结业/停止营业检测 ─────────────────────────────────────────────────────
+const CLOSED_BIZ_RE = /\b(permanently\s+clos|closed\s+down|ceased\s+operat|no\s+longer\s+operat|out\s+of\s+business|went\s+bankrupt|liquidat|already\s+clos|has\s+clos|have\s+clos|已结业|已停业|停止营业|结业清货|倒闭|停办|已停止营业|停业了|不再营业)\b/i;
+
+/**
+ * snippet/summary 是否含结业信号
+ * @param {string|null|undefined} text
+ * @returns {boolean}
+ */
+function isClosedBusiness(text) {
+    if (!text) return false;
+    return CLOSED_BIZ_RE.test(text);
+}
+
 /**
  * V8 Step5 质量闸：
- * 返回 { qualified: bool, grade: 'premium'|'qualified'|'unqualified' }
+ * 返回 { qualified: bool, grade: 'premium'|'qualified'|'unqualified', reason?: string }
  *
  * 只有 grade !== 'unqualified' 的线索才上传给 zhimao Bulk API。
  * 这与 zhimao 搜索层 (.neq quality_grade unqualified) 完全对齐，
  * 避免"上传了但展示不了"的废配额问题。
  *
  * @param {object} lead - V8 enriched lead
- * @returns {{ qualified: boolean, grade: string }}
+ * @returns {{ qualified: boolean, grade: string, reason?: string }}
  */
 function evaluateLead(lead) {
-    if (!lead || !lead.company_name) return { qualified: false, grade: 'unqualified' };
+    if (!lead || !lead.company_name) return { qualified: false, grade: 'unqualified', reason: 'no_company_name' };
+
+    // 拦截新闻媒体来源
+    if (isJunkDomain(lead.domain) && lead.domain) {
+        return { qualified: false, grade: 'unqualified', reason: 'junk_domain' };
+    }
+
+    // 拦截已结业商家（检查 snippet / summary）
+    const snippetText = [
+        lead.snippet,
+        lead.profile_payload_json?.snippet,
+        lead.intent_summary,
+        lead.intent_summary_zh,
+    ].filter(Boolean).join(' ');
+    if (isClosedBusiness(snippetText)) {
+        return { qualified: false, grade: 'unqualified', reason: 'closed_business' };
+    }
 
     const ib = (lead.inference_breakdown && typeof lead.inference_breakdown === 'object')
         ? lead.inference_breakdown
@@ -182,4 +241,4 @@ function evaluateLead(lead) {
     return { qualified: grade !== 'unqualified', grade };
 }
 
-module.exports = { isJunkDomain, isJunkName, computeQualityGrade, evaluateLead };
+module.exports = { isJunkDomain, isJunkName, computeQualityGrade, isClosedBusiness, evaluateLead };

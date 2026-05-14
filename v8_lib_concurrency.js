@@ -226,6 +226,47 @@ async function callGeminiJson(promptText, {
 // rules but at zero cost. Filtering ~30-50% of obvious noise before Gemini cuts
 // step2 wall time and quota usage proportionally.
 const LISTICLE_RE = /\b(top\s*\d+|best\s+\w+|how\s+to\b|guide\s+to\b|review[s]?:?\b|vs\.?\b|things\s+you\s+should|^\d+\s+(best|top))\b/i;
+
+// 新闻/媒体文章特征（标题级别即可拦截，无需等 Gemini）
+const NEWS_TITLE_RE = /\b(breaking\s+news|press\s+release|media\s+release|news\s+report|daily\s+news|weekly\s+news|记者|报道|报章|新闻|报导|早报|联合早报|副刊|采访|专访|通讯社)\b/i;
+// 已结业/永久关闭特征（snippet 级别）
+const CLOSED_BIZ_RE = /\b(permanently\s+clos|closed\s+down|ceased\s+operat|no\s+longer\s+operat|out\s+of\s+business|went\s+bankrupt|liquidat|已结业|已停业|停止营业|结业清货|倒闭|停办)\b/i;
+
+// 新加坡及亚太区主要新闻媒体域名（buyer 来源不应包含新闻报章）
+const NEWS_DOMAIN_HOSTS = new Set([
+    // 新加坡
+    'zaobao.com.sg', 'www.zaobao.com.sg', 'zaobao.sg', 'zbschools.sg',
+    'straitstimes.com', 'www.straitstimes.com',
+    'channelnewsasia.com', 'www.channelnewsasia.com',
+    'todayonline.com', 'www.todayonline.com',
+    'businesstimes.com.sg', 'www.businesstimes.com.sg',
+    'mothership.sg', 'www.mothership.sg',
+    'stomp.straitstimes.com', 'stomp.com.sg',
+    '8world.com', 'www.8world.com',
+    'beritaharian.sg', 'www.beritaharian.sg',
+    'tamilmurasu.com.sg',
+    'tnp.sg',
+    // 马来西亚
+    'thestar.com.my', 'www.thestar.com.my',
+    'nst.com.my', 'www.nst.com.my',
+    'malaymail.com', 'www.malaymail.com',
+    'sinchew.com.my', 'www.sinchew.com.my',
+    // 全球主流媒体
+    'bbc.com', 'www.bbc.com', 'bbc.co.uk',
+    'cnn.com', 'www.cnn.com',
+    'reuters.com', 'www.reuters.com',
+    'bloomberg.com', 'www.bloomberg.com',
+    'ft.com', 'www.ft.com',
+    'wsj.com', 'www.wsj.com',
+    'theguardian.com', 'www.theguardian.com',
+    'techcrunch.com', 'www.techcrunch.com',
+    'forbes.com', 'www.forbes.com',
+    'businessinsider.com', 'www.businessinsider.com',
+    'nytimes.com', 'www.nytimes.com',
+    'washingtonpost.com', 'www.washingtonpost.com',
+]);
+const NEWS_DOMAIN_RE = /\.(news|press|media|journalist|tribune|gazette|herald|chronicle|times\.com\.sg|daily|weekly|post\.com)$/i;
+
 const PLATFORM_HOSTS = [
     'alibaba.com', 'aliexpress.com', 'amazon.com', 'thomasnet.com',
     'globalsources.com', 'made-in-china.com', 'tradeindia.com',
@@ -236,21 +277,36 @@ const PLATFORM_HOSTS = [
 ];
 const CN_HINT_RE = /\b(china|chinese|guangzhou|shenzhen|yiwu|shanghai|ningbo|hk\b|hong\s*kong)\b/i;
 
+function isNewsDomain(link) {
+    if (!link) return false;
+    try {
+        const host = new URL(link.startsWith('http') ? link : `https://${link}`).hostname.toLowerCase();
+        if (NEWS_DOMAIN_HOSTS.has(host)) return true;
+        if (NEWS_DOMAIN_RE.test(host)) return true;
+    } catch (_) {}
+    return false;
+}
+
 function preFilterRawLeads(rawItems) {
     if (!Array.isArray(rawItems)) return { kept: [], dropped: 0, reasons: {} };
     const kept = [];
-    const reasons = { listicle: 0, platform: 0, cn_supplier: 0, no_signal: 0 };
+    const reasons = { listicle: 0, platform: 0, cn_supplier: 0, no_signal: 0, news_media: 0, closed_biz: 0 };
     for (const r of rawItems) {
         const title = String(r.title || '').trim();
         const snippet = String(r.snippet || '').trim();
         const link = String(r.link || '').toLowerCase();
+        const combined = `${title} ${snippet}`;
 
         if (!title && !snippet) { reasons.no_signal += 1; continue; }
         if (LISTICLE_RE.test(title) || LISTICLE_RE.test(snippet)) { reasons.listicle += 1; continue; }
         if (PLATFORM_HOSTS.some(h => link.includes(h))) { reasons.platform += 1; continue; }
+        // 新闻媒体：域名黑名单 + 标题特征
+        if (isNewsDomain(link) || NEWS_TITLE_RE.test(title)) { reasons.news_media += 1; continue; }
+        // 已结业商家：snippet/title 含关闭特征词
+        if (CLOSED_BIZ_RE.test(combined)) { reasons.closed_biz += 1; continue; }
         // CN-supplier hint must be in the snippet+title combo and not contradicted
         // by a non-CN country mention. Coarse but cheap.
-        if (CN_HINT_RE.test(`${title} ${snippet}`) && /\b(supplier|exporter|manufacturer|factory)\b/i.test(snippet)) {
+        if (CN_HINT_RE.test(combined) && /\b(supplier|exporter|manufacturer|factory)\b/i.test(snippet)) {
             reasons.cn_supplier += 1; continue;
         }
         kept.push(r);
