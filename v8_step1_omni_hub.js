@@ -27,6 +27,70 @@ if (!API_KEY) { console.error('[step1] SERPER_API_KEY env var is required'); pro
 const SWEEP_COUNT  = Math.max(1, parseInt(process.env.SWEEP_COUNT || '1', 10));
 const SEARCH_PAGE  = SWEEP_COUNT; // 1-based Serper page
 
+function loadReweightControls() {
+  const raw = process.env.DISCOVERY_REWEIGHT_JSON || '[]';
+  let items = [];
+  try { items = JSON.parse(raw); } catch { items = []; }
+
+  const sum = (kind) => (Array.isArray(items) ? items
+    .filter(x => String(x?.source_kind || '').toLowerCase() === kind)
+    .reduce((acc, x) => acc + Number(x?.weight_delta || 0), 0) : 0);
+
+  const geo      = sum('geo');
+  const entity   = sum('entity');
+  const contact  = sum('contact');
+  const generic  = sum('generic');
+  const staleness = sum('staleness');
+
+  // 硬禁用检查（channel_disabled=true 时直接 disable）
+  const isHardDisabled = (kind) => Array.isArray(items) && items
+    .filter(x => String(x?.source_kind || '').toLowerCase() === kind)
+    .some(x => x?.channel_disabled === true);
+
+  // 合并多行域名黑名单（V8 step2 直接过滤 host）
+  const domainBlacklist = Array.isArray(items)
+    ? [...new Set(items.flatMap(x => Array.isArray(x?.domain_blacklist) ? x.domain_blacklist : []))]
+    : [];
+
+  // 合并关键词抑制列表（V8 step0 查询翻译时排除这些词）
+  const keywordSuppress = Array.isArray(items)
+    ? [...new Set(items.flatMap(x => Array.isArray(x?.keyword_suppress) ? x.keyword_suppress : []))]
+    : [];
+
+  // 计算各渠道权重分（0-1），用于动态调整抓取优先级
+  // 基准 1.0，负向信号降低，正向信号提升，硬禁用强制 0
+  const channelWeight = (kind, base = 1.0) => {
+    if (isHardDisabled(kind)) return 0;
+    const delta = sum(kind);
+    // 线性映射：delta=-0.3 → weight=0.1, delta=0 → 1.0, delta=+0.15 → 1.5
+    return Math.max(0, Math.min(2.0, base + delta * 3));
+  };
+
+  return {
+    // 原有布尔控制（向后兼容）
+    geo, entity, contact, generic,
+    disableLinkedin:  isHardDisabled('entity') || entity <= -0.05,
+    disableLookalike: isHardDisabled('generic') || generic <= -0.08,
+    enforceGeo:       isHardDisabled('geo') || geo <= -0.05,
+    // 新增：渠道权重（0=禁用, 1=正常, >1=加权）
+    weights: {
+      geo:       channelWeight('geo'),
+      entity:    channelWeight('entity'),
+      contact:   channelWeight('contact'),
+      generic:   channelWeight('generic'),
+      staleness: channelWeight('staleness'),
+    },
+    // 新增：时效性加强（数据陈旧投诉时，强制加年份过滤）
+    enforceRecency: isHardDisabled('staleness') || staleness <= -0.06,
+    // 新增：域名黑名单（直接传给 step2）
+    domainBlacklist,
+    // 新增：关键词抑制（传给 step0 翻译器）
+    keywordSuppress,
+    // 调试用：原始策略行数
+    _policyCount: Array.isArray(items) ? items.length : 0,
+  };
+}
+
 // ─── Serper helpers ────────────────────────────────────────────────────────
 function serperPost(path, body) {
   return new Promise(resolve => {
@@ -85,6 +149,8 @@ async function run() {
   const { baseQuery, countryName, category, tld } = data;
   const cc   = countryCode || '';
   const year = new Date().getFullYear();
+  const controls = loadReweightControls();
+  console.log('[step1] reweight controls:', JSON.stringify(controls));
 
   // ── Pillar 定义（每个 Pillar 都是一个 Promise，全部同时启动） ──────────────
   //
@@ -302,9 +368,24 @@ async function run() {
     }),
   };
 
+  if (controls.disableLinkedin) {
+    delete pillarPromises.p11_linkedin_decision;
+    console.log('[step1] LinkedIn pillar DISABLED by reweight policy (entity delta=' + controls.entity.toFixed(3) + ')');
+  }
+  if (controls.disableLookalike) {
+    delete pillarPromises.p9_lookalike;
+    console.log('[step1] Lookalike pillar DISABLED by reweight policy (generic delta=' + controls.generic.toFixed(3) + ')');
+  }
+
   // ── 全并行执行（等最慢的那一路） ──────────────────────────────────────────
   const depthLabel = SEARCH_PAGE === 1 ? '浅层(p1)' : `深水区(p${SEARCH_PAGE} ≈ 第${(SEARCH_PAGE-1)*20+1}-${SEARCH_PAGE*20}条)`;
   console.log(`[step1] Launching ${Object.keys(pillarPromises).length} pillars in parallel for "${category}" in ${countryName} [${depthLabel}]...`);
+  if (controls._policyCount > 0) {
+    console.log(`[step1] Active policies: ${controls._policyCount}, weights:`, JSON.stringify(controls.weights));
+  }
+  if (controls.domainBlacklist.length > 0) {
+    console.log(`[step1] Domain blacklist (${controls.domainBlacklist.length}): ${controls.domainBlacklist.slice(0, 5).join(', ')}...`);
+  }
   const startedAt = Date.now();
 
   const results = await Promise.allSettled(Object.values(pillarPromises));
@@ -324,9 +405,47 @@ async function run() {
   const nowIso = new Date().toISOString();
   allLeads.forEach(l => { l.source_timestamp = l.source_timestamp || nowIso; });
 
-  // P0 出口过滤：丢弃垃圾域名
+  // P0 出口过滤：丢弃垃圾域名 + 策略域名黑名单 + 地理过滤
   const beforeFilter = allLeads.length;
-  const filteredLeads = allLeads.filter(l => !isJunkLead(l));
+  // 构建策略域名黑名单 Set（O(1) 查找）
+  const blacklistSet = new Set(controls.domainBlacklist.map(d => d.toLowerCase()));
+
+  let filteredLeads = allLeads.filter(l => {
+    if (isJunkLead(l)) return false;
+    // 策略域名黑名单过滤
+    if (blacklistSet.size > 0 && l.link) {
+      try {
+        const host = new URL(l.link).hostname.toLowerCase().replace(/^www\./, '');
+        if (blacklistSet.has(host)) return false;
+      } catch { /* ignore */ }
+    }
+    return true;
+  });
+
+  if (controls.enforceGeo) {
+    const countryHint = String(countryName || '').toLowerCase();
+    const beforeGeo = filteredLeads.length;
+    filteredLeads = filteredLeads.filter((l) => {
+      const combined = `${l.title || ''} ${l.snippet || ''} ${l.link || ''}`.toLowerCase();
+      return combined.includes(countryHint) || combined.includes(`.${cc.toLowerCase()}`);
+    });
+    console.log(`[step1] Geo filter (enforced): ${beforeGeo} → ${filteredLeads.length} (removed ${beforeGeo - filteredLeads.length} geo-mismatched)`);
+  }
+
+  // 时效性过滤：数据陈旧投诉时，过滤掉明显旧数据（标题/摘要中含 3 年前年份）
+  if (controls.enforceRecency) {
+    const currentYear = new Date().getFullYear();
+    const staleYearRe = new RegExp(`\\b(${currentYear - 3}|${currentYear - 4}|${currentYear - 5})\\b`);
+    const beforeRecency = filteredLeads.length;
+    filteredLeads = filteredLeads.filter(l => {
+      const combined = `${l.title || ''} ${l.snippet || ''}`;
+      return !staleYearRe.test(combined);
+    });
+    if (beforeRecency > filteredLeads.length) {
+      console.log(`[step1] Recency filter (enforced): removed ${beforeRecency - filteredLeads.length} stale results`);
+    }
+  }
+
   const junkCount = beforeFilter - filteredLeads.length;
 
   // Pillar 分布统计（帮助运营判断哪些渠道质量好）

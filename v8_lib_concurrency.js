@@ -274,6 +274,7 @@ const PLATFORM_HOSTS = [
     'tradekey.com', 'go4worldbusiness.com', 'panjiva.com',
     'importyeti.com', 'volza.com', 'reddit.com', 'quora.com',
     'wikipedia.org', 'wikihow.com', 'youtube.com',
+    'facebook.com', 'instagram.com', 'linkedin.com', 'x.com', 'twitter.com', 'tiktok.com',
 ];
 const CN_HINT_RE = /\b(china|chinese|guangzhou|shenzhen|yiwu|shanghai|ningbo|hk\b|hong\s*kong)\b/i;
 

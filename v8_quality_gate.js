@@ -101,6 +101,66 @@ const JUNK_DOMAIN_PATTERNS = [
     /substack\.com/i,
 ];
 
+const SOCIAL_DOMAIN_HOSTS = new Set([
+    'facebook.com', 'www.facebook.com', 'm.facebook.com',
+    'instagram.com', 'www.instagram.com',
+    'linkedin.com', 'www.linkedin.com',
+    'x.com', 'twitter.com', 'www.twitter.com',
+    'youtube.com', 'www.youtube.com',
+    'tiktok.com', 'www.tiktok.com',
+    'pinterest.com', 'www.pinterest.com',
+]);
+const AGGREGATOR_DOMAIN_HOSTS = new Set([
+    'yellowpages.com', 'www.yellowpages.com',
+    'yelp.com', 'www.yelp.com',
+    'kompass.com', 'www.kompass.com',
+    'tradeindia.com', 'www.tradeindia.com',
+    'tradekey.com', 'www.tradekey.com',
+    'globalsources.com', 'www.globalsources.com',
+    'made-in-china.com', 'www.made-in-china.com',
+    'ec21.com', 'www.ec21.com',
+    'ecplaza.net', 'www.ecplaza.net',
+]);
+const NEWS_TEXT_RE = /\b(news|press|journal|报道|新闻|专访|记者|通讯社)\b/i;
+const SOCIAL_TEXT_RE = /\b(facebook|instagram|linkedin|x\.com|twitter|youtube|tiktok|social)\b/i;
+
+// 国家识别（轻量版，避免引入重依赖）
+const COUNTRY_HINTS = {
+    US: ['united states', 'usa', 'america', '美国'],
+    CN: ['china', 'prc', 'chinese', '中国'],
+    SG: ['singapore', '新加坡'],
+    MY: ['malaysia', '马来西亚'],
+    TH: ['thailand', '泰国'],
+    VN: ['vietnam', '越南'],
+    ID: ['indonesia', '印尼', '印度尼西亚'],
+    PH: ['philippines', '菲律宾'],
+    JP: ['japan', '日本'],
+    KR: ['south korea', 'korea', '韩国'],
+    GB: ['united kingdom', 'uk', 'britain', '英国'],
+    DE: ['germany', '德国'],
+    FR: ['france', '法国'],
+    IT: ['italy', '意大利'],
+    ES: ['spain', '西班牙'],
+    CA: ['canada', '加拿大'],
+    AU: ['australia', '澳大利亚', '澳洲'],
+    CH: ['switzerland', 'swiss', '瑞士'],
+    BR: ['brazil', '巴西'],
+    IN: ['india', '印度'],
+    TR: ['turkey', '土耳其'],
+    AE: ['uae', 'united arab emirates', '阿联酋'],
+    SA: ['saudi arabia', '沙特'],
+};
+const CCTLD_TO_ISO = {
+    us: 'US', cn: 'CN', sg: 'SG', my: 'MY', th: 'TH', vn: 'VN', id: 'ID', ph: 'PH',
+    jp: 'JP', kr: 'KR', uk: 'GB', gb: 'GB', de: 'DE', fr: 'FR', it: 'IT', es: 'ES',
+    ca: 'CA', au: 'AU', ch: 'CH', br: 'BR', in: 'IN', tr: 'TR', ae: 'AE', sa: 'SA',
+};
+const CALLING_CODE_TO_ISO = {
+    '1': 'US', '86': 'CN', '65': 'SG', '60': 'MY', '66': 'TH', '84': 'VN', '62': 'ID',
+    '63': 'PH', '81': 'JP', '82': 'KR', '44': 'GB', '49': 'DE', '33': 'FR', '39': 'IT',
+    '34': 'ES', '61': 'AU', '41': 'CH', '55': 'BR', '91': 'IN', '90': 'TR', '971': 'AE', '966': 'SA',
+};
+
 /**
  * 域名是否为垃圾来源（与 zhimao isJunkDomain 完全对齐）
  * @param {string|null|undefined} raw
@@ -117,6 +177,74 @@ function isJunkDomain(raw) {
     if (JUNK_DOMAIN_HOSTS.has(domain)) return true;
     if (JUNK_DOMAIN_PATTERNS.some(p => p.test(domain))) return true;
     return false;
+}
+
+function getHost(raw) {
+    if (!raw || !raw.trim()) return '';
+    try {
+        const host = new URL(raw.startsWith('http') ? raw : `https://${raw}`).hostname.toLowerCase();
+        return host.replace(/^www\./, '');
+    } catch {
+        return raw.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+    }
+}
+
+function inferEntityType({ domain, snippet, companyName }) {
+    const host = getHost(domain);
+    const text = `${snippet || ''} ${companyName || ''}`.toLowerCase();
+    if (SOCIAL_DOMAIN_HOSTS.has(host) || SOCIAL_TEXT_RE.test(text)) return 'social';
+    if (AGGREGATOR_DOMAIN_HOSTS.has(host)) return 'aggregator';
+    if (NEWS_TEXT_RE.test(text)) return 'media';
+    return 'company';
+}
+
+function extractPhoneCountry(phone) {
+    if (!phone || typeof phone !== 'string') return null;
+    const m = phone.trim().match(/^\+(\d{1,3})/);
+    if (!m) return null;
+    return CALLING_CODE_TO_ISO[m[1]] || null;
+}
+
+function inferIsoFromDomain(domain) {
+    const host = getHost(domain);
+    if (!host || !host.includes('.')) return null;
+    const suffix = host.split('.').pop();
+    if (!suffix) return null;
+    return CCTLD_TO_ISO[suffix] || null;
+}
+
+function assessCountryMatchLevel({ targetCountry, text, domain, phone }) {
+    const target = String(targetCountry || '').toUpperCase();
+    if (!target || target.length !== 2) return 'medium';
+    const hay = String(text || '').toLowerCase();
+    let positive = 0;
+    let negative = 0;
+
+    const targetHints = COUNTRY_HINTS[target] || [];
+    if (targetHints.some(h => hay.includes(h.toLowerCase()))) positive += 1;
+
+    for (const [iso, hints] of Object.entries(COUNTRY_HINTS)) {
+        if (iso === target) continue;
+        if (hints.some(h => hay.includes(h.toLowerCase()))) {
+            negative += 1;
+            break;
+        }
+    }
+
+    const domainIso = inferIsoFromDomain(domain);
+    if (domainIso) {
+        if (domainIso === target) positive += 1;
+        else negative += 1;
+    }
+    const phoneIso = extractPhoneCountry(phone);
+    if (phoneIso) {
+        if (phoneIso === target) positive += 1;
+        else negative += 1;
+    }
+
+    if (negative >= 2) return 'low';
+    if (positive >= 2 && negative === 0) return 'high';
+    return 'medium';
 }
 
 // ── 垃圾公司名过滤（与 zhimao JUNK_NAME_EXACT + JUNK_NAME_PATTERNS 完全一致） ─
@@ -209,6 +337,15 @@ function isClosedBusiness(text) {
 function evaluateLead(lead) {
     if (!lead || !lead.company_name) return { qualified: false, grade: 'unqualified', reason: 'no_company_name' };
 
+    const entityType = inferEntityType({
+        domain: lead.domain,
+        snippet: [lead.snippet, lead.intent_summary, lead.intent_summary_zh].filter(Boolean).join(' '),
+        companyName: lead.company_name,
+    });
+    if (entityType !== 'company') {
+        return { qualified: false, grade: 'unqualified', reason: `entity_type_${entityType}` };
+    }
+
     // 拦截新闻媒体来源
     if (isJunkDomain(lead.domain) && lead.domain) {
         return { qualified: false, grade: 'unqualified', reason: 'junk_domain' };
@@ -223,6 +360,16 @@ function evaluateLead(lead) {
     ].filter(Boolean).join(' ');
     if (isClosedBusiness(snippetText)) {
         return { qualified: false, grade: 'unqualified', reason: 'closed_business' };
+    }
+
+    const countryMatch = assessCountryMatchLevel({
+        targetCountry: lead.country,
+        text: snippetText,
+        domain: lead.domain,
+        phone: lead.primary_phone,
+    });
+    if (countryMatch === 'low') {
+        return { qualified: false, grade: 'unqualified', reason: 'country_mismatch' };
     }
 
     const ib = (lead.inference_breakdown && typeof lead.inference_breakdown === 'object')

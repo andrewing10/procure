@@ -36,7 +36,37 @@ function sleep(ms) {
 //   2 → 本轮无新数据（graceful stop）→ markDone 但标记 result_count 来自 bulk 侧
 const PIPELINE_EXIT = { SUCCESS: 0, CRASH: 1, NO_DATA: 2 };
 
-function runPipeline(countryIso, category, jobId, sweepCount = 1) {
+async function readReweightPolicies(job) {
+  const country = String(job.country_iso || '').trim().toUpperCase();
+  const category = String(job.category || '').trim().toLowerCase();
+  const merged = new Map();
+  async function pull(countryScoped, categoryScoped) {
+    let q = supabase
+      .from('discovery_reweight_policies')
+      .select('source_kind,weight_delta,sample_count,country_iso,category_key,updated_at,last_reason');
+    q = countryScoped ? q.eq('country_iso', country) : q.is('country_iso', null);
+    q = categoryScoped ? q.eq('category_key', category) : q.is('category_key', null);
+    const { data } = await q.limit(50);
+    for (const row of (data || [])) {
+      const key = String(row.source_kind || 'generic');
+      const prev = merged.get(key) || { source_kind: key, weight_delta: 0, sample_count: 0 };
+      prev.weight_delta += Number(row.weight_delta || 0);
+      prev.sample_count += Number(row.sample_count || 0);
+      merged.set(key, prev);
+    }
+  }
+  try {
+    await pull(true, true);
+    await pull(true, false);
+    await pull(false, true);
+    await pull(false, false);
+  } catch (e) {
+    console.warn('[worker] read reweight policies failed:', e?.message || e);
+  }
+  return Array.from(merged.values());
+}
+
+function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, reweightPolicies = []) {
   return new Promise((resolve) => {
     const child = spawn(
       'node',
@@ -47,6 +77,10 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1) {
           ...process.env,
           DISCOVERY_JOB_ID: String(jobId),
           SWEEP_COUNT:       String(sweepCount),
+          DISCOVERY_SESSION_ID: meta.session_id ? String(meta.session_id) : '',
+          DISCOVERY_PARENT_JOB_ID: meta.parent_job_id ? String(meta.parent_job_id) : '',
+          DISCOVERY_ACTION_TYPE: meta.action_type ? String(meta.action_type) : 'new_search',
+          DISCOVERY_REWEIGHT_JSON: JSON.stringify(Array.isArray(reweightPolicies) ? reweightPolicies : []),
         },
       },
     );
@@ -58,7 +92,7 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1) {
 async function pickPendingJob() {
   const { data, error } = await supabase
     .from('discovery_jobs')
-    .select('id,category,country_iso,requested_by')
+    .select('id,category,country_iso,requested_by,session_id,parent_job_id,action_type')
     .eq('status', 'pending')
     .order('created_at', { ascending: true })
     .limit(1)
@@ -210,8 +244,9 @@ async function main() {
         .maybeSingle();
       const sweepCount = Number(jobMeta?.sweep_count ?? 0) + 1;
 
-      console.log(`[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount})`);
-      const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount);
+      const reweightPolicies = await readReweightPolicies(job);
+      console.log(`[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`);
+      const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount, job, reweightPolicies);
 
       if (exitCode === PIPELINE_EXIT.CRASH) {
         await markFailed(job.id, 'pipeline_exit_non_zero');

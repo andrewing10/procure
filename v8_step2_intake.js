@@ -59,6 +59,20 @@ const CONCURRENCY  = Math.max(1, parseInt(process.env.INTAKE_CONCURRENCY  || '3'
 const TIMEOUT_MS   = Math.max(5_000, parseInt(process.env.INTAKE_TIMEOUT_MS || '25000', 10));
 const MAX_RETRIES  = Math.max(0, parseInt(process.env.INTAKE_MAX_RETRIES  || '3',  10));
 
+const SOCIAL_HOST_RE = /(facebook|instagram|linkedin|twitter|x\.com|youtube|tiktok|pinterest)\./i;
+const MEDIA_TEXT_RE = /\b(news|press|journal|报道|新闻|记者|通讯社)\b/i;
+const AGGREGATOR_HOST_RE = /(yellowpages|yelp|kompass|tradeindia|tradekey|ec21|ecplaza)\./i;
+
+function inferEntityType({ title, snippet, link }) {
+    const host = String(link || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+    const t = `${title || ''} ${snippet || ''}`;
+    // 顺序与 v8_quality_gate.js 保持一致：社媒 → 聚合平台 → 媒体 → 公司
+    if (SOCIAL_HOST_RE.test(String(link || ''))) return 'social';
+    if (AGGREGATOR_HOST_RE.test(String(link || ''))) return 'aggregator';
+    if (MEDIA_TEXT_RE.test(t)) return 'media';
+    return 'company';
+}
+
 function buildPrompt(batch, triggerBlock) {
     return `Extract exact formal Company Name from each item.
 [CRITICAL RULES]
@@ -94,6 +108,8 @@ async function processBatch(batch, batchIndex, batchTotal, triggerBlock) {
         const name = cn.trim();
         // 用与 zhimao quality_gate 对齐的 isJunkName 过滤，避免垃圾名进入 Step3 浪费 Gemini
         if (isJunkName(name)) { junkNameDropped += 1; return; }
+        const entityType = inferEntityType({ title: r.title, snippet: r.snippet, link: r.link });
+        if (entityType !== 'company') return;
         accepted.push({
             company_name: name,
             domain:        normalizeLinkToDomain(r.link),
@@ -101,6 +117,7 @@ async function processBatch(batch, batchIndex, batchTotal, triggerBlock) {
             phone:         r.phone,
             pillar:        r.pillar,
             intent_signal: r.intent_signal,
+            entity_type:   entityType,
         });
     });
     console.log(`[step2] Batch ${batchIndex}/${batchTotal}: ${accepted.length}/${batch.length} accepted, junk_name_dropped=${junkNameDropped} (${Date.now() - startedAt}ms)`);

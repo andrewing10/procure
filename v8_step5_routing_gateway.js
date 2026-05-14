@@ -269,6 +269,7 @@ function mapToBulkL1Item(lead) {
         ...(lead.source_timestamp && { source_timestamp: lead.source_timestamp }),
         // L3 supply-chain inference (written to data_intel_l3_inferred by the bulk API)
         ...(lead.inference_breakdown && { inference_breakdown: lead.inference_breakdown }),
+        ...(lead.entity_type && { entity_type: lead.entity_type }),
     };
 }
 
