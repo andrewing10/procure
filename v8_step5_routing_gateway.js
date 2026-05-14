@@ -216,9 +216,28 @@ function pushBatchToCatagent(items, batchIndex, batchTotal) {
     });
 }
 
-// Top-level orchestrator: 按 BULK_BATCH_SIZE 切片，逐批 push。
-// 任一批 5xx/transport 错误都直接 return failure，上层 main 决定是否 exit(1)。
-// 任一批返回 l3_error，仅累计、不中断（与之前行为一致：L1 已写、L3 部分失败不致命）。
+// 单批最大重试次数（针对 5xx / transport 错误）
+const BATCH_MAX_RETRIES = Number(process.env.STEP5_MAX_RETRIES) > 0
+    ? Number(process.env.STEP5_MAX_RETRIES)
+    : 3;
+// 初始退避延迟 ms（指数退避：1s → 2s → 4s）
+const BATCH_RETRY_BASE_MS = 1000;
+
+async function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
+
+// 不可重试的状态码：认证失败、payload 过大、客户端错误（4xx 非 429）
+function isRetryableStatus(code) {
+    if (code === 0) return true;   // transport error
+    if (code === 429) return true; // rate limit
+    if (code >= 500) return true;  // server error
+    return false;                  // 4xx client errors: don't retry
+}
+
+// Top-level orchestrator: 按 BULK_BATCH_SIZE 切片，逐批 push，失败自动重试。
+// 任一批在 BATCH_MAX_RETRIES 次后仍失败，return failure，上层 main 决定是否 exit(1)。
+// 任一批返回 l3_error，仅累计、不中断（L1 已写、L3 部分失败不致命）。
 async function pushToCatagentBatched(items) {
     const total = items.length;
     if (total === 0) return { ok: true, attempted: 0, qualified: 0, l3WrittenSum: 0, l3AttemptedSum: 0, l3Errors: [] };
@@ -234,16 +253,41 @@ async function pushToCatagentBatched(items) {
         const slice = items.slice(start, start + BULK_BATCH_SIZE);
         console.log(`[step5] pushing batch ${batchIndex}/${batchTotal} (${slice.length} leads, total=${total})`);
 
-        const { statusCode, body } = await pushBatchToCatagent(slice, batchIndex, batchTotal);
+        let lastStatusCode = 0;
+        let lastBody = null;
+        let succeeded = false;
 
-        if (statusCode < 200 || statusCode >= 300) {
-            console.error(`[step5] batch ${batchIndex}/${batchTotal} FAILED with HTTP ${statusCode}.`);
+        for (let attempt = 1; attempt <= BATCH_MAX_RETRIES; attempt++) {
+            const { statusCode, body } = await pushBatchToCatagent(slice, batchIndex, batchTotal);
+            lastStatusCode = statusCode;
+            lastBody = body;
+
+            if (statusCode >= 200 && statusCode < 300) {
+                succeeded = true;
+                break;
+            }
+
+            if (!isRetryableStatus(statusCode)) {
+                // 4xx 客户端错误不重试（配置问题，重试无意义）
+                console.error(`[step5] batch ${batchIndex}/${batchTotal} non-retryable HTTP ${statusCode} — aborting.`);
+                break;
+            }
+
+            if (attempt < BATCH_MAX_RETRIES) {
+                const delay = BATCH_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+                console.warn(`[step5] batch ${batchIndex}/${batchTotal} failed (HTTP ${statusCode}), retrying in ${delay}ms (attempt ${attempt}/${BATCH_MAX_RETRIES})...`);
+                await sleep(delay);
+            }
+        }
+
+        if (!succeeded) {
+            console.error(`[step5] batch ${batchIndex}/${batchTotal} FAILED after ${BATCH_MAX_RETRIES} attempts (last HTTP ${lastStatusCode}).`);
             console.error('[step5] Hint: 401=missing/wrong CATAGENT_API_KEY · 404=wrong CATAGENT_API_URL · 413=batch too large (lower STEP5_BATCH_SIZE) · 500=DB schema mismatch (run latest migrations).');
             return {
                 ok: false,
                 failedBatch: batchIndex,
                 batchTotal,
-                statusCode,
+                statusCode: lastStatusCode,
                 attempted: start + slice.length,
                 qualified: qualifiedSum,
                 l3WrittenSum,
@@ -252,12 +296,12 @@ async function pushToCatagentBatched(items) {
             };
         }
 
-        if (body && typeof body === 'object') {
-            qualifiedSum    += Number(body.qualified)    || 0;
-            l3WrittenSum    += Number(body.l3_written)   || 0;
-            l3AttemptedSum  += Number(body.l3_attempted) || 0;
-            if (body.l3_error) {
-                l3Errors.push({ batch: `${batchIndex}/${batchTotal}`, ...body.l3_error });
+        if (lastBody && typeof lastBody === 'object') {
+            qualifiedSum    += Number(lastBody.qualified)    || 0;
+            l3WrittenSum    += Number(lastBody.l3_written)   || 0;
+            l3AttemptedSum  += Number(lastBody.l3_attempted) || 0;
+            if (lastBody.l3_error) {
+                l3Errors.push({ batch: `${batchIndex}/${batchTotal}`, ...lastBody.l3_error });
             }
         }
     }

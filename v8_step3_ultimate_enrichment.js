@@ -81,9 +81,13 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
 
         const results = Array.isArray(parsed?.results) ? parsed.results : [];
         const now = new Date().toISOString();
+        // 归一化比较：去除多余空格、大小写统一，防止 Gemini 返回名称与原始名称
+        // 细微差异（首字母大写/尾部空格）导致 find 失败，inference_breakdown 丢失。
+        const normName = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
         let merged = 0;
         for (const r of results) {
-            const lead = batch.find(l => l.company_name === r.name);
+            const rNorm = normName(r.name);
+            const lead = batch.find(l => normName(l.company_name) === rNorm);
             if (!lead) continue;
             lead.entity_role = r.entity_role || 'Service';
             lead.inferred_bom = Array.isArray(r.primary_materials_top3)
