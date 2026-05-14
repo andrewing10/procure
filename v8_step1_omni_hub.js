@@ -33,25 +33,26 @@ const JUNK_DOMAIN_HOSTS = new Set([
   'amazon.com','www.amazon.com',
   'ebay.com','www.ebay.com',
   'etsy.com','www.etsy.com',
-  'importyeti.com','www.importyeti.com',
+  'importyeti.com','www.importyeti.com',   // 聚合站点：内容有价值但 URL 是垃圾 → 见 Pillar 3 修复说明
   'volza.com','www.volza.com',
   'panjiva.com','www.panjiva.com',
   'tradesparq.com',
   'bing.com','www.bing.com',
   'google.com','www.google.com',
   'wikipedia.org','en.wikipedia.org',
+  'wikidata.org',
 ]);
 const JUNK_DOMAIN_PATTERNS = [
   /scribd\./i, /1688\.com/i, /wikip/i, /fandom\.com/i,
   /blogspot\./i, /wordpress\.com/i, /medium\.com/i,
+  /substack\.com/i,
 ];
 
-/** 返回 true 说明这条 lead 是垃圾，应丢弃 */
 function isJunkLead(lead) {
   if (!lead || !lead.link) return false;
   try {
-    const url = lead.link.trim().toLowerCase();
-    const domain = url.replace(/^https?:\/\//,'').replace(/\/.*/,'').replace(/:\d+$/,'');
+    const domain = lead.link.trim().toLowerCase()
+      .replace(/^https?:\/\//, '').replace(/\/.*/, '').replace(/:\d+$/, '');
     if (JUNK_DOMAIN_HOSTS.has(domain)) return true;
     if (JUNK_DOMAIN_PATTERNS.some(p => p.test(domain))) return true;
   } catch(_) {}
@@ -63,156 +64,199 @@ const [inputFile, outputFile, countryCode] = process.argv.slice(2);
 const API_KEY = process.env.SERPER_API_KEY;
 if (!API_KEY) { console.error('[step1] SERPER_API_KEY env var is required'); process.exit(1); }
 
-async function fetchPlaces(query, gl) {
-    return new Promise(resolve => {
-        const req = https.request({ hostname: 'google.serper.dev', path: '/places', method: 'POST', headers: { 'X-API-KEY': API_KEY, 'Content-Type': 'application/json' } }, r => {
-            let body = ''; r.on('data', c => body += c); r.on('end', () => resolve(JSON.parse(body || '{}').places || []));
-        });
-        req.on('error', () => resolve([])); req.write(JSON.stringify({ q: query, gl })); req.end();
+// ─── Serper helpers ────────────────────────────────────────────────────────
+function serperPost(path, body) {
+  return new Promise(resolve => {
+    const payload = JSON.stringify(body);
+    const req = https.request({
+      hostname: 'google.serper.dev', path, method: 'POST',
+      headers: { 'X-API-KEY': API_KEY, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    }, r => {
+      let data = ''; r.on('data', c => data += c);
+      r.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch { resolve({}); }
+      });
     });
+    req.on('error', () => resolve({}));
+    req.write(payload); req.end();
+  });
 }
 
-async function searchOrganic(query, gl) {
-    return new Promise(resolve => {
-        const req = https.request({ hostname: 'google.serper.dev', path: '/search', method: 'POST', headers: { 'X-API-KEY': API_KEY, 'Content-Type': 'application/json' } }, r => {
-            let body = ''; r.on('data', c => body += c); r.on('end', () => resolve(JSON.parse(body || '{}').organic || []));
-        });
-        req.on('error', () => resolve([])); req.write(JSON.stringify({ q: query, gl, num: 20 })); req.end();
-    });
+function fetchPlaces(query, gl) {
+  return serperPost('/places', { q: query, gl }).then(r => r.places || []);
 }
 
+function searchOrganic(query, gl, num = 20) {
+  return serperPost('/search', { q: query, gl, num }).then(r => r.organic || []);
+}
+
+// ─── Lead builders ─────────────────────────────────────────────────────────
+function fromOrganic(results, pillar, intent_signal) {
+  return results.map(o => ({
+    title: o.title, link: o.link, snippet: o.snippet,
+    pillar, ...(intent_signal ? { intent_signal } : {}),
+  }));
+}
+
+// ─── 主函数：全 Pillar 并行执行 ────────────────────────────────────────────
+// 性能：原来 ~10 次 Serper 调用串行 ≈ 30-60s，现在全并行 ≈ 1-3s（取最慢一路）
 async function run() {
-    const data = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
-    const { baseQuery, countryName, category, tld } = data;
-    const allLeads = [];
-    const currentYear = new Date().getFullYear();
+  const data = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
+  const { baseQuery, countryName, category, tld } = data;
+  const cc   = countryCode || '';
+  const year = new Date().getFullYear();
 
-    // Pillar 0: Seed DB Activation
-    console.log(`[step1] Pillar 0: Seed DB Activation...`);
-    try {
-        if (fs.existsSync('zhimao_seed_intelligence.json')) {
-            const seeds = JSON.parse(fs.readFileSync('zhimao_seed_intelligence.json', 'utf8'));
-            const matched = seeds.filter(s => s.country?.toLowerCase() === countryCode?.toLowerCase() && s.category?.toLowerCase().includes(category.toLowerCase()));
-            matched.forEach(s => allLeads.push({ title: s.company_name, link: s.domain, snippet: 'Seed DB Verified Buyer', pillar: 'Pillar 0 Seed' }));
-            console.log(`[step1] Activated ${matched.length} seed entities.`);
-        }
-    } catch (e) { console.log(`[step1] Seed DB unavailable, skipping.`); }
+  // ── Pillar 定义（每个 Pillar 都是一个 Promise，全部同时启动） ──────────────
+  //
+  // 核心选题原则（采购数据专家视角）：
+  //   真正的买家信号强度：进口记录 > 招聘采购岗 > 业务类型(进口商/批发商) > 主动询盘 > 公司自述
+  //   所有 query 必须返回"公司官网"URL，而非聚合站/社交媒体（会被垃圾过滤器清除）
 
-    // Pillar 1: LBS Maps
-    console.log(`[step1] Pillar 1: LBS Maps...`);
-    const places = await fetchPlaces(`${category} wholesaler OR distributor in ${countryName}`, countryCode);
-    places.forEach(p => { if (p.website || p.phoneNumber) allLeads.push({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS' }); });
+  const pillarPromises = {
 
-    // Pillar 2: Local B2B Directory
-    console.log(`[step1] Pillar 2: Local B2B Directory...`);
-    const b2b = await searchOrganic(`"${category}" ("b2b" OR "directory" OR "suppliers" OR "manufacturers") ${tld} -site:alibaba.com -site:globalsources.com -site:made-in-china.com`, countryCode);
-    b2b.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 2 Local B2B' }));
+    // ── P0: 种子库激活（高质量已验证买家） ──────────────────────────────────
+    p0_seed: Promise.resolve().then(() => {
+      try {
+        if (!fs.existsSync('zhimao_seed_intelligence.json')) return [];
+        const seeds = JSON.parse(fs.readFileSync('zhimao_seed_intelligence.json', 'utf8'));
+        return seeds
+          .filter(s =>
+            s.country?.toLowerCase() === cc.toLowerCase() &&
+            s.category?.toLowerCase().includes(category.toLowerCase())
+          )
+          .map(s => ({ title: s.company_name, link: s.domain, snippet: 'Seed DB Verified Buyer', pillar: 'Pillar 0 Seed' }));
+      } catch { return []; }
+    }),
 
-    // Pillar 3: Customs / Import Trade Records
-    // Strategy: query public import-data aggregators (ImportYeti, Volza, Panjiva public pages)
-    // and generic BoL-signal searches. All three paths degrade gracefully on 0 results.
-    console.log(`[step1] Pillar 3: Customs / Import Trade Records...`);
-    try {
-        // Path A: ImportYeti -- free public importer profiles
-        const importyeti = await searchOrganic(
-            `site:importyeti.com "${category}" "${countryName}"`,
-            countryCode
-        );
-        importyeti.forEach(o => allLeads.push({
-            title:   o.title,
-            link:    o.link,
-            snippet: o.snippet,
-            pillar:  'Pillar 3 Customs/ImportYeti',
-        }));
+    // ── P1: Google Maps/Places（最可靠买家信号：业务类型注册为进口商/批发商） ─
+    // 返回真实公司网站，命中率最高
+    p1_maps_dist: fetchPlaces(`${category} wholesaler OR distributor OR importer in ${countryName}`, cc)
+      .then(ps => ps
+        .filter(p => p.website || p.phoneNumber)
+        .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'MAP_VERIFIED_BUYER' }))
+      ),
 
-        // Path B: Volza / Panjiva public pages
-        const volza = await searchOrganic(
-            `(site:volza.com OR site:panjiva.com) "${category}" importer "${countryName}"`,
-            countryCode
-        );
-        volza.forEach(o => allLeads.push({
-            title:   o.title,
-            link:    o.link,
-            snippet: o.snippet,
-            pillar:  'Pillar 3 Customs/Volza',
-        }));
+    p1_maps_trading: fetchPlaces(`${category} trading company OR import export in ${countryName}`, cc)
+      .then(ps => ps
+        .filter(p => p.website || p.phoneNumber)
+        .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'TRADING_COMPANY' }))
+      ),
 
-        // Path C: Generic BoL / customs declaration signal
-        const bol = await searchOrganic(
-            `"${category}" ("bill of lading" OR "customs importer" OR "import record" OR "HS code") "${countryName}" -site:alibaba.com`,
-            countryCode
-        );
-        bol.forEach(o => allLeads.push({
-            title:   o.title,
-            link:    o.link,
-            snippet: o.snippet,
-            pillar:  'Pillar 3 Customs/BoL',
-        }));
+    // ── P2: 公司官网直接搜索（在目标国TLD下找自述为进口商/批发商的公司） ─────
+    // 关键：用 site:.vn 等TLD直接找公司网站，不找聚合站
+    p2_direct_importer: searchOrganic(
+      `"${category}" (importer OR wholesaler OR distributor) ${tld} -site:alibaba.com -site:made-in-china.com`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 2 Direct', 'SELF_DECLARED_IMPORTER')),
 
-        const p3count = importyeti.length + volza.length + bol.length;
-        console.log(`[step1] Pillar 3: ${p3count} customs/trade signals found${p3count === 0 ? ' (no public records for this query -- skipping gracefully)' : ''}.`);
-    } catch (e) {
-        console.warn(`[step1] Pillar 3 failed (non-fatal): ${e.message}`);
+    p2_sourcing_intent: searchOrganic(
+      `"${category}" ("we import" OR "we source" OR "our suppliers" OR "looking for supplier" OR "wanted suppliers") ${tld}`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 2 Direct', 'ACTIVE_SOURCING')),
+
+    // ── P3: 采购招聘信号（最可靠的买家信号之一：招采购经理 = 一定在采购）  ────
+    // 修复说明：原 site:importyeti.com/volza.com 搜索结果的 URL 都在垃圾名单里
+    // 会被 isJunkLead 全部过滤掉（100% Serper 配额浪费）。
+    // 改为：搜索目标国公司的采购招聘页面，这类页面在公司官网上，URL 有效。
+    p3_jobs_procurement: searchOrganic(
+      `"${category}" ("procurement manager" OR "import manager" OR "sourcing manager" OR "purchasing manager") job ${tld}`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 3 Jobs', 'PROCUREMENT_HIRING')),
+
+    p3_jobs_buyer: searchOrganic(
+      `"${category}" ("buyer" OR "import buyer" OR "commercial buyer") job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 3 Jobs', 'BUYER_HIRING')),
+
+    // ── P4: 主动询盘意图（RFQ / 供应商征集 — 最明确的买家自我标识） ──────────
+    p4_rfq: searchOrganic(
+      `"${category}" (RFQ OR "request for quotation" OR "request for proposal" OR "tender" OR "供应商征集") ${tld}`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 4 Intent', 'RFQ_POSTED')),
+
+    p4_sourcing_post: searchOrganic(
+      `"${category}" ("looking for manufacturers" OR "need factory" OR "sourcing from China" OR "procurement notice") ${countryName}`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 4 Intent', 'SOURCING_POST')),
+
+    // ── P5: 政府采购/招标（机构采购商，预算确定，信号最强） ─────────────────
+    p5_tenders: searchOrganic(
+      `"${category}" (tender OR RFP OR "request for proposal" OR procurement) (${tld} OR site:.gov.${cc})`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 5 Tenders', 'GOV_PROCUREMENT')),
+
+    // ── P6: 行业协会与进口商目录（结构化来源） ─────────────────────────────
+    // 修复说明：原来搜 "exhibitor list"（展商名录）找到的是卖家不是买家。
+    // 改为：搜买家参观/注册信息，或进口商协会会员名录
+    p6_buyer_assoc: searchOrganic(
+      `"${category}" importers association OR buyers club OR "member directory" ${countryName}`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 6 Association', 'ASSOCIATION_MEMBER')),
+
+    p6_trade_show_buyer: searchOrganic(
+      `"${category}" ("buyer visitor" OR "visitor registration" OR "trade visitors" OR "buying mission") ${year} ${countryName}`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 6 Association', 'TRADE_SHOW_BUYER')),
+
+    // ── P7: 海关/贸易信号（真实进口行为，数据最权威） ───────────────────────
+    // 修复说明：原来 site:importyeti.com 等结果 URL 在垃圾名单被全过滤。
+    // 新策略：搜"含海关关键词的公司页面"（返回公司官网，而不是聚合站）
+    p7_customs_direct: searchOrganic(
+      `"${category}" ("import" OR "importer of record" OR "customs entry" OR "HS code" OR "HTS") ${tld} company`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 7 Customs', 'CUSTOMS_SIGNAL')),
+
+    p7_bol_signal: searchOrganic(
+      `"${category}" ("bill of lading" OR "海运提单" OR "شحنة" OR "connaissement") importer "${countryName}"`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 7 Customs', 'BOL_SIGNAL')),
+
+    // ── P8: 电商买家信号（B2B电商平台上的买家侧入口） ────────────────────────
+    p8_b2b_buyer: searchOrganic(
+      `"${category}" buyer OR "trade buyer" OR "retail buyer" ${countryName} -site:alibaba.com -site:made-in-china.com -site:globalsources.com`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 8 B2B', 'B2B_BUYER')),
+
+    p8_ecommerce_import: searchOrganic(
+      `"${category}" ("private label" OR "OEM buyer" OR "contract manufacturing") ${countryName}`,
+      cc
+    ).then(r => fromOrganic(r, 'Pillar 8 B2B', 'PRIVATE_LABEL')),
+  };
+
+  // ── 全并行执行（等最慢的那一路） ──────────────────────────────────────────
+  console.log(`[step1] Launching ${Object.keys(pillarPromises).length} pillars in parallel for "${category}" in ${countryName}...`);
+  const startedAt = Date.now();
+
+  const results = await Promise.allSettled(Object.values(pillarPromises));
+  const labels  = Object.keys(pillarPromises);
+
+  const allLeads = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      console.log(`[step1] ${labels[i]}: ${r.value.length} signals`);
+      allLeads.push(...r.value);
+    } else if (r.status === 'rejected') {
+      console.warn(`[step1] ${labels[i]} failed (non-fatal): ${r.reason?.message || r.reason}`);
     }
+  });
 
-    // Pillar 4: Social -- 在原有探针基础上并发4路深度意图探针（原标签 'Pillar 4 Social' 保持不变）
-    console.log(`[step1] Pillar 4: Social + Deep Intent Probes...`);
-    const [social, socialFbIntent, socialLinkedInIntent, socialWhatsApp, socialThreads] = await Promise.all([
-        // 原有探针（保留原逻辑不变）
-        searchOrganic(`${baseQuery} "${countryName}" site:linkedin.com/company OR site:facebook.com/groups`, countryCode),
-        // FB Groups 主动采购意图
-        searchOrganic(`"${category}" ("need supplier" OR "sourcing" OR "looking for supplier" OR "buying" OR "RFQ") site:facebook.com/groups "${countryName}"`, countryCode),
-        // LinkedIn 采购职位
-        searchOrganic(`"${category}" ("procurement manager" OR "sourcing manager" OR "purchasing" OR "import") site:linkedin.com/in "${countryName}"`, countryCode),
-        // WhatsApp 商业联系
-        searchOrganic(`"${category}" ("whatsapp group" OR "wa.me" OR "whatsapp business") "${countryName}" buyer OR importer`, countryCode),
-        // Threads/Instagram 采购意图
-        searchOrganic(`"${category}" ("looking for supplier" OR "where to buy" OR "need" OR "sourcing") "${countryName}" (site:threads.net OR site:instagram.com)`, countryCode),
-    ]);
-    social.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 4 Social' }));
-    socialFbIntent.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 4 Social', intent_signal: 'ACTIVE_SOURCING' }));
-    socialLinkedInIntent.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 4 Social', intent_signal: 'PROCUREMENT_ROLE' }));
-    socialWhatsApp.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 4 Social', intent_signal: 'WHATSAPP_CONTACT' }));
-    socialThreads.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 4 Social', intent_signal: 'ACTIVE_SOURCING' }));
-    console.log(`[step1] Pillar 4 total: ${social.length + socialFbIntent.length + socialLinkedInIntent.length + socialWhatsApp.length + socialThreads.length} signals`);
+  // 注入时间戳
+  const nowIso = new Date().toISOString();
+  allLeads.forEach(l => { l.source_timestamp = l.source_timestamp || nowIso; });
 
-    // Pillar 5: Tenders & Procurement
-    console.log(`[step1] Pillar 5: Tenders & Procurement...`);
-    const tenders = await searchOrganic(`"${category}" (tender OR RFP OR "request for proposal" OR procurement) ${tld} OR site:.gov.${countryCode}`, countryCode);
-    tenders.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 5 Tenders' }));
+  // P0 出口过滤：丢弃垃圾域名
+  const beforeFilter = allLeads.length;
+  const filteredLeads = allLeads.filter(l => !isJunkLead(l));
+  const junkCount = beforeFilter - filteredLeads.length;
 
-    // Pillar 5b: Compliance Registries -- 认证申请人 = 正在生产/采购该品类的前端信号（非致命）
-    console.log(`[step1] Pillar 5b: Compliance Registries...`);
-    try {
-        const compliance = await searchOrganic(
-            `"${category}" ("Applicant" OR "Grantee" OR "certificate holder" OR "registered manufacturer") (site:fccid.io OR site:tuv.com OR site:ul.com OR site:ce-check.eu OR site:intertek.com)`,
-            countryCode
-        );
-        compliance.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 5 Tenders', intent_signal: 'COMPLIANCE_REGISTRANT' }));
-        console.log(`[step1] Pillar 5b: ${compliance.length} compliance signals found.`);
-    } catch (e) {
-        console.warn(`[step1] Pillar 5b failed (non-fatal): ${e.message}`);
-    }
+  // Pillar 分布统计（帮助运营判断哪些渠道质量好）
+  const pillarStats = {};
+  filteredLeads.forEach(l => { pillarStats[l.pillar] = (pillarStats[l.pillar] || 0) + 1; });
 
-    // Pillar 6: Exhibitions
-    console.log(`[step1] Pillar 6: Exhibitions...`);
-    const exhibitions = await searchOrganic(`"${category}" ("exhibitor list" OR "exhibitors directory") ${currentYear} "${countryName}"`, countryCode);
-    exhibitions.forEach(o => allLeads.push({ title: o.title, link: o.link, snippet: o.snippet, pillar: 'Pillar 6 Exhibitions' }));
+  console.log(`[step1] Done in ${Date.now() - startedAt}ms. Total=${filteredLeads.length} (junk_filtered=${junkCount})`);
+  console.log(`[step1] Pillar distribution:`, JSON.stringify(pillarStats, null, 2));
 
-    // 注入 source_timestamp（新增字段，不影响任何现有字段和逻辑）
-    const nowIso = new Date().toISOString();
-    allLeads.forEach(l => { l.source_timestamp = l.source_timestamp || nowIso; });
-
-    // P0 出口过滤：丢弃垃圾域名 leads（不影响无 link 的 Pillar 0/1 结果）
-    const beforeFilter = allLeads.length;
-    const filteredLeads = allLeads.filter(l => !isJunkLead(l));
-    const junkCount = beforeFilter - filteredLeads.length;
-    if (junkCount > 0) {
-        console.log(`[step1] P0 junk filter: removed ${junkCount}/${beforeFilter} leads (junk domains)`);
-    }
-
-    fs.writeFileSync(outputFile, JSON.stringify(filteredLeads, null, 2));
-    console.log(`[step1] Done -- ${filteredLeads.length} clean leads written -> ${outputFile}`);
+  fs.writeFileSync(outputFile, JSON.stringify(filteredLeads, null, 2));
 }
 
-run().catch(e => { console.error(e); process.exit(1); });
+run().catch(e => { console.error('[step1] fatal:', e); process.exit(1); });

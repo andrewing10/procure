@@ -18,7 +18,8 @@ const USE_PROXY = process.env.USE_PROXY === 'true';
 const USE_BRD_SB = process.env.USE_BRD_SB === 'true';
 const BRD_SB_WSS = process.env.BRD_SB_WSS || '';
 
-const PLAYWRIGHT_TIMEOUT  = parseInt(process.env.PLAYWRIGHT_TIMEOUT || '15000', 10);
+// 超时从 15s 降低到 10s：大多数公司联系页 2-5s 可加载，15s 超时导致 Step3 是最慢瓶颈
+const PLAYWRIGHT_TIMEOUT  = parseInt(process.env.PLAYWRIGHT_TIMEOUT || '10000', 10);
 
 // Tuning knobs --------------------------------------------------------------
 //   BOM_BATCH_SIZE / L3_CONCURRENCY  → Gemini L3 inference parallelism
@@ -27,7 +28,35 @@ const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE ||
 const L3_CONCURRENCY        = Math.max(1, parseInt(process.env.L3_CONCURRENCY || '3',  10));
 const L3_TIMEOUT_MS         = Math.max(5_000, parseInt(process.env.L3_TIMEOUT_MS || '30000', 10));
 const L3_MAX_RETRIES        = Math.max(0, parseInt(process.env.L3_MAX_RETRIES || '3', 10));
-const PAGE_CONCURRENCY      = Math.max(1, parseInt(process.env.STEP3_PAGE_CONCURRENCY || '4', 10));
+// 并发数提升：4 → 8（在有代理或高带宽环境下可进一步调高至 12）
+const PAGE_CONCURRENCY      = Math.max(1, parseInt(process.env.STEP3_PAGE_CONCURRENCY || '8', 10));
+
+// ── 域名抓取缓存（本地文件，跳过 30 天内已爬取的域名）─────────────────────────
+// 避免 cron 每次重跑都对同一家公司 Playwright，既浪费时间又增加被封风险
+const DOMAIN_CACHE_FILE = 'zhimao_domain_contact_cache.json';
+const DOMAIN_CACHE_TTL_DAYS = parseInt(process.env.DOMAIN_CACHE_TTL_DAYS || '30', 10);
+let domainContactCache = {};
+try {
+    if (fs.existsSync(DOMAIN_CACHE_FILE)) {
+        domainContactCache = JSON.parse(fs.readFileSync(DOMAIN_CACHE_FILE, 'utf8'));
+    }
+} catch { domainContactCache = {}; }
+
+function getCachedContact(domain) {
+    const entry = domainContactCache[domain];
+    if (!entry) return null;
+    const ageMs = Date.now() - new Date(entry.cached_at).getTime();
+    if (ageMs > DOMAIN_CACHE_TTL_DAYS * 86400 * 1000) return null; // 过期
+    return entry; // { primary_email, primary_phone, cached_at }
+}
+
+function setCachedContact(domain, email, phone) {
+    domainContactCache[domain] = { primary_email: email || null, primary_phone: phone || null, cached_at: new Date().toISOString() };
+}
+
+function flushDomainCache() {
+    try { fs.writeFileSync(DOMAIN_CACHE_FILE, JSON.stringify(domainContactCache, null, 2)); } catch {}
+}
 
 /**
  * L3 Supply Chain Inference (Gemini).
@@ -152,6 +181,23 @@ async function extractContactForLead(lead, contexts) {
     lead.primary_email = lead.primary_email || lead.email || null;
     lead.primary_phone = lead.primary_phone || lead.phone || null;
 
+    // ── 缓存命中：跳过 Playwright，直接使用已缓存的联系方式 ──────────────────
+    if (lead.domain && lead.domain.startsWith('http')) {
+        const cached = getCachedContact(lead.domain);
+        if (cached) {
+            if (cached.primary_email && !lead.primary_email) lead.primary_email = cached.primary_email;
+            if (cached.primary_phone && !lead.primary_phone) lead.primary_phone = cached.primary_phone;
+            if (lead.primary_email || lead.primary_phone) {
+                score += 30;
+                if (lead.pillar?.includes('LBS')) score += 15;
+            } else {
+                score = Math.min(score, 85);
+            }
+            lead.confidence_score = Math.min(score, 100);
+            return lead; // 命中缓存，跳过 Playwright
+        }
+    }
+
     if (lead.domain && lead.domain.startsWith('http')) {
         const isFb = lead.domain.includes('facebook.com');
         const ctx  = isFb ? contexts.mobile : contexts.desktop;
@@ -191,6 +237,9 @@ async function extractContactForLead(lead, contexts) {
         if (emails.size > 0) lead.primary_email = Array.from(emails)[0];
         const cleanPhones = Array.from(phones).filter(p => p.length < 20);
         if (cleanPhones.length > 0) lead.primary_phone = cleanPhones[0];
+
+        // 写入缓存（无论是否找到联系方式，避免下次重复爬取）
+        setCachedContact(lead.domain, lead.primary_email, lead.primary_phone);
 
         if (lead.primary_email || lead.primary_phone) console.log(`[step3] Enriched: ${lead.company_name} | ${lead.primary_email || ''}`);
     }
@@ -253,12 +302,14 @@ async function run() {
     );
 
     await browser.close();
+    flushDomainCache(); // 持久化本次抓取结果到缓存文件
 
     // pMap may return Error instances if any worker threw — keep success rows only.
     const finalLeads = enriched.filter(x => x && !(x instanceof Error));
+    const contactHit = finalLeads.filter(l => l.primary_email || l.primary_phone).length;
 
     fs.writeFileSync(outputFile, JSON.stringify(finalLeads, null, 2));
-    console.log(`[step3] Done — ${finalLeads.length} enriched leads in ${Date.now() - overallStart}ms → ${outputFile}`);
+    console.log(`[step3] Done — ${finalLeads.length} enriched leads (contact_hit=${contactHit}, hit_rate=${Math.round(contactHit/finalLeads.length*100)}%) in ${Date.now() - overallStart}ms → ${outputFile}`);
 }
 
 run().catch(e => { console.error('[step3] fatal:', e); process.exit(1); });
