@@ -239,7 +239,15 @@ function mapToBulkL1Item(lead) {
     const ib = lead.inference_breakdown;
     let categories;
     if (ib && Array.isArray(ib.procurement_items) && ib.procurement_items.length > 0) {
-        categories = ib.procurement_items.slice(0, 5);       // L3 推断的采购品类（最多 5 个）
+        // procurement_items 元素是 { category, priority, ... } 对象，必须提取 .category 字符串；
+        // 直接传整个对象会让 bulk/route.ts String(obj) → "[object Object]"
+        categories = ib.procurement_items
+            .slice(0, 5)
+            .map(item => (item && typeof item === 'object' && typeof item.category === 'string')
+                ? item.category.trim()
+                : (typeof item === 'string' ? item.trim() : null))
+            .filter(Boolean);
+        if (categories.length === 0) categories = undefined;
     } else if (lead.category && typeof lead.category === 'string') {
         categories = [lead.category];                         // 来自 Step0 的品类标签
     } else if (lead.pillar && typeof lead.pillar === 'string') {

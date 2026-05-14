@@ -5,6 +5,30 @@ const { isJunkName } = require('./v8_quality_gate');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 
+// 将搜索结果 URL 规范化为「公司主页域名」。
+// 搜索引擎 link 可能是 PDF、sitemap、CMS 上传附件等，不应直接当官网域名。
+// 规则：
+//   1. 解析 URL，取 origin（protocol + host）作为规范主页
+//   2. path 以 .pdf / .doc / .docx / .xls / .ppt / /wp-content/ / /uploads/ 开头 → 退回 origin
+//   3. 解析失败（非 URL） → 原样保留，让 isJunkDomain 后续兜底
+function normalizeLinkToDomain(rawLink) {
+    if (!rawLink || typeof rawLink !== 'string') return rawLink;
+    const s = rawLink.trim();
+    try {
+        const u = new URL(s);
+        const path = u.pathname.toLowerCase();
+        const NON_PAGE_EXT  = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|csv|zip|rar|gz|xml|json|txt|rss)$/;
+        const NON_PAGE_PATH = /^\/(wp-content|uploads|static|assets|cdn|files)\//;
+        if (NON_PAGE_EXT.test(path) || NON_PAGE_PATH.test(path)) {
+            // 退回至站点首页 origin，去掉附件路径
+            return u.origin;
+        }
+        return s; // 普通 HTML 页面：保留完整 URL，isJunkDomain 会再做宿主校验
+    } catch {
+        return s;
+    }
+}
+
 // ─── Industry context (unchanged) ──────────────────────────────────────────
 function loadIndustryContext(samplePillar) {
     try {
@@ -72,7 +96,7 @@ async function processBatch(batch, batchIndex, batchTotal, triggerBlock) {
         if (isJunkName(name)) { junkNameDropped += 1; return; }
         accepted.push({
             company_name: name,
-            domain:        r.link,
+            domain:        normalizeLinkToDomain(r.link),
             snippet:       r.snippet,
             phone:         r.phone,
             pillar:        r.pillar,
