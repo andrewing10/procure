@@ -1,4 +1,4 @@
-require('./load-env');
+require('dotenv').config();
 const fs    = require('fs');
 const https = require('https');
 
@@ -20,12 +20,13 @@ if (!GEMINI_KEY) {
     console.warn('[step0] GEMINI_KEY not set — will use OpenAI only for translation.');
 }
 
-// 国家名称映射（扩展至 40+ 主要采购市场）
+// 国家名称映射（与 zhimao apps/web/lib/search/v8DiscoveryCountrySupport.ts 同步）
 const COUNTRY_NAMES = {
   // 亚洲
   vn: 'Vietnam', th: 'Thailand', id: 'Indonesia', my: 'Malaysia', sg: 'Singapore',
   ph: 'Philippines', mm: 'Myanmar', kh: 'Cambodia', bd: 'Bangladesh', pk: 'Pakistan',
   in: 'India', lk: 'Sri Lanka', np: 'Nepal', jp: 'Japan', kr: 'South Korea', tw: 'Taiwan',
+  cn: 'China', hk: 'Hong Kong', mo: 'Macau', ru: 'Russia',
   // 中东
   ae: 'UAE', sa: 'Saudi Arabia', qa: 'Qatar', kw: 'Kuwait', bh: 'Bahrain', om: 'Oman',
   tr: 'Turkey', il: 'Israel', jo: 'Jordan', eg: 'Egypt',
@@ -35,6 +36,10 @@ const COUNTRY_NAMES = {
   // 欧洲
   de: 'Germany', gb: 'United Kingdom', fr: 'France', it: 'Italy', es: 'Spain',
   nl: 'Netherlands', pl: 'Poland', se: 'Sweden', no: 'Norway', dk: 'Denmark',
+  pt: 'Portugal', ie: 'Ireland', ch: 'Switzerland', at: 'Austria', be: 'Belgium',
+  fi: 'Finland', cz: 'Czech Republic', hu: 'Hungary', ro: 'Romania', bg: 'Bulgaria',
+  sk: 'Slovakia', hr: 'Croatia', si: 'Slovenia', ee: 'Estonia', lv: 'Latvia', lt: 'Lithuania',
+  lu: 'Luxembourg', is: 'Iceland', mt: 'Malta', cy: 'Cyprus',
   // 非洲
   ng: 'Nigeria', za: 'South Africa', ke: 'Kenya', gh: 'Ghana', et: 'Ethiopia',
   // 大洋洲
@@ -46,6 +51,7 @@ const LANGUAGE_MAP  = {
   vn: 'Vietnamese', th: 'Thai', id: 'Indonesian', my: 'Malay', ph: 'Filipino',
   mm: 'Burmese', kh: 'Khmer', bd: 'Bengali', pk: 'Urdu', in: 'Hindi', lk: 'Sinhala',
   jp: 'Japanese', kr: 'Korean', tw: 'Traditional Chinese',
+  cn: 'Simplified Chinese', hk: 'Traditional Chinese', mo: 'Traditional Chinese', ru: 'Russian',
   ae: 'Arabic', sa: 'Arabic', qa: 'Arabic', kw: 'Arabic', bh: 'Arabic', om: 'Arabic',
   tr: 'Turkish', il: 'Hebrew', jo: 'Arabic', eg: 'Arabic',
   us: 'English', ca: 'English', gb: 'English', au: 'English', nz: 'English', sg: 'English',
@@ -53,13 +59,19 @@ const LANGUAGE_MAP  = {
   br: 'Portuguese',
   de: 'German', fr: 'French', it: 'Italian', es: 'Spanish', nl: 'Dutch',
   pl: 'Polish', se: 'Swedish', no: 'Norwegian', dk: 'Danish',
+  pt: 'Portuguese', ie: 'English', ch: 'German', at: 'German', be: 'Dutch',
+  fi: 'Finnish', cz: 'Czech', hu: 'Hungarian', ro: 'Romanian', bg: 'Bulgarian',
+  sk: 'Slovak', hr: 'Croatian', si: 'Slovenian', ee: 'Estonian', lv: 'Latvian', lt: 'Lithuanian',
+  lu: 'French', is: 'Icelandic', mt: 'English', cy: 'Greek',
   ng: 'English', za: 'English', ke: 'English', gh: 'English', et: 'Amharic',
 };
 
 async function run() {
-    const targetLang  = LANGUAGE_MAP[countryCode]  || 'English';
-    const countryName = COUNTRY_NAMES[countryCode] || countryCode;
-    const tld         = `site:.${countryCode} OR site:.com.${countryCode}`;
+    const cc = String(countryCode || '').trim().slice(0, 2).toLowerCase() || 'us';
+    const isoUpper = cc.toUpperCase();
+    const targetLang  = LANGUAGE_MAP[cc]  || 'English';
+    const countryName = COUNTRY_NAMES[cc] || isoUpper;
+    const tld         = `site:.${cc} OR site:.com.${cc}`;
 
     let baseQuery = '';
 
@@ -143,7 +155,7 @@ Return ONLY valid JSON with this exact structure:
         baseQuery = `"${category}" ("importer" OR "wholesaler" OR "distributor" OR "buyer" OR "procurement" OR "sourcing")`;
     }
 
-    fs.writeFileSync(outputFile, JSON.stringify({ baseQuery, tld, countryName, countryCode, category }, null, 2));
+    fs.writeFileSync(outputFile, JSON.stringify({ baseQuery, tld, countryName, countryCode: isoUpper, category }, null, 2));
     console.log(`[step0] Orchestration written ??${outputFile}`);
 }
 
