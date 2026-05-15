@@ -68,6 +68,13 @@ async function readReweightPolicies(job) {
 
 function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, reweightPolicies = []) {
   return new Promise((resolve) => {
+    // 提取 Pillar 0 产业链扩展结果（由 zhimao interpret → expand-query 生成）
+    // 注入 step0 用于替换单一品类词为多样化买家画像搜索词
+    const pillar0 = (meta.action_payload && typeof meta.action_payload === 'object')
+      ? meta.action_payload
+      : null;
+    const pillar0Json = pillar0 ? JSON.stringify(pillar0) : '';
+
     const child = spawn(
       'node',
       ['zhimao_v8_ultimate_master.js', countryIso, category],
@@ -81,6 +88,8 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
           DISCOVERY_PARENT_JOB_ID: meta.parent_job_id ? String(meta.parent_job_id) : '',
           DISCOVERY_ACTION_TYPE: meta.action_type ? String(meta.action_type) : 'new_search',
           DISCOVERY_REWEIGHT_JSON: JSON.stringify(Array.isArray(reweightPolicies) ? reweightPolicies : []),
+          // Pillar 0：产业链扩展结果，含 buyer_personas / expanded_keywords / boolean_queries
+          PILLAR0_PAYLOAD: pillar0Json,
         },
       },
     );
@@ -92,7 +101,7 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
 async function pickPendingJob() {
   const { data, error } = await supabase
     .from('discovery_jobs')
-    .select('id,category,country_iso,requested_by,session_id,parent_job_id,action_type')
+    .select('id,category,country_iso,requested_by,session_id,parent_job_id,action_type,action_payload')
     .eq('status', 'pending')
     .order('created_at', { ascending: true })
     .limit(1)

@@ -73,6 +73,31 @@ async function run() {
     const countryName = COUNTRY_NAMES[cc] || isoUpper;
     const tld         = `site:.${cc} OR site:.com.${cc}`;
 
+    // ── Pillar 0：读取产业链扩展结果（由 zhimao interpret→expand-query 生成） ──
+    let pillar0Keywords = [];
+    let pillar0Personas = [];
+    let pillar0BooleanQueries = [];
+    try {
+        const raw = process.env.PILLAR0_PAYLOAD;
+        if (raw && raw.trim().startsWith('{')) {
+            const p0 = JSON.parse(raw);
+            if (Array.isArray(p0.expanded_keywords) && p0.expanded_keywords.length > 0) {
+                pillar0Keywords = p0.expanded_keywords.slice(0, 20); // 最多 20 个扩展词
+            }
+            if (Array.isArray(p0.buyer_personas) && p0.buyer_personas.length > 0) {
+                pillar0Personas = p0.buyer_personas.map(p => p.industry_en).filter(Boolean).slice(0, 8);
+            }
+            if (Array.isArray(p0.boolean_queries) && p0.boolean_queries.length > 0) {
+                pillar0BooleanQueries = p0.boolean_queries.slice(0, 3);
+            }
+            if (pillar0Keywords.length > 0 || pillar0Personas.length > 0) {
+                console.log(`[step0] Pillar 0 payload loaded: ${pillar0Keywords.length} keywords, ${pillar0Personas.length} personas`);
+            }
+        }
+    } catch (e) {
+        console.warn('[step0] PILLAR0_PAYLOAD parse failed, continuing without expansion:', e.message);
+    }
+
     let baseQuery = '';
 
     if (targetLang !== 'English') {
@@ -155,8 +180,35 @@ Return ONLY valid JSON with this exact structure:
         baseQuery = `"${category}" ("importer" OR "wholesaler" OR "distributor" OR "buyer" OR "procurement" OR "sourcing")`;
     }
 
-    fs.writeFileSync(outputFile, JSON.stringify({ baseQuery, tld, countryName, countryCode: isoUpper, category }, null, 2));
-    console.log(`[step0] Orchestration written ??${outputFile}`);
+    // ── Pillar 0 注入：将产业链扩展词追加到搜索策略 ──────────────────────────
+    // 例：搜"电池"时扩展为"drone manufacturer OR e-bike assembler OR energy storage brand"
+    // 这让 V8 矩阵能直接找到下游真实买家，而不是搜原始品类词
+    if (pillar0Personas.length > 0 || pillar0Keywords.length > 0) {
+        // 优先用买家画像（industry_en）构建精准意图查询
+        const intentTerms = [
+            ...pillar0Personas.slice(0, 5).map(p => `"${p}"`),
+            ...pillar0Keywords.slice(0, 8).map(k => `"${k}"`),
+        ];
+        if (intentTerms.length > 0) {
+            const intentClause = intentTerms.join(' OR ');
+            // 组合成：(原始品类 OR 扩展下游买家词) AND 采购意图词
+            baseQuery = `(${intentClause}) AND ("importer" OR "buyer" OR "procurement" OR "sourcing" OR "supplier")`;
+            console.log(`[step0] Pillar 0 enhanced query: ${baseQuery.slice(0, 120)}...`);
+        }
+    }
+
+    // 写出 step0 结果（含 Pillar 0 扩展词，供 step1+ 使用）
+    fs.writeFileSync(outputFile, JSON.stringify({
+        baseQuery,
+        tld,
+        countryName,
+        countryCode: isoUpper,
+        category,
+        // 传递 Pillar 0 原始数据给后续步骤备用
+        pillar0Keywords: pillar0Keywords.length > 0 ? pillar0Keywords : undefined,
+        pillar0BooleanQueries: pillar0BooleanQueries.length > 0 ? pillar0BooleanQueries : undefined,
+    }, null, 2));
+    console.log(`[step0] Orchestration written → ${outputFile}`);
 }
 
 run().catch(e => { console.error(e); process.exit(1); });
