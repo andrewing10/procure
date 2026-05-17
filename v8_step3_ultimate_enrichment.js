@@ -3,6 +3,7 @@ const fs      = require('fs');
 const { chromium } = require('playwright');
 const cheerio = require('cheerio');
 const { pMap, callGeminiJson } = require('./v8_lib_concurrency');
+const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 const SKIP_L3_INFERENCE = process.env.SKIP_L3_INFERENCE === 'true';
@@ -149,7 +150,7 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                       )
                     : [],
                 intent_summary:         r.intent_summary || '',
-                purchase_cycle:         r.purchase_cycle || 'quarterly',
+                purchase_cycle:         normalizePurchaseCycle(r.purchase_cycle) || 'quarterly',
                 reason_codes:           Array.isArray(r.reason_codes) ? r.reason_codes : ['BOM_INFERENCE'],
                 model_version:          'v8-gemini-l3-v1',
                 demand_source:          'inferred',

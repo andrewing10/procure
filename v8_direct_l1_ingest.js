@@ -11,6 +11,7 @@
 
 const { upsertJobLeadMapping } = require('./v8_zhimao_contract');
 const { inferProcurementSignalCount } = require('./v8_quality_gate');
+const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
 
 const CHUNK_L1 = Math.min(Math.max(Number(process.env.DIRECT_L1_CHUNK || 80), 10), 200);
 
@@ -159,7 +160,7 @@ function buildL1Row(lead, nowIso) {
     semantic_intent: Array.isArray(lead.inferred_bom) && lead.inferred_bom.length ? lead.inferred_bom : null,
     inference_breakdown: ib || null,
     intent_summary: ib && ib.intent_summary ? String(ib.intent_summary).slice(0, 4000) : null,
-    purchase_cycle: ib && ib.purchase_cycle ? String(ib.purchase_cycle).slice(0, 64) : null,
+    purchase_cycle: normalizePurchaseCycle(ib && ib.purchase_cycle),
     event_timestamp: lead.source_timestamp ? String(lead.source_timestamp) : nowIso,
     quality_grade: qualityGrade,
     // ── C1 新增字段 ────────────────────────────────────────────────────────
