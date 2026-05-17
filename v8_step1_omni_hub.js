@@ -5,6 +5,8 @@ const https = require('https');
 // ── 垃圾域名判断统一从 v8_quality_gate 引入，与 zhimao 主系统保持单源同步 ────
 // 不再在此文件维护独立黑名单，避免两处列表漂移浪费 Serper 配额
 const { isJunkDomain } = require('./v8_quality_gate');
+const { readMatrixFromEnv, resolveCitiesForRun, isPlatformEnabled } = require('./v8_constants_geo');
+const { extractSocialUrlsFromText } = require('./v8_lib_social_extract');
 
 function isJunkLead(lead) {
   if (!lead || !lead.link) return false;
@@ -171,11 +173,15 @@ async function fetchPlacesWithFallback(query, gl) {
       address:     p.formatted_address || p.vicinity || '',
       rating:      p.rating,
       business_status: p.business_status,
+      // 买家抓取矩阵（Batch 3）：新增 maps_url / place_id 直透到 lead，
+      // Step5 → buildL1Row 据此写 data_intel_l1_companies.maps_url / place_id 列
+      place_id:    p.place_id || null,
+      maps_url:    p.place_id ? `https://www.google.com/maps/place/?q=place_id:${p.place_id}` : null,
       _source: 'google_places_native',
     }));
   }
-  // Serper 兜底
-  return fetchPlaces(query, gl);
+  // Serper 兜底（无 place_id；maps_url 留空给前端按需生成）
+  return fetchPlaces(query, gl).then(arr => arr.map((p) => ({ ...p, place_id: p.place_id || null, maps_url: p.maps_url || null })));
 }
 
 function searchOrganic(query, gl, num = 20, page = SEARCH_PAGE) {
@@ -217,6 +223,16 @@ async function run() {
   const controls = loadReweightControls();
   console.log('[step1] reweight controls:', JSON.stringify(controls));
 
+  // ── 买家抓取矩阵（Batch 3）：解析 PILLAR0_PAYLOAD.matrix ──────────────────
+  // matrix.cities       → maps 类 pillar 多城市循环（空=按国家级 query 兼容老路径）
+  // matrix.platforms    → 6 平台 pillar 启停白名单（空=全开）
+  // matrix.deepAllCities→ true 时 cities 空 + 国家有主要城市表 → 自动展开 5 城
+  const matrix = readMatrixFromEnv();
+  const mapsCities = resolveCitiesForRun(cc, matrix);
+  if (matrix) {
+    console.log(`[step1] matrix: cities=[${(matrix.cities || []).join('|')}] effective=[${mapsCities.join('|')}] platforms=[${(matrix.platforms || []).join('|')}] deepAll=${matrix.deepAllCities}`);
+  }
+
   // ── Pillar 定义（每个 Pillar 都是一个 Promise，全部同时启动） ──────────────
   //
   // 核心选题原则（采购数据专家视角）：
@@ -225,43 +241,131 @@ async function run() {
 
   const pillarPromises = {
 
-    // ── P0: 种子库激活（高质量已验证买家） ──────────────────────────────────
-    p0_seed: Promise.resolve().then(() => {
+    // ── P0: 种子库激活（高质量已验证买家 + DB pending seeds） ─────────────────
+    // 1) 本地 zhimao_seed_intelligence.json：经营级别一致性的离线种子
+    // 2) Supabase discovery_seeds：业务员主动喂入的 FB 小组 / 公司主页 URL（Batch 4）
+    //    pending 种子按 (country_iso, category) 匹配后转为 lead；procure 在 Step5 后由
+    //    finalize 路径将 status 标记为 consumed（避免 Step1 内重复跑 query 而 mark 过早）。
+    p0_seed: (async () => {
+      const out = [];
       try {
-        if (!fs.existsSync('zhimao_seed_intelligence.json')) return [];
-        const seeds = JSON.parse(fs.readFileSync('zhimao_seed_intelligence.json', 'utf8'));
-        return seeds
-          .filter(s =>
-            s.country?.toLowerCase() === cc.toLowerCase() &&
-            s.category?.toLowerCase().includes(category.toLowerCase())
-          )
-          .map(s => ({ title: s.company_name, link: s.domain, snippet: 'Seed DB Verified Buyer', pillar: 'Pillar 0 Seed' }));
-      } catch { return []; }
-    }),
+        if (fs.existsSync('zhimao_seed_intelligence.json')) {
+          const seeds = JSON.parse(fs.readFileSync('zhimao_seed_intelligence.json', 'utf8'));
+          for (const s of seeds) {
+            if (s.country?.toLowerCase() === cc.toLowerCase() &&
+                s.category?.toLowerCase().includes(category.toLowerCase())) {
+              out.push({ title: s.company_name, link: s.domain, snippet: 'Seed DB Verified Buyer', pillar: 'Pillar 0 Seed' });
+            }
+          }
+        }
+      } catch (_) { /* local seed missing is fine */ }
+
+      // 仅当 worker 已注入 SUPABASE 凭证时拉取 DB pending 种子
+      const supaUrl = process.env.SUPABASE_URL || '';
+      const supaKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+      if (supaUrl && supaKey) {
+        try {
+          const { createClient } = require('@supabase/supabase-js');
+          const supa = createClient(supaUrl, supaKey, { auth: { persistSession: false } });
+          let q = supa.from('discovery_seeds').select('id,url,seed_type,country_iso,category').eq('status', 'pending');
+          if (cc) q = q.or(`country_iso.is.null,country_iso.eq.${cc.toUpperCase()}`);
+          const { data: pending, error } = await q.limit(50);
+          if (!error && Array.isArray(pending)) {
+            const catLower = category.toLowerCase();
+            for (const s of pending) {
+              const sc = String(s.category || '').toLowerCase();
+              if (sc && !sc.includes(catLower)) continue; // 与本任务品类不相关则跳过（保留 pending）
+              out.push({
+                title: s.url,
+                link: s.url,
+                snippet: `User-supplied seed (${s.seed_type})`,
+                pillar: 'Pillar 0 Seed',
+                intent_signal: 'USER_SEED',
+                _seed_id: s.id,
+              });
+            }
+            // 标记 consumed：worker 再次启动同条件任务时不会重复入队
+            const consumeIds = pending
+              .filter((s) => {
+                const sc = String(s.category || '').toLowerCase();
+                return !sc || sc.includes(category.toLowerCase());
+              })
+              .map((s) => s.id);
+            if (consumeIds.length > 0) {
+              await supa.from('discovery_seeds')
+                .update({ status: 'consumed', consumed_at: new Date().toISOString(), job_id: process.env.DISCOVERY_JOB_ID || null })
+                .in('id', consumeIds);
+              console.log(`[step1] p0_seed: consumed ${consumeIds.length} discovery_seeds rows for ${cc}/${category}`);
+            }
+          }
+        } catch (e) {
+          console.warn('[step1] p0_seed: supabase fetch failed (non-fatal):', e?.message || e);
+        }
+      }
+      return out;
+    })(),
 
     // ── P1: Google Maps/Places（最可靠买家信号：业务类型注册为进口商/批发商） ─
     // 返回真实公司网站，命中率最高。
     // 深分页策略：Places 不支持 page 参数，改用 query 轮换（SEARCH_PAGE 奇偶 / 不同身份词）
     // 避免每次 cron 重复拉取相同 20 条结果。
-    p1_maps_dist: (() => {
-      // sweep 偶数：换成 "supplier procurement" 等买家特征词，避免每轮相同 20 条
-      const q = SEARCH_PAGE % 2 === 0
-        ? `${category} procurement manager OR buyer OR purchasing ${countryName}`
-        : `${category} wholesaler OR distributor OR importer in ${countryName}`;
-      return fetchPlacesWithFallback(q, cc).then(ps => ps
-        .filter(p => p.website || p.phoneNumber)
-        .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'MAP_VERIFIED_BUYER', _gmaps_source: p._source || 'serper_places' }))
-      );
+    // 买家抓取矩阵（Batch 3）：mapsCities 非空时多城市循环并合并去重（按 place_id）。
+    p1_maps_dist: (async () => {
+      const buildQ = (city) => {
+        const id = SEARCH_PAGE % 2 === 0
+          ? 'procurement manager OR buyer OR purchasing'
+          : 'wholesaler OR distributor OR importer';
+        return city ? `${category} ${id} "${city}" ${countryName}` : `${category} ${id} ${countryName}`;
+      };
+      const queries = mapsCities.length > 0
+        ? mapsCities.map((city) => ({ city, q: buildQ(city) }))
+        : [{ city: null, q: buildQ(null) }];
+      const arrs = await Promise.all(queries.map(({ city, q }) =>
+        fetchPlacesWithFallback(q, cc).then((ps) => ps.map((p) => ({ ...p, _city: city })))
+      ));
+      const seen = new Set();
+      return arrs.flat()
+        .filter((p) => p.website || p.phoneNumber)
+        .filter((p) => {
+          const k = (p.place_id || p.website || `${p.title}|${p.address}`).toLowerCase();
+          if (seen.has(k)) return false;
+          seen.add(k); return true;
+        })
+        .map((p) => ({
+          title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber,
+          pillar: 'Pillar 1 LBS', intent_signal: 'MAP_VERIFIED_BUYER',
+          _gmaps_source: p._source || 'serper_places',
+          _city: p._city || null, maps_url: p.maps_url || null, place_id: p.place_id || null,
+        }));
     })(),
 
-    p1_maps_trading: (() => {
-      const q = SEARCH_PAGE % 2 === 0
-        ? `${category} import export agent OR sourcing company ${countryName}`
-        : `${category} trading company OR import export in ${countryName}`;
-      return fetchPlacesWithFallback(q, cc).then(ps => ps
-        .filter(p => p.website || p.phoneNumber)
-        .map(p => ({ title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber, pillar: 'Pillar 1 LBS', intent_signal: 'TRADING_COMPANY', _gmaps_source: p._source || 'serper_places' }))
-      );
+    p1_maps_trading: (async () => {
+      const buildQ = (city) => {
+        const id = SEARCH_PAGE % 2 === 0
+          ? 'import export agent OR sourcing company'
+          : 'trading company OR import export';
+        return city ? `${category} ${id} "${city}" ${countryName}` : `${category} ${id} in ${countryName}`;
+      };
+      const queries = mapsCities.length > 0
+        ? mapsCities.map((city) => ({ city, q: buildQ(city) }))
+        : [{ city: null, q: buildQ(null) }];
+      const arrs = await Promise.all(queries.map(({ city, q }) =>
+        fetchPlacesWithFallback(q, cc).then((ps) => ps.map((p) => ({ ...p, _city: city })))
+      ));
+      const seen = new Set();
+      return arrs.flat()
+        .filter((p) => p.website || p.phoneNumber)
+        .filter((p) => {
+          const k = (p.place_id || p.website || `${p.title}|${p.address}`).toLowerCase();
+          if (seen.has(k)) return false;
+          seen.add(k); return true;
+        })
+        .map((p) => ({
+          title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber,
+          pillar: 'Pillar 1 LBS', intent_signal: 'TRADING_COMPANY',
+          _gmaps_source: p._source || 'serper_places',
+          _city: p._city || null, maps_url: p.maps_url || null, place_id: p.place_id || null,
+        }));
     })(),
 
     // ── P2: 公司官网直接搜索（在目标国TLD下找自述为进口商/批发商的公司） ─────
@@ -400,6 +504,54 @@ async function run() {
       source_url:    o.link,         // 保留原始 URL 供溯源，但不作为公司 domain
     }))),
 
+    // ── 买家抓取矩阵 P_Y / P_FB / P_YT / P_X（Batch 3 新增） ─────────────────
+    // 4 个平台 pillar 通过 site: 限定走公开 snippet，绝不登录态抓取；
+    // matrix.platforms 为空时全开，含枚举值时仅启用对应平台。
+    p_yellowpages: (async () => {
+      const cityClause = mapsCities.length > 0 ? ` ("${mapsCities.slice(0, 3).join('" OR "')}")` : '';
+      const q = `(site:yellowpages.com OR site:yelp.com OR site:europages.com OR site:kompass.com) "${category}" ${countryName}${cityClause}`;
+      const r = await searchOrganic(q, cc, 20);
+      return r.map((o) => ({
+        title: o.title, link: o.link, snippet: o.snippet,
+        pillar: 'Pillar Yellow', intent_signal: 'YP_LISTING',
+      }));
+    })(),
+
+    p_facebook_public: (async () => {
+      const cityClause = mapsCities.length > 0 ? ` ("${mapsCities.slice(0, 3).join('" OR "')}")` : '';
+      const q = `site:facebook.com "${category}" (buyer OR distributor OR importer OR wholesale) ${countryName}${cityClause}`;
+      const r = await searchOrganic(q, cc, 20);
+      return r.map((o) => ({
+        title: o.title, link: null, snippet: o.snippet,
+        pillar: 'Pillar FB Public', intent_signal: 'FB_PUBLIC_PROFILE',
+        source_url: o.link,
+        // 公开主页 URL 直接挂到 lead.social_profile_urls，Step5 写入 L1 列
+        social_profile_urls: extractSocialUrlsFromText(o.link, o.snippet),
+      }));
+    })(),
+
+    p_youtube_about: (async () => {
+      const q = `site:youtube.com (inurl:about OR inurl:c OR inurl:@) "${category}" (company OR brand OR official) ${countryName}`;
+      const r = await searchOrganic(q, cc, 20);
+      return r.map((o) => ({
+        title: o.title, link: null, snippet: o.snippet,
+        pillar: 'Pillar YT About', intent_signal: 'YT_ABOUT',
+        source_url: o.link,
+        social_profile_urls: extractSocialUrlsFromText(o.link, o.snippet),
+      }));
+    })(),
+
+    p_x_public: (async () => {
+      const q = `(site:x.com OR site:twitter.com) "${category}" (buyer OR import OR procurement) ${countryName}`;
+      const r = await searchOrganic(q, cc, 20);
+      return r.map((o) => ({
+        title: o.title, link: null, snippet: o.snippet,
+        pillar: 'Pillar X Public', intent_signal: 'X_PUBLIC',
+        source_url: o.link,
+        social_profile_urls: extractSocialUrlsFromText(o.link, o.snippet),
+      }));
+    })(),
+
     // ── P9: Lookalike 裂变（种子反哺闭环核心）────────────────────────────────
     // 设计逻辑：
     //   Pillar0 把种子激活为 lead → Step5 把高置信 lead 写回 seed JSON
@@ -440,6 +592,20 @@ async function run() {
   if (controls.disableLookalike) {
     delete pillarPromises.p9_lookalike;
     console.log('[step1] Lookalike pillar DISABLED by reweight policy (generic delta=' + controls.generic.toFixed(3) + ')');
+  }
+
+  // 买家抓取矩阵：6 平台白名单启停（matrix.platforms 为空 → 全开）
+  if (matrix && Array.isArray(matrix.platforms) && matrix.platforms.length > 0) {
+    if (!isPlatformEnabled(matrix, 'maps')) {
+      delete pillarPromises.p1_maps_dist;
+      delete pillarPromises.p1_maps_trading;
+    }
+    if (!isPlatformEnabled(matrix, 'yellowpages'))      delete pillarPromises.p_yellowpages;
+    if (!isPlatformEnabled(matrix, 'facebook_public'))  delete pillarPromises.p_facebook_public;
+    if (!isPlatformEnabled(matrix, 'linkedin_snippet')) delete pillarPromises.p11_linkedin_decision;
+    if (!isPlatformEnabled(matrix, 'youtube_about'))    delete pillarPromises.p_youtube_about;
+    if (!isPlatformEnabled(matrix, 'x_public'))         delete pillarPromises.p_x_public;
+    console.log(`[step1] matrix.platforms whitelist applied: kept=${Object.keys(pillarPromises).filter(k => /^(p1_maps|p_|p11_)/.test(k)).join('|')}`);
   }
 
   // ── 全并行执行（等最慢的那一路） ──────────────────────────────────────────

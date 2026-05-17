@@ -125,6 +125,25 @@ function mapEntityRoleToBizType(entityRole) {
  * @param {object} lead — v8 流水线 lead（与 mapToBulkL1Item 同源字段）
  * @param {string} nowIso
  */
+/**
+ * 买家抓取矩阵（Batch 3）：根据 lead.pillar / lead._gmaps_source 推导 discovered_via 标签。
+ * 与 zhimao apps/web/lib/discovery/matrixDefaults KNOWN_PLATFORMS 标签集对齐。
+ */
+function inferDiscoveredVia(lead) {
+  const pillar = String(lead.pillar || '');
+  if (lead._gmaps_source) return 'maps';
+  if (/Pillar 1 LBS|Maps/i.test(pillar)) return 'maps';
+  if (/Pillar Yellow/i.test(pillar)) return 'yellowpages';
+  if (/Pillar FB Public/i.test(pillar)) return 'facebook_public';
+  if (/Pillar 11 LinkedIn/i.test(pillar)) return 'linkedin_snippet';
+  if (/Pillar YT About/i.test(pillar)) return 'youtube_about';
+  if (/Pillar X Public/i.test(pillar)) return 'x_public';
+  if (/Pillar 0 Seed/i.test(pillar)) return 'seed';
+  if (/Pillar 9 Lookalike/i.test(pillar)) return 'lookalike';
+  if (pillar) return 'organic_search';
+  return null;
+}
+
 function buildL1Row(lead, nowIso) {
   const name = String(lead.company_name || '').trim();
   const name_canonical = normalizeNameCanonical(name);
@@ -141,6 +160,14 @@ function buildL1Row(lead, nowIso) {
   const row = {
     name_canonical,
     country,
+    // 买家抓取矩阵 Batch 3：city / maps_url / place_id / social_profile_urls / discovered_via
+    city: (lead._city && String(lead._city).slice(0, 120)) || (ib && ib.city ? String(ib.city).slice(0, 120) : null) || null,
+    maps_url: lead.maps_url ? String(lead.maps_url).slice(0, 500) : null,
+    place_id: lead.place_id ? String(lead.place_id).slice(0, 200) : null,
+    social_profile_urls: Array.isArray(lead.social_profile_urls)
+      ? lead.social_profile_urls.filter((u) => typeof u === 'string' && u.length <= 500).slice(0, 8)
+      : [],
+    discovered_via: inferDiscoveredVia(lead),
     domain: extractDomain(lead.domain) || null,
     primary_email: lead.primary_email || null,
     primary_phone: lead.primary_phone || null,

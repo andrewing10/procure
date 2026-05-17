@@ -4,6 +4,7 @@ const { chromium } = require('playwright');
 const cheerio = require('cheerio');
 const { pMap, callGeminiJson } = require('./v8_lib_concurrency');
 const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
+const { extractSocialUrls } = require('./v8_lib_social_extract');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 const SKIP_L3_INFERENCE = process.env.SKIP_L3_INFERENCE === 'true';
@@ -219,8 +220,9 @@ function normalizeWhatsApp(raw) {
     return digits.startsWith('+') ? digits : `+${digits}`;
 }
 
-// ─── HTML 字段提取（邮箱、电话、WhatsApp 专项提取）────────────────────────
-const extractFromHTML = (html, emails, phones) => {
+// ─── HTML 字段提取（邮箱、电话、WhatsApp、公开社媒主页 URL 一并抽取）─────
+// 买家抓取矩阵 Batch 3：socials 为 Set<string>，每次合并；不传时仅抽 email/phone（向后兼容）
+const extractFromHTML = (html, emails, phones, socials) => {
     const $ = cheerio.load(html);
 
     $('a[href^="mailto:"]').each((_, el) => {
@@ -252,6 +254,13 @@ const extractFromHTML = (html, emails, phones) => {
     while ((m = emailRegex.exec(bodyText)) !== null) {
         const em = m[1].toLowerCase();
         if (!em.endsWith('.png') && !em.endsWith('.jpg') && !em.endsWith('.jpeg')) emails.add(em);
+    }
+
+    if (socials instanceof Set) {
+        try {
+            const urls = extractSocialUrls($, html);
+            for (const u of urls) socials.add(u);
+        } catch (_) { /* social extraction is opportunistic */ }
     }
 };
 
@@ -346,8 +355,9 @@ async function extractContactForLead(lead, contexts) {
     if (lead.domain && lead.domain.startsWith('http')) {
         const isFb = lead.domain.includes('facebook.com');
         const ctx  = isFb ? contexts.mobile : contexts.desktop;
-        const emails = new Set();
-        const phones = new Set();
+        const emails  = new Set();
+        const phones  = new Set();
+        const socials = new Set(Array.isArray(lead.social_profile_urls) ? lead.social_profile_urls : []);
         let page;
         try {
             page = await ctx.newPage();
@@ -355,10 +365,10 @@ async function extractContactForLead(lead, contexts) {
                 let fbUrl = lead.domain.replace('www.facebook.com', 'mbasic.facebook.com');
                 if (!fbUrl.includes('/groups/') && !fbUrl.includes('/share/') && !fbUrl.includes('/about')) fbUrl = fbUrl.replace(/\/$/, '') + '/about';
                 await page.goto(fbUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
-                extractFromHTML(await page.content(), emails, phones);
+                extractFromHTML(await page.content(), emails, phones, socials);
             } else {
                 await page.goto(lead.domain, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
-                extractFromHTML(await page.content(), emails, phones);
+                extractFromHTML(await page.content(), emails, phones, socials);
                 try {
                     const contactHref = await page.evaluate(() => {
                         const anchors = Array.from(document.querySelectorAll('a[href]'));
@@ -369,7 +379,7 @@ async function extractContactForLead(lead, contexts) {
                     if (contactHref) {
                         const contactUrl = contactHref.startsWith('http') ? contactHref : new URL(contactHref, lead.domain).href;
                         await page.goto(contactUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
-                        extractFromHTML(await page.content(), emails, phones);
+                        extractFromHTML(await page.content(), emails, phones, socials);
                     }
                 } catch (_) { /* contact page unreachable — ignore */ }
             }
@@ -382,6 +392,8 @@ async function extractContactForLead(lead, contexts) {
         if (emails.size > 0) lead.primary_email = Array.from(emails)[0];
         const cleanPhones = Array.from(phones).filter(p => p.length < 20);
         if (cleanPhones.length > 0) lead.primary_phone = cleanPhones[0];
+        // 买家抓取矩阵：累加从官网/FB about 抽到的公开社媒主页（≤ 8 条）
+        if (socials.size > 0) lead.social_profile_urls = [...socials].slice(0, 8);
 
         // 写入缓存（无论是否找到联系方式，避免下次重复爬取）
         setCachedContact(lead.domain, lead.primary_email, lead.primary_phone);
