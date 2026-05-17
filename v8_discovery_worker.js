@@ -345,6 +345,11 @@ async function main() {
         console.log(`[worker] job ${job.id} sweep=${sweepCount}: no new data (graceful stop).`);
       }
 
+      // 补报中间 stage：流水线（step1-5）以黑盒子进程运行，这里在 markDone 前
+      // 补上 parsing / scoring，让 UI 进度条不出现 fetching→persisting 长空白。
+      await recordStage(supabase, job.id, 'parsing',  { phase: 'step1_step3_complete' });
+      await recordStage(supabase, job.id, 'scoring',  { phase: 'step4_step5_complete', sweep: sweepCount });
+
       // 更新 sweep_count 方便下轮深分页
       await supabase
         .from('discovery_jobs')

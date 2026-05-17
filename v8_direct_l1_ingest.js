@@ -10,6 +10,7 @@
  */
 
 const { upsertJobLeadMapping } = require('./v8_zhimao_contract');
+const { inferProcurementSignalCount } = require('./v8_quality_gate');
 
 const CHUNK_L1 = Math.min(Math.max(Number(process.env.DIRECT_L1_CHUNK || 80), 10), 200);
 
@@ -95,6 +96,30 @@ function canonicalKey(nameCanonical, country) {
   return `${nameCanonical}\u0000${country}`;
 }
 
+/** 将 V8 entity_role → zhimao biz_type（C1 对齐，允许 importer/wholesaler/retailer/distributor/manufacturer/service/unknown） */
+function mapEntityRoleToBizType(entityRole) {
+    const role = String(entityRole || '').trim().toLowerCase();
+    if (!role) return null;
+    const map = {
+        importer: 'importer',
+        'import company': 'importer',
+        'trading company': 'wholesaler',
+        trader: 'wholesaler',
+        wholesaler: 'wholesaler',
+        wholesale: 'wholesaler',
+        retailer: 'retailer',
+        retail: 'retailer',
+        distributor: 'distributor',
+        distribution: 'distributor',
+        manufacturer: 'manufacturer',
+        factory: 'manufacturer',
+        'service provider': 'service',
+        service: 'service',
+        buyer: 'importer',
+    };
+    return map[role] || 'unknown';
+}
+
 /**
  * @param {object} lead — v8 流水线 lead（与 mapToBulkL1Item 同源字段）
  * @param {string} nowIso
@@ -111,7 +136,7 @@ function buildL1Row(lead, nowIso) {
   const ib = lead.inference_breakdown && typeof lead.inference_breakdown === 'object' ? lead.inference_breakdown : null;
   const qualityGrade = lead._quality_grade || 'qualified';
 
-  /** 与当前线上 data_intel_l1_companies 列一致（无单独 name / company_name 列）。 */
+    /** 与当前线上 data_intel_l1_companies 列一致（无单独 name / company_name 列）。 */
   const row = {
     name_canonical,
     country,
@@ -137,6 +162,37 @@ function buildL1Row(lead, nowIso) {
     purchase_cycle: ib && ib.purchase_cycle ? String(ib.purchase_cycle).slice(0, 64) : null,
     event_timestamp: lead.source_timestamp ? String(lead.source_timestamp) : nowIso,
     quality_grade: qualityGrade,
+    // ── C1 新增字段 ────────────────────────────────────────────────────────
+    biz_type: mapEntityRoleToBizType(
+      (ib && ib.entity_role) || lead.entity_role || null,
+    ),
+    procurement_score: (() => {
+      const sigCount = inferProcurementSignalCount(lead);
+      // 基础评分：信号数 × 20，上限 100
+      // BOL/CUSTOMS = 高权重；tax_verified = 中权重
+      let score = sigCount * 20;
+      if (lead.tax_verified) score = Math.max(score, 40);
+      const boostScore = Number(lead.verified_source_boost || 0);
+      score = Math.min(100, score + boostScore);
+      return Math.max(0, score);
+    })(),
+    procurement_signals: (() => {
+      const sigs = [];
+      const sigType = String(lead.intent_signal || '').toUpperCase();
+      if (sigType === 'BOL_SIGNAL' || sigType === 'CUSTOMS_SIGNAL' || sigType === 'IMPORT_RECORD') {
+        sigs.push({ type: 'customs_import', source: 'v8_pipeline', confidence: 0.85, date: nowIso });
+      }
+      if (sigType === 'PROCUREMENT_DECISION_MAKER') {
+        sigs.push({ type: 'social', source: 'v8_pipeline', confidence: 0.7, date: nowIso });
+      }
+      if (lead.tax_verified) {
+        sigs.push({ type: 'customs_import', source: 'v8_tax_verifier', confidence: 0.9, date: nowIso });
+      }
+      if (lead.verified_source_id) {
+        sigs.push({ type: 'website_change', source: 'v8_verified_source', confidence: 0.75, date: nowIso });
+      }
+      return sigs.length ? sigs : null;
+    })(),
   };
 
   Object.keys(row).forEach((k) => {

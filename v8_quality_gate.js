@@ -4,16 +4,16 @@
  * 与 zhimao/apps/web/lib/data-intel/quality.ts 完全镜像的质量计算模块。
  *
  * 规则双方必须保持一致：
- *   - V8 Step5 用此模块决定哪些线索上传给 zhimao Bulk API
- *   - zhimao Bulk API (route.ts) 调用 computeQualityGrade 决定写入 quality_grade
+ *   - V8 Step5 用此模块决定哪些线索写入 data_intel_l1_companies（直写模式）
  *   - zhimao 搜索层 (.neq quality_grade unqualified) 决定哪些可以展示
  *
  * 三档质量：
- *   premium     — 高置信 L3 + 真实联系方式
+ *   premium     — 高置信 L3 + 真实联系方式（或采购信号 >= 2）
  *   qualified   — 有真实联系方式，来源为 LLM 推断
- *   unqualified — 无联系方式 / 垃圾源头 / 乱码名称 → 不上传，不消耗配额
+ *   unqualified — 无联系方式 / 垃圾源头 / 乱码名称 / 业态黑名单 → 不写入，不消耗配额
  *
  * ⚠️ 每次修改 zhimao/quality.ts 时必须同步更新此文件！
+ * C3 同步：bizDescription、procurementSignalCount、BIZ_ANTI_PATTERNS、entityType、countryMatchLevel
  */
 
 // ── 垃圾域名黑名单（与 zhimao JUNK_DOMAIN_HOSTS 完全一致） ──────────────────
@@ -292,8 +292,34 @@ function isJunkName(name) {
     return false;
 }
 
+// ── 业态黑名单（C3 同步：解决餐厅/医院/政府机关误进 L1 问题） ────────────────
+const BIZ_ANTI_PATTERNS = [
+    /\b(mcdonald|kfc|starbucks|subway|burger.king|pizza.hut|domino|wendy|taco.bell)\b/i,
+    /\b(restaurant|cafe|coffee\s+shop|fast[_\s]food|food.chain|bistro|bakery|eatery|diner)\b/i,
+    /\b(hotel|motel|hostel|inn\b|resort|lodge|accommodation)\b/i,
+    /\b(hospital|clinic|dental|medical.center|pharmacy|dispensary|healthcare.provider)\b/i,
+    /\b(primary.school|secondary.school|university|college|academy\b|kindergarten|tuition)\b/i,
+    /\b(bank\b|insurance\s+company|financial\s+service|accounting\s+firm|law\s+firm)\b/i,
+    /\b(government|municipality|ministry|prefecture|public\s+sector|city.council|town.hall)\b/i,
+    /\b(charity|ngo\b|nonprofit|non-profit|foundation\b)\b/i,
+    /\b(salon|barbershop|spa\b|beauty.center|nail.studio|massage.parlor|gym\b|fitness.center)\b/i,
+];
+
 /**
- * 计算质量档（与 zhimao computeQualityGrade 完全对齐）
+ * 判断公司名/描述是否属于"非采购买家"业态（与 zhimao isBizTypeBlacklisted C3 完全对齐）
+ * @param {string|null|undefined} nameOrDesc
+ * @returns {boolean}
+ */
+function isBizTypeBlacklisted(nameOrDesc) {
+    if (!nameOrDesc || !nameOrDesc.trim()) return false;
+    for (const re of BIZ_ANTI_PATTERNS) {
+        if (re.test(nameOrDesc)) return true;
+    }
+    return false;
+}
+
+/**
+ * 计算质量档（与 zhimao computeQualityGrade 完全对齐，含 C3 升级）
  *
  * @param {{
  *   nameCanonical: string|null|undefined,
@@ -302,12 +328,32 @@ function isJunkName(name) {
  *   primaryPhone: string|null|undefined,
  *   confidenceTier: string|null|undefined,
  *   hasProcurementItems: boolean|undefined,
+ *   entityType: string|null|undefined,
+ *   countryMatchLevel: string|null|undefined,
+ *   bizDescription: string|null|undefined,
+ *   procurementSignalCount: number,
  * }} params
  * @returns {'premium'|'qualified'|'unqualified'}
  */
-function computeQualityGrade({ nameCanonical, domain, primaryEmail, primaryPhone, confidenceTier, hasProcurementItems }) {
+function computeQualityGrade({
+    nameCanonical,
+    domain,
+    primaryEmail,
+    primaryPhone,
+    confidenceTier,
+    hasProcurementItems,
+    entityType,
+    countryMatchLevel,
+    bizDescription,
+    procurementSignalCount = 0,
+}) {
     // 第一关：公司名质量
     if (isJunkName(nameCanonical)) return 'unqualified';
+    if (entityType && entityType !== 'company') return 'unqualified';
+    if (countryMatchLevel === 'low') return 'unqualified';
+
+    // C3 第一关补充：业态黑名单（餐厅/医院/政府等不可能是采购买家）
+    if (isBizTypeBlacklisted(bizDescription != null ? bizDescription : nameCanonical)) return 'unqualified';
 
     // 第二关：联系方式是否真实可用
     const domainIsJunk = isJunkDomain(domain);
@@ -316,13 +362,17 @@ function computeQualityGrade({ nameCanonical, domain, primaryEmail, primaryPhone
     const hasPhone = Boolean(primaryPhone && primaryPhone.trim() && primaryPhone.replace(/\D/g, '').length >= 6);
     const hasContact = hasRealDomain || hasEmail || hasPhone;
 
-    if (!hasContact) return 'unqualified';
+    // C3：有采购信号时放宽联系方式要求（信号证明了商业存在）
+    if (!hasContact && procurementSignalCount <= 0) return 'unqualified';
 
     // 第三关：L3 推断置信度（有时不存在，跳过）
     if (confidenceTier !== undefined && confidenceTier !== null) {
         if (confidenceTier.toLowerCase() === 'low') return 'unqualified';
         if (hasProcurementItems === false) return 'unqualified';
     }
+
+    // C3 Premium 升级：有采购信号直接 premium（进口证据/招聘信号 = 确定性买家）
+    if (procurementSignalCount >= 2 && (hasRealDomain || hasEmail)) return 'premium';
 
     // Premium：高置信 L3 + 真实域名或验证邮箱
     if (confidenceTier && confidenceTier.toLowerCase() === 'high' && (hasRealDomain || hasEmail)) return 'premium';
@@ -355,17 +405,45 @@ function isClosedBusiness(text) {
  * @param {object} lead - V8 enriched lead
  * @returns {{ qualified: boolean, grade: string, reason?: string }}
  */
+/**
+ * 从 V8 lead 推断采购信号数量（与 zhimao C3 procurementSignalCount 语义对齐）：
+ *   BOL_SIGNAL / CUSTOMS_SIGNAL / PROCUREMENT_DECISION_MAKER / IMPORT_RECORD：各计 1
+ *   tax_verified：+1
+ *   verified_source_id（已验证来源）：+1
+ * @param {object} lead
+ * @returns {number}
+ */
+function inferProcurementSignalCount(lead) {
+    let count = 0;
+    const sig = String(lead.intent_signal || '').toUpperCase();
+    if (sig === 'BOL_SIGNAL' || sig === 'CUSTOMS_SIGNAL' || sig === 'IMPORT_RECORD') count += 1;
+    if (sig === 'PROCUREMENT_DECISION_MAKER') count += 1;
+    if (lead.tax_verified) count += 1;
+    if (lead.verified_source_id) count += 1;
+    // 来自 inference_breakdown 的 reason_codes
+    const ib = lead.inference_breakdown;
+    if (ib && Array.isArray(ib.reason_codes)) {
+        const codes = ib.reason_codes.map(c => String(c).toUpperCase());
+        if (codes.some(c => c.includes('IMPORT') || c.includes('BOL') || c.includes('CUSTOMS'))) count += 1;
+    }
+    return Math.min(count, 5);
+}
+
 function evaluateLead(lead) {
     if (!lead || !lead.company_name) return { qualified: false, grade: 'unqualified', reason: 'no_company_name' };
 
+    const snippetText = [
+        lead.snippet,
+        lead.profile_payload_json?.snippet,
+        lead.intent_summary,
+        lead.intent_summary_zh,
+    ].filter(Boolean).join(' ');
+
     const entityType = inferEntityType({
         domain: lead.domain,
-        snippet: [lead.snippet, lead.intent_summary, lead.intent_summary_zh].filter(Boolean).join(' '),
+        snippet: snippetText,
         companyName: lead.company_name,
     });
-    if (entityType !== 'company') {
-        return { qualified: false, grade: 'unqualified', reason: `entity_type_${entityType}` };
-    }
 
     // 拦截新闻媒体来源
     if (isJunkDomain(lead.domain) && lead.domain) {
@@ -373,12 +451,6 @@ function evaluateLead(lead) {
     }
 
     // 拦截已结业商家（检查 snippet / summary）
-    const snippetText = [
-        lead.snippet,
-        lead.profile_payload_json?.snippet,
-        lead.intent_summary,
-        lead.intent_summary_zh,
-    ].filter(Boolean).join(' ');
     if (isClosedBusiness(snippetText)) {
         return { qualified: false, grade: 'unqualified', reason: 'closed_business' };
     }
@@ -389,24 +461,35 @@ function evaluateLead(lead) {
         domain: lead.domain,
         phone: lead.primary_phone,
     });
-    if (countryMatch === 'low') {
-        return { qualified: false, grade: 'unqualified', reason: 'country_mismatch' };
-    }
 
     const ib = (lead.inference_breakdown && typeof lead.inference_breakdown === 'object')
         ? lead.inference_breakdown
         : null;
 
+    const procurementSignalCount = inferProcurementSignalCount(lead);
+
     const grade = computeQualityGrade({
-        nameCanonical:        lead.company_name,
-        domain:               lead.domain          || null,
-        primaryEmail:         lead.primary_email   || null,
-        primaryPhone:         lead.primary_phone   || null,
-        confidenceTier:       ib ? (ib.confidence_tier || null) : undefined,
-        hasProcurementItems:  ib ? (Array.isArray(ib.procurement_items) && ib.procurement_items.length >= 1) : undefined,
+        nameCanonical:           lead.company_name,
+        domain:                  lead.domain          || null,
+        primaryEmail:            lead.primary_email   || null,
+        primaryPhone:            lead.primary_phone   || null,
+        confidenceTier:          ib ? (ib.confidence_tier || null) : undefined,
+        hasProcurementItems:     ib ? (Array.isArray(ib.procurement_items) && ib.procurement_items.length >= 1) : undefined,
+        entityType:              entityType,
+        countryMatchLevel:       countryMatch,
+        bizDescription:          lead.company_name,
+        procurementSignalCount:  procurementSignalCount,
     });
 
     return { qualified: grade !== 'unqualified', grade };
 }
 
-module.exports = { isJunkDomain, isJunkName, computeQualityGrade, isClosedBusiness, evaluateLead };
+module.exports = {
+    isJunkDomain,
+    isJunkName,
+    isBizTypeBlacklisted,
+    computeQualityGrade,
+    isClosedBusiness,
+    inferProcurementSignalCount,
+    evaluateLead,
+};
