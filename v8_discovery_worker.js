@@ -1,6 +1,12 @@
 require('dotenv').config();
 const { spawn, execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
+const {
+  recordStage,
+  finalizeJob,
+  failJob,
+  isJobCancelled,
+} = require('./v8_zhimao_contract');
 
 // Self-heal: ensure Playwright Chromium binary is present before the first job runs.
 // Render's build and runtime filesystems are separate; the browser cache from buildCommand
@@ -68,6 +74,7 @@ async function readReweightPolicies(job) {
 
 function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, reweightPolicies = []) {
   return new Promise((resolve) => {
+    let cancelled = false;
     // 提取 Pillar 0 产业链扩展结果（由 zhimao interpret → expand-query 生成）
     // 注入 step0 用于替换单一品类词为多样化买家画像搜索词
     const pillar0 = (meta.action_payload && typeof meta.action_payload === 'object')
@@ -93,8 +100,31 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
         },
       },
     );
-    child.on('close', (code) => resolve(code ?? 1));
-    child.on('error', () => resolve(PIPELINE_EXIT.CRASH));
+    const cancelPoll = setInterval(async () => {
+      if (cancelled) return;
+      if (await isJobCancelled(supabase, jobId)) {
+        cancelled = true;
+        console.warn(`[worker] job ${jobId} cancelled — terminating pipeline child`);
+        try {
+          child.kill('SIGTERM');
+        } catch (_) {
+          /* ignore */
+        }
+      }
+    }, 3000);
+
+    child.on('close', (code) => {
+      clearInterval(cancelPoll);
+      if (cancelled) {
+        resolve(PIPELINE_EXIT.CRASH);
+        return;
+      }
+      resolve(code ?? 1);
+    });
+    child.on('error', () => {
+      clearInterval(cancelPoll);
+      resolve(PIPELINE_EXIT.CRASH);
+    });
   });
 }
 
@@ -140,34 +170,30 @@ async function markRunning(jobId) {
   return true;
 }
 
-async function readResultCountFromBulk(jobId) {
-  // Bulk API (Step 5 → /api/data-intel/l1/procurement/bulk) is the single source of
-  // truth for how many rows this job actually wrote into data_intel_l1_companies.
-  // The worker only reads that value — it must not overwrite it with a country-wide count,
-  // otherwise unrelated prior runs leak into this job's reported number.
-  const { data, error } = await supabase
-    .from('discovery_jobs')
-    .select('result_count,status')
-    .eq('id', jobId)
-    .maybeSingle();
+async function readMappingCount(jobId) {
+  const { count, error } = await supabase
+    .from('discovery_job_leads')
+    .select('company_id', { count: 'exact', head: true })
+    .eq('discovery_job_id', jobId)
+    .neq('quality_grade', 'unqualified');
   if (error) {
-    console.error('[worker] read result_count error:', error.message);
+    console.error('[worker] read mapping count error:', error.message);
     return 0;
   }
-  return Number(data?.result_count ?? 0);
+  return Number(count ?? 0);
 }
 
-async function markDone(job, count) {
-  const nowIso = new Date().toISOString();
-  // Only update status/completed_at. result_count was already written by Bulk API
-  // (Step 5) using the exact rows.length actually upserted in this job — that is
-  // the authoritative number and must not be overridden here.
-  const { error: updateErr } = await supabase
-    .from('discovery_jobs')
-    .update({ status: 'done', completed_at: nowIso })
-    .eq('id', job.id);
-  if (updateErr) {
-    console.error('[worker] mark done error:', updateErr.message);
+async function markDone(job) {
+  await recordStage(supabase, job.id, 'persisting', { phase: 'pre_finalize' });
+  const fin = await finalizeJob(supabase, job);
+  if (!fin.ok) {
+    const nowIso = new Date().toISOString();
+    const { error: updateErr } = await supabase
+      .from('discovery_jobs')
+      .update({ status: 'done', completed_at: nowIso })
+      .eq('id', job.id)
+      .in('status', ['pending', 'running', 'claimed', 'fetching', 'parsing', 'scoring', 'persisting']);
+    if (updateErr) console.error('[worker] mark done fallback error:', updateErr.message);
   }
 
   if (job.requested_by) {
@@ -188,17 +214,7 @@ async function markDone(job, count) {
 }
 
 async function markFailed(jobId, msg) {
-  const { error } = await supabase
-    .from('discovery_jobs')
-    .update({
-      status: 'failed',
-      completed_at: new Date().toISOString(),
-      error_message: String(msg || 'pipeline_failed').slice(0, 1000),
-    })
-    .eq('id', jobId);
-  if (error) {
-    console.error('[worker] mark failed error:', error.message);
-  }
+  await failJob(supabase, jobId, msg);
 }
 
 /**
@@ -245,6 +261,9 @@ async function main() {
         continue;
       }
 
+      await recordStage(supabase, job.id, 'claimed');
+      await recordStage(supabase, job.id, 'fetching');
+
       // 读取该 job 的历史 sweep 次数，传入流水线做深分页
       const { data: jobMeta } = await supabase
         .from('discovery_jobs')
@@ -256,6 +275,12 @@ async function main() {
       const reweightPolicies = await readReweightPolicies(job);
       console.log(`[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`);
       const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount, job, reweightPolicies);
+
+      if (await isJobCancelled(supabase, job.id)) {
+        console.log(`[worker] job ${job.id} cancelled — skip finalize`);
+        await sleep(1000);
+        continue;
+      }
 
       if (exitCode === PIPELINE_EXIT.CRASH) {
         await markFailed(job.id, 'pipeline_exit_non_zero');
@@ -274,9 +299,9 @@ async function main() {
         .update({ sweep_count: sweepCount })
         .eq('id', job.id);
 
-      const count = await readResultCountFromBulk(job.id);
-      await markDone(job, count);
-      console.log(`[worker] job done ${job.id}, count=${count}, sweep=${sweepCount}`);
+      await markDone(job);
+      const count = await readMappingCount(job.id);
+      console.log(`[worker] job done ${job.id}, mapping_count=${count}, sweep=${sweepCount}`);
     } catch (e) {
       console.error('[worker] loop error:', e instanceof Error ? e.message : e);
     }

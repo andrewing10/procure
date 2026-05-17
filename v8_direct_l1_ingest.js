@@ -9,6 +9,8 @@
  * 表列名需与线上 data_intel_l1_companies / data_intel_graph_edges 一致；若迁移有差异，请改 buildL1Row。
  */
 
+const { upsertJobLeadMapping } = require('./v8_zhimao_contract');
+
 const CHUNK_L1 = Math.min(Math.max(Number(process.env.DIRECT_L1_CHUNK || 80), 10), 200);
 
 function normalizeNameCanonical(name) {
@@ -62,6 +64,7 @@ function buildL1Row(lead, nowIso) {
   const name_canonical = normalizeNameCanonical(name);
   const country = normalizeCountry(lead.country);
   const ib = lead.inference_breakdown && typeof lead.inference_breakdown === 'object' ? lead.inference_breakdown : null;
+  const qualityGrade = lead._quality_grade || 'qualified';
 
   /** 与当前线上 data_intel_l1_companies 列一致（无单独 name / company_name 列）。 */
   const row = {
@@ -88,6 +91,7 @@ function buildL1Row(lead, nowIso) {
     intent_summary: ib && ib.intent_summary ? String(ib.intent_summary).slice(0, 4000) : null,
     purchase_cycle: ib && ib.purchase_cycle ? String(ib.purchase_cycle).slice(0, 64) : null,
     event_timestamp: lead.source_timestamp ? String(lead.source_timestamp) : nowIso,
+    quality_grade: qualityGrade,
   };
 
   Object.keys(row).forEach((k) => {
@@ -199,19 +203,26 @@ async function directIngestQualifiedLeads(supabase, leads, opts = {}) {
       idByKey.set(k, companyId);
       resolvedLeads += 1;
 
+      if (discoveryJobId) {
+        const mapRes = await upsertJobLeadMapping(
+          supabase,
+          discoveryJobId,
+          companyId,
+          lead._quality_grade || 'qualified',
+        );
+        if (!mapRes.ok) {
+          errors.push(`discovery_job_leads: ${mapRes.error?.message || 'upsert_failed'}`);
+        }
+      }
+
       const edgeBatch = collectEdgeRows(lead, companyId);
       if (edgeBatch.length === 0) continue;
       edgesWritten += await insertEdgesWithFallback(supabase, edgeBatch, errors);
     }
   }
 
-  if (discoveryJobId) {
-    const { error: jobErr } = await supabase
-      .from('discovery_jobs')
-      .update({ result_count: resolvedLeads })
-      .eq('id', discoveryJobId);
-    if (jobErr) errors.push(`discovery_jobs.result_count: ${jobErr.message}`);
-  }
+  // result_count / status=done 由 worker 调 discovery_job_finalize 统一收尾（按 mapping 真实行数统计）。
+  // 此处仅保留 resolvedLeads 供 step5 日志；不再直写 jobs.result_count，避免与 finalize 双写打架。
 
   const fatalUpsert = errors.some((e) => String(e).startsWith('L1 upsert:'));
   const noneResolved = leads.length > 0 && resolvedLeads === 0;
