@@ -25,6 +25,46 @@ function normalizeCountry(country) {
   return c;
 }
 
+// ── 国家推断（与 zhimao quality.ts inferActualCountryFromSignals 对齐） ────────
+const _CCTLD_TO_ISO = {
+  us: 'US', cn: 'CN', sg: 'SG', my: 'MY', th: 'TH', vn: 'VN', id: 'ID', ph: 'PH',
+  jp: 'JP', kr: 'KR', uk: 'GB', gb: 'GB', de: 'DE', fr: 'FR', it: 'IT', es: 'ES',
+  ca: 'CA', au: 'AU', ch: 'CH', br: 'BR', in: 'IN', tr: 'TR', ae: 'AE', sa: 'SA',
+};
+const _CALLING_CODE_TO_ISO = {
+  '1': 'US', '86': 'CN', '65': 'SG', '60': 'MY', '66': 'TH', '84': 'VN', '62': 'ID',
+  '63': 'PH', '81': 'JP', '82': 'KR', '44': 'GB', '49': 'DE', '33': 'FR', '39': 'IT',
+  '34': 'ES', '61': 'AU', '41': 'CH', '55': 'BR', '91': 'IN', '90': 'TR', '971': 'AE', '966': 'SA',
+};
+
+/**
+ * 从域名 ccTLD / 电话国际区号推断公司实际所在国；
+ * 与 zhimao quality.ts inferActualCountryFromSignals 逻辑一致，解决 country 字段分叉问题。
+ * @param {{ searchCountry?: string, domain?: string|null, phone?: string|null }} params
+ * @returns {string|null} 两位 ISO 或 null
+ */
+function inferActualCountryFromSignals({ searchCountry, domain, phone }) {
+  // 1. 先尝试域名 ccTLD
+  if (domain) {
+    try {
+      const host = new URL(domain.startsWith('http') ? domain : `https://${domain}`).hostname.toLowerCase();
+      const suffix = host.split('.').pop();
+      const fromTld = suffix ? _CCTLD_TO_ISO[suffix] : null;
+      if (fromTld) return fromTld;
+    } catch { /* ignore */ }
+  }
+  // 2. 再尝试电话区号
+  if (phone) {
+    const m = String(phone).trim().match(/^\+(\d{1,3})/);
+    if (m) {
+      const fromPhone = _CALLING_CODE_TO_ISO[m[1]];
+      if (fromPhone) return fromPhone;
+    }
+  }
+  // 3. 回落到搜索目标国
+  return searchCountry ? normalizeCountry(searchCountry) : null;
+}
+
 function extractDomain(input) {
   if (!input) return null;
   const s = String(input).trim();
@@ -62,7 +102,12 @@ function canonicalKey(nameCanonical, country) {
 function buildL1Row(lead, nowIso) {
   const name = String(lead.company_name || '').trim();
   const name_canonical = normalizeNameCanonical(name);
-  const country = normalizeCountry(lead.country);
+  // 使用 inferActualCountryFromSignals（与 zhimao bulk 路径对齐），解决 country 字段分叉问题
+  const country = inferActualCountryFromSignals({
+    searchCountry: lead.country,
+    domain: lead.domain || null,
+    phone: lead.primary_phone || null,
+  }) || normalizeCountry(lead.country);
   const ib = lead.inference_breakdown && typeof lead.inference_breakdown === 'object' ? lead.inference_breakdown : null;
   const qualityGrade = lead._quality_grade || 'qualified';
 
@@ -76,8 +121,8 @@ function buildL1Row(lead, nowIso) {
     address_line: lead.snippet ? String(lead.snippet).slice(0, 500) : null,
     place_type: lead.entity_role || null,
     snippet: lead.snippet ? String(lead.snippet).slice(0, 2000) : null,
-    source: 'bulk',
-    source_tags: ['bulk_import'],
+    source: 'v8_pipeline',
+    source_tags: ['v8_pipeline'],
     landed_at: nowIso,
     updated_at: nowIso,
     l1_updated_at: nowIso,

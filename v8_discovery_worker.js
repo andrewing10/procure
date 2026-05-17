@@ -40,7 +40,12 @@ function sleep(ms) {
 //   0 → 全量写入成功
 //   1 → 脚本崩溃 / 配置错误 → markFailed
 //   2 → 本轮无新数据（graceful stop）→ markDone 但标记 result_count 来自 bulk 侧
-const PIPELINE_EXIT = { SUCCESS: 0, CRASH: 1, NO_DATA: 2 };
+const PIPELINE_EXIT = {
+  SUCCESS: 0,
+  CRASH: 1,
+  NO_DATA: 2,
+  CANCELLED: 3, // 子进程被 cancel SIGTERM 终止，语义上不是"失败"
+};
 
 async function readReweightPolicies(job) {
   const country = String(job.country_iso || '').trim().toUpperCase();
@@ -116,7 +121,8 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
     child.on('close', (code) => {
       clearInterval(cancelPoll);
       if (cancelled) {
-        resolve(PIPELINE_EXIT.CRASH);
+        // 被 cancel 信号终止，使用专属退出码，不污染"失败"统计
+        resolve(PIPELINE_EXIT.CANCELLED);
         return;
       }
       resolve(code ?? 1);
@@ -276,7 +282,8 @@ async function main() {
       console.log(`[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`);
       const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount, job, reweightPolicies);
 
-      if (await isJobCancelled(supabase, job.id)) {
+      // CANCELLED 退出码 或 DB 仍显示 cancelled → 均跳过 finalize，不计为失败
+      if (exitCode === PIPELINE_EXIT.CANCELLED || await isJobCancelled(supabase, job.id)) {
         console.log(`[worker] job ${job.id} cancelled — skip finalize`);
         await sleep(1000);
         continue;

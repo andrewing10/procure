@@ -161,13 +161,27 @@ const CALLING_CODE_TO_ISO = {
     '34': 'ES', '61': 'AU', '41': 'CH', '55': 'BR', '91': 'IN', '90': 'TR', '971': 'AE', '966': 'SA',
 };
 
+// CJK + 地址关键字拦截（与 zhimao quality.ts 对齐）：V8 pipeline 可能把实际地址写入 domain 字段
+const CJK_RANGE_RE = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/;
+const ADDR_KEYWORD_RE = /[号街路道楼室层区市省镇村]/u;
+
 /**
- * 域名是否为垃圾来源（与 zhimao isJunkDomain 完全对齐）
+ * 域名是否为垃圾来源（与 zhimao quality.ts isJunkDomain 完全对齐）
+ * 额外规则（相较旧版本补齐）：
+ *   1. 含 CJK 字符 → 地址被误写入 domain 字段
+ *   2. 含中文地址关键字（号/街/路/楼/室...）
+ *   3. 超长 punycode 标签（xn-- 前缀且 >30 字符 = 被编码的中文地址）
+ *   4. 无 TLD（不含点 = 不是域名）
  * @param {string|null|undefined} raw
  * @returns {boolean}
  */
 function isJunkDomain(raw) {
     if (!raw || !raw.trim()) return false;
+    // 快速拒绝：原始字符串含 CJK 字符（中文地址直接写入了 domain 字段）
+    if (CJK_RANGE_RE.test(raw)) return true;
+    // 快速拒绝：含常见中文地址关键字
+    if (ADDR_KEYWORD_RE.test(raw)) return true;
+
     const domain = raw
         .trim()
         .toLowerCase()
@@ -176,6 +190,13 @@ function isJunkDomain(raw) {
         .replace(/:\d+$/, '');
     if (JUNK_DOMAIN_HOSTS.has(domain)) return true;
     if (JUNK_DOMAIN_PATTERNS.some(p => p.test(domain))) return true;
+
+    // 拒绝超长 punycode 标签（xn-- 且 >30 字符 = 被编码的非 ASCII 地址，如山东省青岛市...）
+    const labels = domain.split('.');
+    if (labels.some(l => l.startsWith('xn--') && l.length > 30)) return true;
+    // 拒绝没有 TLD 的单标签字符串（不含点 = 不是域名）
+    if (!domain.includes('.')) return true;
+
     return false;
 }
 
