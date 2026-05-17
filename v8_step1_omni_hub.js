@@ -5,8 +5,15 @@ const https = require('https');
 // ── 垃圾域名判断统一从 v8_quality_gate 引入，与 zhimao 主系统保持单源同步 ────
 // 不再在此文件维护独立黑名单，避免两处列表漂移浪费 Serper 配额
 const { isJunkDomain } = require('./v8_quality_gate');
-const { readMatrixFromEnv, resolveCitiesForRun, isPlatformEnabled } = require('./v8_constants_geo');
+const {
+  readMatrixFromEnv,
+  resolveCitiesForRun,
+  isPlatformEnabled,
+  readIndustryHintFromEnv,
+  getIndustryAnchor,
+} = require('./v8_constants_geo');
 const { extractSocialUrlsFromText } = require('./v8_lib_social_extract');
+const { getIndustryHint, DEFAULT_PLACE_BLACKLIST } = require('./v8_icp_taxonomy');
 
 function isJunkLead(lead) {
   if (!lead || !lead.link) return false;
@@ -162,11 +169,30 @@ async function fetchGooglePlacesNative(query, gl) {
   return enriched;
 }
 
+/**
+ * Batch A.4：根据 industry_hint.place_type_blacklist 把 Google Places 的 types 过滤掉。
+ * Native API 才有 types 字段；Serper /places 没有 → 走 Native 时才生效。
+ */
+function filterByPlaceTypeBlacklist(placesRaw, blacklist) {
+  if (!Array.isArray(placesRaw) || placesRaw.length === 0) return placesRaw;
+  if (!Array.isArray(blacklist) || blacklist.length === 0) return placesRaw;
+  const blk = new Set(blacklist.map((s) => String(s || '').toLowerCase()));
+  return placesRaw.filter((p) => {
+    const types = Array.isArray(p.types) ? p.types : [];
+    if (types.length === 0) return true; // 无 types 时不过滤（避免误杀 Serper 兜底）
+    for (const t of types) {
+      if (blk.has(String(t || '').toLowerCase())) return false;
+    }
+    return true;
+  });
+}
+
 // P1 Pillar 专用：先走 Google Places 原生，失败回 Serper /places
-async function fetchPlacesWithFallback(query, gl) {
+async function fetchPlacesWithFallback(query, gl, placeTypeBlacklist) {
   const native = await fetchGooglePlacesNative(query, gl).catch(() => null);
   if (native && native.length > 0) {
-    return native.map(p => ({
+    const filtered = filterByPlaceTypeBlacklist(native, placeTypeBlacklist || []);
+    return filtered.map(p => ({
       title:       p.name || '',
       website:     p.website || '',
       phoneNumber: p.formatted_phone_number || '',
@@ -232,6 +258,56 @@ async function run() {
   if (matrix) {
     console.log(`[step1] matrix: cities=[${(matrix.cities || []).join('|')}] effective=[${mapsCities.join('|')}] platforms=[${(matrix.platforms || []).join('|')}] deepAll=${matrix.deepAllCities}`);
   }
+
+  // ── Batch A.4：ICP 业态 hint（zhimao submit 注入；缺失则从 category 兜底）─
+  // 用于：Google Places types 黑名单过滤 + 写到 lead.industry_hint 透传到 step2 prompt
+  let industryHint = readIndustryHintFromEnv();
+  if (!industryHint) {
+    try { industryHint = getIndustryHint(category); }
+    catch (_) { industryHint = null; }
+  }
+  const placeTypeBlacklist = (industryHint && industryHint.place_type_blacklist)
+    ? industryHint.place_type_blacklist
+    : DEFAULT_PLACE_BLACKLIST;
+  if (industryHint) {
+    console.log(
+      `[step1] industry_hint: category_key=${industryHint.category_key} ` +
+      `industry_key=${industryHint.industry_key || '-'} ` +
+      `blacklist=[${placeTypeBlacklist.slice(0, 4).join(',')}…] hit=${industryHint.hit}`,
+    );
+  }
+
+  // ── Batch D.1：业态 anchor 词（map_retrieval_segments 派生）──────────────────
+  // 命中字典（industry_key/category_key/segment_id）时，step1 的 P1/P3/P11/P_*
+  // pillar 把"trading company / procurement manager"这种泛词替换为业态精准 anchor，
+  // 显著提升 industry_match=high 比例（验收金标线：基线 ~30% → ≥70%）。
+  // 不命中时 anchor=null，pillar 退化为旧泛词路径，保持向后兼容。
+  // 查询顺序：industry_key → category_key → 原始品类（容忍用户传中文）
+  let industryAnchor = null;
+  try {
+    const tries = [];
+    if (industryHint) {
+      if (industryHint.industry_key) tries.push(industryHint.industry_key);
+      if (industryHint.category_key && industryHint.category_key !== 'other') tries.push(industryHint.category_key);
+    }
+    tries.push(category);
+    for (const k of tries) {
+      const a = getIndustryAnchor(k);
+      if (a) { industryAnchor = a; break; }
+    }
+  } catch (_) {
+    industryAnchor = null;
+  }
+  if (industryAnchor) {
+    console.log(
+      `[step1] industry_anchor segment=${industryAnchor.segment_id} ` +
+      `en=[${industryAnchor.en.slice(0, 3).join(',')}…] zh=[${industryAnchor.zh.slice(0, 3).join(',')}…]`,
+    );
+  }
+  // 取主 anchor（首选 EN，作为 P1 maps / P3 jobs / P11 LinkedIn 的核心 query 词）
+  const anchorPrimary = industryAnchor && industryAnchor.en[0] ? industryAnchor.en[0] : '';
+  const anchorAlt     = industryAnchor && industryAnchor.en[1] ? industryAnchor.en[1] : '';
+  const anchorAll     = industryAnchor ? [...industryAnchor.en, ...industryAnchor.zh].slice(0, 6) : [];
 
   // ── Pillar 定义（每个 Pillar 都是一个 Promise，全部同时启动） ──────────────
   //
@@ -312,16 +388,20 @@ async function run() {
     // 买家抓取矩阵（Batch 3）：mapsCities 非空时多城市循环并合并去重（按 place_id）。
     p1_maps_dist: (async () => {
       const buildQ = (city) => {
-        const id = SEARCH_PAGE % 2 === 0
-          ? 'procurement manager OR buyer OR purchasing'
-          : 'wholesaler OR distributor OR importer';
-        return city ? `${category} ${id} "${city}" ${countryName}` : `${category} ${id} ${countryName}`;
+        // Batch D.1：命中 anchor 时把"procurement manager OR buyer"换成业态精准 anchor，
+        // 例：anchor='wholesale cosmetics' → 直接用，避免泛词把金融/咨询拉回结果集。
+        const anchorTerm = anchorPrimary
+          ? (SEARCH_PAGE % 2 === 0 ? anchorPrimary : (anchorAlt || anchorPrimary))
+          : (SEARCH_PAGE % 2 === 0
+              ? 'procurement manager OR buyer OR purchasing'
+              : 'wholesaler OR distributor OR importer');
+        return city ? `${category} ${anchorTerm} "${city}" ${countryName}` : `${category} ${anchorTerm} ${countryName}`;
       };
       const queries = mapsCities.length > 0
         ? mapsCities.map((city) => ({ city, q: buildQ(city) }))
         : [{ city: null, q: buildQ(null) }];
       const arrs = await Promise.all(queries.map(({ city, q }) =>
-        fetchPlacesWithFallback(q, cc).then((ps) => ps.map((p) => ({ ...p, _city: city })))
+        fetchPlacesWithFallback(q, cc, placeTypeBlacklist).then((ps) => ps.map((p) => ({ ...p, _city: city })))
       ));
       const seen = new Set();
       return arrs.flat()
@@ -341,16 +421,20 @@ async function run() {
 
     p1_maps_trading: (async () => {
       const buildQ = (city) => {
-        const id = SEARCH_PAGE % 2 === 0
-          ? 'import export agent OR sourcing company'
-          : 'trading company OR import export';
-        return city ? `${category} ${id} "${city}" ${countryName}` : `${category} ${id} in ${countryName}`;
+        // Batch D.1：anchor 命中时把"trading company OR import export"换成业态词；
+        // 同行抓取"印尼大蒜"案例的核心病灶就是这段把所有印尼商号拉回来。
+        const anchorTerm = anchorPrimary
+          ? `(${anchorPrimary}${anchorAlt ? ` OR ${anchorAlt}` : ''})`
+          : (SEARCH_PAGE % 2 === 0
+              ? 'import export agent OR sourcing company'
+              : 'trading company OR import export');
+        return city ? `${category} ${anchorTerm} "${city}" ${countryName}` : `${category} ${anchorTerm} in ${countryName}`;
       };
       const queries = mapsCities.length > 0
         ? mapsCities.map((city) => ({ city, q: buildQ(city) }))
         : [{ city: null, q: buildQ(null) }];
       const arrs = await Promise.all(queries.map(({ city, q }) =>
-        fetchPlacesWithFallback(q, cc).then((ps) => ps.map((p) => ({ ...p, _city: city })))
+        fetchPlacesWithFallback(q, cc, placeTypeBlacklist).then((ps) => ps.map((p) => ({ ...p, _city: city })))
       ));
       const seen = new Set();
       return arrs.flat()
@@ -385,12 +469,17 @@ async function run() {
     // 会被 isJunkLead 全部过滤掉（100% Serper 配额浪费）。
     // 改为：搜索目标国公司的采购招聘页面，这类页面在公司官网上，URL 有效。
     p3_jobs_procurement: searchOrganic(
-      `"${category}" ("procurement manager" OR "import manager" OR "sourcing manager" OR "purchasing manager") job ${tld}`,
+      // Batch D.1：把 anchor 词加进 query，避免"procurement manager"拉到金融/IT 招聘
+      anchorPrimary
+        ? `"${anchorPrimary}" "procurement manager" OR "category manager" OR "buyer" job ${tld}`
+        : `"${category}" ("procurement manager" OR "import manager" OR "sourcing manager" OR "purchasing manager") job ${tld}`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 3 Jobs', 'PROCUREMENT_HIRING')),
 
     p3_jobs_buyer: searchOrganic(
-      `"${category}" ("buyer" OR "import buyer" OR "commercial buyer") job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`,
+      anchorPrimary
+        ? `"${anchorPrimary}" buyer job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`
+        : `"${category}" ("buyer" OR "import buyer" OR "commercial buyer") job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 3 Jobs', 'BUYER_HIRING')),
 
@@ -493,7 +582,11 @@ async function run() {
     // 由 Step2 LLM 的 extractCompanyFromSnippet 负责从 snippet 里抽公司名。
     // 最终 lead.domain 不是 linkedin.com，而是 Step2 推断出的空域名（待 Step3 补全）。
     p11_linkedin_decision: searchOrganic(
-      `site:linkedin.com/in "${category}" ("Procurement Director" OR "Category Manager" OR "Sourcing Manager" OR "Import Manager" OR "Head of Purchasing") ${countryName}`,
+      // Batch D.1：LinkedIn 决策人查询用 anchor 替代品类原文，让 LinkedIn 的语义匹配
+      // 落到具体行业（"wholesale cosmetics" 比 "护肝片" 更易命中决策人 profile）
+      anchorPrimary
+        ? `site:linkedin.com/in "${anchorPrimary}" ("Procurement Director" OR "Category Manager" OR "Sourcing Manager" OR "Head of Purchasing") ${countryName}`
+        : `site:linkedin.com/in "${category}" ("Procurement Director" OR "Category Manager" OR "Sourcing Manager" OR "Import Manager" OR "Head of Purchasing") ${countryName}`,
       cc, 20
     ).then(r => r.map(o => ({
       title:         o.title,
@@ -509,7 +602,9 @@ async function run() {
     // matrix.platforms 为空时全开，含枚举值时仅启用对应平台。
     p_yellowpages: (async () => {
       const cityClause = mapsCities.length > 0 ? ` ("${mapsCities.slice(0, 3).join('" OR "')}")` : '';
-      const q = `(site:yellowpages.com OR site:yelp.com OR site:europages.com OR site:kompass.com) "${category}" ${countryName}${cityClause}`;
+      // Batch D.1：anchor 命中时把品类原文换成业态短语，避免黄页站把无关行业拉进来
+      const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
+      const q = `(site:yellowpages.com OR site:yelp.com OR site:europages.com OR site:kompass.com) ${subject} ${countryName}${cityClause}`;
       const r = await searchOrganic(q, cc, 20);
       return r.map((o) => ({
         title: o.title, link: o.link, snippet: o.snippet,
@@ -519,7 +614,8 @@ async function run() {
 
     p_facebook_public: (async () => {
       const cityClause = mapsCities.length > 0 ? ` ("${mapsCities.slice(0, 3).join('" OR "')}")` : '';
-      const q = `site:facebook.com "${category}" (buyer OR distributor OR importer OR wholesale) ${countryName}${cityClause}`;
+      const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
+      const q = `site:facebook.com ${subject} (buyer OR distributor OR importer OR wholesale) ${countryName}${cityClause}`;
       const r = await searchOrganic(q, cc, 20);
       return r.map((o) => ({
         title: o.title, link: null, snippet: o.snippet,
@@ -531,7 +627,8 @@ async function run() {
     })(),
 
     p_youtube_about: (async () => {
-      const q = `site:youtube.com (inurl:about OR inurl:c OR inurl:@) "${category}" (company OR brand OR official) ${countryName}`;
+      const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
+      const q = `site:youtube.com (inurl:about OR inurl:c OR inurl:@) ${subject} (company OR brand OR official) ${countryName}`;
       const r = await searchOrganic(q, cc, 20);
       return r.map((o) => ({
         title: o.title, link: null, snippet: o.snippet,
@@ -542,7 +639,8 @@ async function run() {
     })(),
 
     p_x_public: (async () => {
-      const q = `(site:x.com OR site:twitter.com) "${category}" (buyer OR import OR procurement) ${countryName}`;
+      const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
+      const q = `(site:x.com OR site:twitter.com) ${subject} (buyer OR import OR procurement) ${countryName}`;
       const r = await searchOrganic(q, cc, 20);
       return r.map((o) => ({
         title: o.title, link: null, snippet: o.snippet,

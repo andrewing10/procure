@@ -121,24 +121,43 @@ function applySourceBoost(lead) {
 
 const totalLeads = leads.length;
 const gradeStats = { premium: 0, qualified: 0, unqualified: 0 };
+// Batch A.4：ICP 闸门 balanced 阈值
+//   none  → 直接 unqualified
+//   low   → 直接 unqualified
+//   medium→ 保留 grade，但加 needs_human_review=true 软标记
+//   high  → 保持 grade
+//   null/undefined（未跑业态判定，向后兼容）→ 仅按 evaluateLead 决策
+const ICP_THRESHOLD = String(process.env.ICP_MATCH_THRESHOLD || 'balanced').toLowerCase();
+const icpStats = { high: 0, medium: 0, low: 0, none: 0, unset: 0 };
+
 const validLeads = leads
   .map(applySourceBoost)
   .filter((lead) => {
     if (!String(lead.country || '').trim()) return false;
     const { qualified, grade } = evaluateLead(lead);
+    const matchRaw = String(lead.industry_match || '').toLowerCase();
+    const m = ['high', 'medium', 'low', 'none'].includes(matchRaw) ? matchRaw : 'unset';
+    icpStats[m] += 1;
+    if (ICP_THRESHOLD !== 'off' && (m === 'low' || m === 'none')) {
+      // 强制降级：覆盖 evaluateLead，写入 unqualified，不入 L1
+      lead._quality_grade = 'unqualified';
+      gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
+      return false;
+    }
     gradeStats[grade] = (gradeStats[grade] || 0) + 1;
     lead._quality_grade = grade;
+    if (m === 'medium') lead.needs_human_review = true;
     return qualified;
   });
 
 const droppedQuality = totalLeads - validLeads.length;
 if (droppedQuality > 0) {
   console.log(
-    `[step5] quality-gate veto: dropped ${droppedQuality}/${totalLeads} (unqualified). grade distribution: premium=${gradeStats.premium} qualified=${gradeStats.qualified} unqualified=${gradeStats.unqualified}`,
+    `[step5] quality-gate veto: dropped ${droppedQuality}/${totalLeads}. grade=premium:${gradeStats.premium} qualified:${gradeStats.qualified} unqualified:${gradeStats.unqualified}; icp=high:${icpStats.high} medium:${icpStats.medium} low:${icpStats.low} none:${icpStats.none} unset:${icpStats.unset} (threshold=${ICP_THRESHOLD})`,
   );
 } else {
   console.log(
-    `[step5] quality-gate pass: ${validLeads.length}/${totalLeads}. premium=${gradeStats.premium} qualified=${gradeStats.qualified}`,
+    `[step5] quality-gate pass: ${validLeads.length}/${totalLeads}. premium=${gradeStats.premium} qualified=${gradeStats.qualified}; icp=high:${icpStats.high} medium:${icpStats.medium} unset:${icpStats.unset}`,
   );
 }
 

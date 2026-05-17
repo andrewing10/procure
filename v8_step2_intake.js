@@ -2,6 +2,8 @@ require('./load-env');
 const fs = require('fs');
 const { pMap, callGeminiJson, preFilterRawLeads } = require('./v8_lib_concurrency');
 const { isJunkName } = require('./v8_quality_gate');
+const { readIndustryHintFromEnv } = require('./v8_constants_geo');
+const { getIndustryHint: deriveIndustryHint } = require('./v8_icp_taxonomy');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 
@@ -73,19 +75,34 @@ function inferEntityType({ title, snippet, link }) {
     return 'company';
 }
 
-function buildPrompt(batch, triggerBlock) {
+function buildPrompt(batch, triggerBlock, industryHint) {
+    const icpBlock = industryHint && industryHint.hit
+        ? `\n[ICP GATE]
+- Target category_key="${industryHint.category_key}"${industryHint.industry_key ? `, industry_key="${industryHint.industry_key}"` : ''}.
+- For EACH item ALSO return:
+    "industry_match": "high" | "medium" | "low" | "none"
+      high   = company's primary business is buying/distributing/selling "${industryHint.category_key}"
+      medium = general trading / import-export / hospitality / retail that PLAUSIBLY purchases "${industryHint.category_key}"
+      low    = adjacent industry (logistics / packaging / consultancy / marketing) that occasionally touches it
+      none   = clearly unrelated (finance / law / accounting / insurance / real estate / IT services / unrelated mfg)
+    "industry_evidence": "≤80 chars English single-sentence reason"
+- If "industry_match" is "low" or "none", you may still extract company_name (we keep it for audit), but the worker will mark it as soft-rejected.`
+        : '';
+    const fmt = industryHint && industryHint.hit
+        ? `Format: {"results": [{"company_name": "Exact Name or null", "industry_match": "high|medium|low|none", "industry_evidence": "..."}]}`
+        : `Format: {"results": [{"company_name": "Exact Name or null"}]}`;
     return `Extract exact formal Company Name from each item.
 [CRITICAL RULES]
 1. ANTI-POLLUTION: If the snippet indicates the company is based in China, or is a Chinese exporter/supplier selling abroad, YOU MUST return null.
 2. ANTI-BLOG: If the title/snippet is a listicle, article, review, or guide (e.g. "Top 10 ...", "Best ... for ...", "How to ...", "Guide to ...", "X things you should ...", "Review:", "vs."), YOU MUST return null -- we only want real buyer company entities.
-3. ANTI-PLATFORM: If the result is a known marketplace, directory platform, or aggregator (Alibaba, Amazon, Thomasnet, etc.) rather than an end-buyer company, return null.${triggerBlock}
-Format: {"results": [{"company_name": "Exact Name or null"}]}
+3. ANTI-PLATFORM: If the result is a known marketplace, directory platform, or aggregator (Alibaba, Amazon, Thomasnet, etc.) rather than an end-buyer company, return null.${triggerBlock}${icpBlock}
+${fmt}
 Input: ${JSON.stringify(batch.map(r => ({ t: r.title, s: r.snippet })))}`;
 }
 
-async function processBatch(batch, batchIndex, batchTotal, triggerBlock) {
+async function processBatch(batch, batchIndex, batchTotal, triggerBlock, industryHint) {
     const startedAt = Date.now();
-    const prompt = buildPrompt(batch, triggerBlock);
+    const prompt = buildPrompt(batch, triggerBlock, industryHint);
     let parsed;
     try {
         parsed = await callGeminiJson(prompt, {
@@ -102,6 +119,7 @@ async function processBatch(batch, batchIndex, batchTotal, triggerBlock) {
     const results = Array.isArray(parsed?.results) ? parsed.results : [];
     const accepted = [];
     let junkNameDropped = 0;
+    const VALID_MATCH = new Set(['high', 'medium', 'low', 'none']);
     batch.forEach((r, idx) => {
         const cn = results[idx]?.company_name;
         if (!cn || cn === 'null' || typeof cn !== 'string' || !cn.trim()) return;
@@ -110,6 +128,12 @@ async function processBatch(batch, batchIndex, batchTotal, triggerBlock) {
         if (isJunkName(name)) { junkNameDropped += 1; return; }
         const entityType = inferEntityType({ title: r.title, snippet: r.snippet, link: r.link });
         if (entityType !== 'company') return;
+        const matchRaw = String(results[idx]?.industry_match || '').toLowerCase();
+        const industryMatch = VALID_MATCH.has(matchRaw) ? matchRaw : null;
+        const industryEvidenceRaw = results[idx]?.industry_evidence;
+        const industryEvidence = typeof industryEvidenceRaw === 'string'
+            ? industryEvidenceRaw.trim().slice(0, 200)
+            : '';
         accepted.push({
             company_name: name,
             domain:        normalizeLinkToDomain(r.link),
@@ -118,6 +142,13 @@ async function processBatch(batch, batchIndex, batchTotal, triggerBlock) {
             pillar:        r.pillar,
             intent_signal: r.intent_signal,
             entity_type:   entityType,
+            // Batch A.4：透传给 step5 quality gate 与 ingest L1
+            industry_match: industryMatch,
+            industry_evidence: industryEvidence ? { reason: industryEvidence } : null,
+            place_id: r.place_id || null,
+            maps_url: r.maps_url || null,
+            social_profile_urls: Array.isArray(r.social_profile_urls) ? r.social_profile_urls : null,
+            _city: r._city || null,
         });
     });
     console.log(`[step2] Batch ${batchIndex}/${batchTotal}: ${accepted.length}/${batch.length} accepted, junk_name_dropped=${junkNameDropped} (${Date.now() - startedAt}ms)`);
@@ -149,6 +180,20 @@ async function run() {
         : '';
     if (industryCtx) console.log(`[step2] Industry context injected: ${industryCtx.name}`);
 
+    // Batch A.4：ICP 业态 hint（zhimao submit 注入；缺失则按 raw lead category 兜底）
+    let industryHint = null;
+    try {
+        industryHint = readIndustryHintFromEnv();
+        if (!industryHint) {
+            const sampleCategoryGuess =
+                (filtered.find(r => typeof r.title === 'string')?.title || '').slice(0, 80);
+            industryHint = sampleCategoryGuess ? deriveIndustryHint(sampleCategoryGuess) : null;
+        }
+    } catch (_) { industryHint = null; }
+    if (industryHint && industryHint.hit) {
+        console.log(`[step2] industry_match enforcement: category_key=${industryHint.category_key} industry_key=${industryHint.industry_key || '-'}`);
+    }
+
     // ── Build batches ──
     const batches = [];
     for (let i = 0; i < filtered.length; i += BATCH_SIZE) {
@@ -160,7 +205,7 @@ async function run() {
     const overallStart = Date.now();
     const results = await pMap(
         batches,
-        (batch, idx) => processBatch(batch, idx + 1, batches.length, triggerBlock),
+        (batch, idx) => processBatch(batch, idx + 1, batches.length, triggerBlock, industryHint),
         { concurrency: CONCURRENCY },
     );
 

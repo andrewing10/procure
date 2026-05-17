@@ -1,0 +1,142 @@
+{
+  "$schema": "https://catagent.io/data/map-retrieval-segments-v1.json",
+  "description": "地图检索段：参与地图/检索查询生成的行业维度，段数即「地图检索行业数」；每段关联一 industry_pack_id 用于策略与展示",
+  "version": "v1",
+  "segments": [
+    {
+      "segment_id": "cosmetics_beauty",
+      "name_zh": "美妆个护",
+      "name_en": "Cosmetics & Beauty",
+      "industry_pack_id": "manufacturing_processing",
+      "keywords": ["cosmetics", "beauty", "personal care", "skincare", "wholesale cosmetics", "beauty supplier"],
+      "keywords_zh": ["美妆", "化妆品", "个护", "护肤品", "化妆品批发", "美妆供应商"],
+      "mapTypes": ["store", "beauty_salon", "spa"]
+    },
+    {
+      "segment_id": "medical_devices",
+      "name_zh": "医疗器械",
+      "name_en": "Medical Devices",
+      "industry_pack_id": "manufacturing_processing",
+      "keywords": ["medical device", "medical equipment", "healthcare supplier", "hospital supply", "surgical equipment"],
+      "keywords_zh": ["医疗器械", "医用", "医疗设备", "医院供应商", "手术器械"],
+      "mapTypes": ["hospital", "pharmacy", "doctor"]
+    },
+    {
+      "segment_id": "electronics_components",
+      "name_zh": "电子元器件",
+      "name_en": "Electronics & Components",
+      "industry_pack_id": "wholesale_distribution",
+      "keywords": ["electronics", "electronic components", "wholesale electronics", "semiconductor", "chip supplier"],
+      "keywords_zh": ["电子", "元器件", "电子批发", "半导体", "芯片供应商"],
+      "mapTypes": ["electronics_store", "store"]
+    },
+    {
+      "segment_id": "solar_photovoltaic",
+      "name_zh": "光伏太阳能",
+      "name_en": "Solar & Photovoltaic",
+      "industry_pack_id": "manufacturing_processing",
+      "keywords": ["solar", "photovoltaic", "solar panel", "renewable energy", "solar supplier"],
+      "keywords_zh": ["光伏", "太阳能", "光伏板", "新能源", "太阳能供应商"],
+      "mapTypes": ["store", "electrician"]
+    },
+    {
+      "segment_id": "cold_chain_logistics",
+      "name_zh": "冷链物流",
+      "name_en": "Cold Chain & Logistics",
+      "industry_pack_id": "logistics_coldchain",
+      "keywords": ["cold chain", "refrigerated", "frozen", "cold storage", "logistics", "warehouse"],
+      "keywords_zh": ["冷链", "冷藏", "冷冻", "冷库", "物流", "仓储"],
+      "mapTypes": ["storage", "moving_company"]
+    },
+    {
+      "segment_id": "construction_materials",
+      "name_zh": "建材",
+      "name_en": "Construction Materials",
+      "industry_pack_id": "manufacturing_processing",
+      "keywords": ["building materials", "construction", "cement", "steel", "building supplier"],
+      "keywords_zh": ["建材", "水泥", "钢材", "建筑", "建材供应商"],
+      "mapTypes": ["store", "hardware_store"]
+    },
+    {
+      "segment_id": "chemical_processing",
+      "name_zh": "化工",
+      "name_en": "Chemical Processing",
+      "industry_pack_id": "manufacturing_processing",
+      "keywords": ["chemical", "chemical processing", "raw materials", "chemical supplier"],
+      "keywords_zh": ["化工", "原料", "化学", "化工供应商"],
+      "mapTypes": ["store"]
+    },
+    {
+      "segment_id": "food_processing",
+      "name_zh": "食品加工",
+      "name_en": "Food Processing",
+      "industry_pack_id": "food_beverage",
+      "keywords": ["food processing", "food wholesale", "supplier", "food manufacturing", "central kitchen"],
+      "keywords_zh": ["食品加工", "食品批发", "供应商", "食品制造", "中央厨房"],
+      "mapTypes": ["restaurant", "food", "store"]
+    },
+    {
+      "segment_id": "catering_food_service",
+      "name_zh": "餐饮团餐",
+      "name_en": "Catering & Food Service",
+      "industry_pack_id": "food_beverage",
+      "keywords": ["catering", "food service", "restaurant supply", "restaurant supplier"],
+      "keywords_zh": ["餐饮", "团餐", "采购", "餐饮供应商"],
+      "mapTypes": ["restaurant", "cafe", "meal_takeaway"]
+    },
+    {
+      "segment_id": "wholesale_distribution",
+      "name_zh": "批发经销",
+      "name_en": "Wholesale & Distribution",
+      "industry_pack_id": "wholesale_distribution",
+      "keywords": ["wholesale", "distributor", "wholesale market", "B2B supplier", "trading company"],
+      "keywords_zh": ["批发", "经销", "批发市场", "B2B供应商", "贸易公司"],
+      "mapTypes": ["store", "wholesaler"]
+    },
+    {
+      "segment_id": "logistics_warehousing",
+      "name_zh": "物流仓储",
+      "name_en": "Logistics & Warehousing",
+      "industry_pack_id": "logistics_coldchain",
+      "keywords": ["logistics", "warehouse", "storage", "distribution center", "freight"],
+      "keywords_zh": ["物流", "仓储", "配送中心", "货运"],
+      "mapTypes": ["storage"]
+    },
+    {
+      "segment_id": "agriculture_agri",
+      "name_zh": "农产品农业",
+      "name_en": "Agriculture",
+      "industry_pack_id": "food_beverage",
+      "keywords": ["agriculture", "agricultural", "wholesale", "farm supply", "seed", "feed"],
+      "keywords_zh": ["农产品", "农业", "批发", "种子", "饲料"],
+      "mapTypes": ["store", "supermarket"]
+    },
+    {
+      "segment_id": "hospitality_hotel",
+      "name_zh": "酒店会展",
+      "name_en": "Hospitality & Hotel",
+      "industry_pack_id": "hospitality",
+      "keywords": ["hotel", "lodging", "conference", "exhibition", "resort", "event venue"],
+      "keywords_zh": ["酒店", "宾馆", "会议", "会展", "度假村", "活动场地"],
+      "mapTypes": ["lodging", "hotel"]
+    },
+    {
+      "segment_id": "manufacturing_plant",
+      "name_zh": "加工制造",
+      "name_en": "Manufacturing & Plant",
+      "industry_pack_id": "manufacturing_processing",
+      "keywords": ["factory", "manufacturing", "plant", "processing", "production facility"],
+      "keywords_zh": ["工厂", "制造", "生产", "加工", "生产设施"],
+      "mapTypes": ["manufacturer"]
+    },
+    {
+      "segment_id": "daily_goods_supplies",
+      "name_zh": "日用品酒店用品",
+      "name_en": "Daily Goods & Supplies",
+      "industry_pack_id": "daily_goods_supplies",
+      "keywords": ["daily goods", "hotel supplies", "cleaning supplies", "disposable", "sanitary supplies"],
+      "keywords_zh": ["日用品", "酒店用品", "清洁用品", "一次性用品", "卫生用品"],
+      "mapTypes": ["store", "supermarket"]
+    }
+  ]
+}

@@ -168,6 +168,26 @@ function buildL1Row(lead, nowIso) {
       ? lead.social_profile_urls.filter((u) => typeof u === 'string' && u.length <= 500).slice(0, 8)
       : [],
     discovered_via: inferDiscoveredVia(lead),
+    // Batch A.4：ICP 闸门 4 个新列（迁移 20260625100000）
+    industry_match: (() => {
+      const m = String(lead.industry_match || '').toLowerCase();
+      return ['high', 'medium', 'low', 'none'].includes(m) ? m : null;
+    })(),
+    industry_evidence: (() => {
+      const ev = lead.industry_evidence;
+      if (!ev || typeof ev !== 'object') return {};
+      const out = {};
+      if (typeof ev.reason === 'string' && ev.reason.trim()) out.reason = ev.reason.trim().slice(0, 200);
+      if (typeof ev.extracted_industry === 'string' && ev.extracted_industry.trim()) {
+        out.extracted_industry = ev.extracted_industry.trim().slice(0, 80);
+      }
+      if (typeof ev.source_text === 'string' && ev.source_text.trim()) {
+        out.source_text = ev.source_text.trim().slice(0, 400);
+      }
+      return out;
+    })(),
+    category_key: lead.category_key ? String(lead.category_key).slice(0, 64) : null,
+    industry_key: lead.industry_key ? String(lead.industry_key).slice(0, 64) : null,
     domain: extractDomain(lead.domain) || null,
     primary_email: lead.primary_email || null,
     primary_phone: lead.primary_phone || null,
