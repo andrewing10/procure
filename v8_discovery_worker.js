@@ -77,9 +77,61 @@ async function readReweightPolicies(job) {
   return Array.from(merged.values());
 }
 
+/**
+ * 监听 discovery_jobs 的取消信号，双路并行：
+ *   - 快路径：Supabase Realtime postgres_changes（毫秒级响应，与 DB trigger pg_notify 同效）
+ *   - 兜底路径：30s 轮询 isJobCancelled（WebSocket 断线或首次订阅延迟时的安全网）
+ *
+ * 返回一个 { promise, cleanup } 对象：
+ *   promise   → 当 job 被取消时 resolve（void）
+ *   cleanup   → 必须在 pipeline 结束后调用，关闭 realtime channel + clearInterval
+ */
+function makeCancelWatcher(jobId) {
+  let resolveCancel;
+  let cancelled = false;
+  const promise = new Promise((resolve) => { resolveCancel = resolve; });
+
+  function triggerCancel() {
+    if (cancelled) return;
+    cancelled = true;
+    console.warn(`[worker] job ${jobId} cancel signal received — terminating pipeline child`);
+    resolveCancel();
+  }
+
+  // 快路径：Supabase Realtime 实时订阅
+  // 依赖 discovery_jobs 表的 realtime 在 Supabase dashboard 已启用（默认开启）
+  const channel = supabase
+    .channel(`job-cancel-${jobId}`)
+    .on(
+      'postgres_changes',
+      { event: 'UPDATE', schema: 'public', table: 'discovery_jobs', filter: `id=eq.${jobId}` },
+      (payload) => {
+        const newStatus = payload.new && payload.new.status;
+        if (newStatus === 'cancelled') triggerCancel();
+      },
+    )
+    .subscribe((status, err) => {
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        console.warn(`[worker] cancel realtime channel ${status} for job ${jobId}, relying on poll fallback`);
+      }
+    });
+
+  // 兜底路径：每 30s 轮询一次（仅在 Realtime 掉线时作为安全网）
+  const fallbackPoll = setInterval(async () => {
+    if (cancelled) return;
+    if (await isJobCancelled(supabase, jobId)) triggerCancel();
+  }, 30_000);
+
+  function cleanup() {
+    clearInterval(fallbackPoll);
+    supabase.removeChannel(channel).catch(() => { /* ignore */ });
+  }
+
+  return { promise, cleanup, get triggered() { return cancelled; } };
+}
+
 function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, reweightPolicies = []) {
   return new Promise((resolve) => {
-    let cancelled = false;
     // 提取 Pillar 0 产业链扩展结果（由 zhimao interpret → expand-query 生成）
     // 注入 step0 用于替换单一品类词为多样化买家画像搜索词
     const pillar0 = (meta.action_payload && typeof meta.action_payload === 'object')
@@ -100,27 +152,20 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
           DISCOVERY_PARENT_JOB_ID: meta.parent_job_id ? String(meta.parent_job_id) : '',
           DISCOVERY_ACTION_TYPE: meta.action_type ? String(meta.action_type) : 'new_search',
           DISCOVERY_REWEIGHT_JSON: JSON.stringify(Array.isArray(reweightPolicies) ? reweightPolicies : []),
-          // Pillar 0：产业链扩展结果，含 buyer_personas / expanded_keywords / boolean_queries
           PILLAR0_PAYLOAD: pillar0Json,
         },
       },
     );
-    const cancelPoll = setInterval(async () => {
-      if (cancelled) return;
-      if (await isJobCancelled(supabase, jobId)) {
-        cancelled = true;
-        console.warn(`[worker] job ${jobId} cancelled — terminating pipeline child`);
-        try {
-          child.kill('SIGTERM');
-        } catch (_) {
-          /* ignore */
-        }
-      }
-    }, 3000);
+
+    // 双路取消监听：Realtime（快）+ 30s 轮询（兜底）
+    const watcher = makeCancelWatcher(jobId);
+    watcher.promise.then(() => {
+      try { child.kill('SIGTERM'); } catch (_) { /* ignore */ }
+    });
 
     child.on('close', (code) => {
-      clearInterval(cancelPoll);
-      if (cancelled) {
+      watcher.cleanup();
+      if (watcher.triggered) {
         // 被 cancel 信号终止，使用专属退出码，不污染"失败"统计
         resolve(PIPELINE_EXIT.CANCELLED);
         return;
@@ -128,7 +173,7 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
       resolve(code ?? 1);
     });
     child.on('error', () => {
-      clearInterval(cancelPoll);
+      watcher.cleanup();
       resolve(PIPELINE_EXIT.CRASH);
     });
   });
