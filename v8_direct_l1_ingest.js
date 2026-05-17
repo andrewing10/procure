@@ -191,7 +191,25 @@ function buildL1Row(lead, nowIso) {
       if (lead.verified_source_id) {
         sigs.push({ type: 'website_change', source: 'v8_verified_source', confidence: 0.75, date: nowIso });
       }
-      return sigs.length ? sigs : null;
+      const items = ib && Array.isArray(ib.procurement_items) ? ib.procurement_items : [];
+      for (const it of items) {
+        if (typeof it === 'string' && it.trim()) {
+          sigs.push({ type: 'procurement_item', source: 'v8-l3', detail: it.trim(), date: nowIso });
+        } else if (it && typeof it === 'object') {
+          const detail = String(it.item || it.name || it.category || '').trim();
+          if (detail) sigs.push({ type: 'procurement_item', source: 'v8-l3', detail, date: nowIso });
+        }
+      }
+      if (ib && ib.intent_summary) {
+        sigs.push({
+          type: 'intent_summary',
+          source: 'v8-l3',
+          detail: String(ib.intent_summary).slice(0, 500),
+          date: nowIso,
+        });
+      }
+      // 禁止 null：显式 null 会绕过 DB DEFAULT 并触发 NOT NULL 约束
+      return sigs;
     })(),
   };
 

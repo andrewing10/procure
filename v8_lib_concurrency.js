@@ -136,14 +136,28 @@ async function requestJsonWithRetry({
     return { statusCode: 0, error: lastError, attempts: attempt };
 }
 
+// 与 zhimao / render.yaml 对齐；模型下线时按序尝试（避免 preview-04-17 整批 L3 失败）
+const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+const GEMINI_MODEL_FALLBACK_CHAIN = [
+    DEFAULT_GEMINI_MODEL,
+    'gemini-3-flash-preview',
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+].filter((m, i, a) => m && a.indexOf(m) === i);
+
+function isGeminiModelUnavailableError(err) {
+    const msg = String(err?.message || err || '').toLowerCase();
+    return msg.includes('not found') || msg.includes('not supported') || msg.includes('is not found for api version');
+}
+
 // ─── callGeminiJson ─────────────────────────────────────────────────────────
 // 模型分级策略（按任务复杂度）：
-//   复杂任务（L3 供应链推断）→ GEMINI_MODEL=gemini-2.5-flash-preview-04-17（env 默认）
-//   简单任务（翻译/名称提取）→ GEMINI_FAST_MODEL=gemini-2.0-flash-lite（env 快速模式）
-//   所有 Gemini 失败后      → OpenAI gpt-4o 自动兜底（OPENAI_API_KEY）
+//   复杂任务（L3）→ GEMINI_MODEL（默认 gemini-3.1-pro-preview）
+//   简单任务     → GEMINI_FAST_MODEL（默认 gemini-3.1-flash-lite）
+//   Gemini 全失败 → OpenAI 自动兜底（OPENAI_API_KEY）
 async function callGeminiJson(promptText, {
     apiKey,
-    model = 'gemini-2.5-flash-preview-04-17',
+    model = DEFAULT_GEMINI_MODEL,
     temperature = 0.1,
     timeoutMs = 60_000,
     maxRetries = 3,
@@ -155,32 +169,47 @@ async function callGeminiJson(promptText, {
 } = {}) {
     if (!apiKey) throw new Error('GEMINI_KEY required');
 
-    // ── 1. 尝试 Gemini ────────────────────────────────────────────────────────
+    // ── 1. 尝试 Gemini（主模型 + 回退链）────────────────────────────────────────
     let geminiError = null;
-    try {
-        const reqBody = JSON.stringify({
-            contents: [{ parts: [{ text: promptText }] }],
-            generationConfig: { temperature, responseMimeType: 'application/json' },
-        });
-        const r = await requestJsonWithRetry({
-            hostname: 'generativelanguage.googleapis.com',
-            path: `/v1beta/models/${model}:generateContent?key=${apiKey}`,
-            method: 'POST',
-            body: reqBody,
-            timeoutMs,
-            maxRetries,
-            label,
-        });
-        if (r.error) throw new Error(`gemini_failed: ${r.error.message}`);
-        if (!r.json) throw new Error(`gemini_parse_failed: status=${r.statusCode}, body=${(r.raw || '').slice(0, 200)}`);
-        if (r.json.error) throw new Error(`gemini_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
-        const text = r.json?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (!text) throw new Error(`gemini_empty_candidate: status=${r.statusCode}`);
-        try { return JSON.parse(text); }
-        catch (e) { throw new Error(`gemini_text_not_json: ${e.message}; head=${String(text).slice(0, 200)}`); }
-    } catch (err) {
-        geminiError = err;
-        console.warn(`[${label}] Gemini failed (${err.message.slice(0, 120)})`);
+    const modelsToTry = [model, ...GEMINI_MODEL_FALLBACK_CHAIN].filter((m, i, a) => m && a.indexOf(m) === i);
+    for (const tryModel of modelsToTry) {
+        try {
+            const reqBody = JSON.stringify({
+                contents: [{ parts: [{ text: promptText }] }],
+                generationConfig: { temperature, responseMimeType: 'application/json' },
+            });
+            const r = await requestJsonWithRetry({
+                hostname: 'generativelanguage.googleapis.com',
+                path: `/v1beta/models/${tryModel}:generateContent?key=${apiKey}`,
+                method: 'POST',
+                body: reqBody,
+                timeoutMs,
+                maxRetries,
+                label: `${label}/${tryModel}`,
+            });
+            if (r.error) throw new Error(`gemini_failed: ${r.error.message}`);
+            if (!r.json) throw new Error(`gemini_parse_failed: status=${r.statusCode}, body=${(r.raw || '').slice(0, 200)}`);
+            if (r.json.error) throw new Error(`gemini_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
+            const text = r.json?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) throw new Error(`gemini_empty_candidate: status=${r.statusCode}`);
+            try {
+                const parsed = JSON.parse(text);
+                if (tryModel !== model) {
+                    console.log(`[${label}] Gemini succeeded with fallback model ${tryModel}`);
+                }
+                return parsed;
+            } catch (e) {
+                throw new Error(`gemini_text_not_json: ${e.message}; head=${String(text).slice(0, 200)}`);
+            }
+        } catch (err) {
+            geminiError = err;
+            if (isGeminiModelUnavailableError(err)) {
+                console.warn(`[${label}] Gemini model ${tryModel} unavailable (${err.message.slice(0, 100)}), trying next…`);
+                continue;
+            }
+            console.warn(`[${label}] Gemini failed (${err.message.slice(0, 120)})`);
+            break;
+        }
     }
 
     // ── 2. OpenAI 兜底（Gemini 限流/错误时自动切换）────────────────────────────

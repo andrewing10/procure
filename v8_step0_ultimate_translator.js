@@ -85,7 +85,10 @@ async function run() {
                 pillar0Keywords = p0.expanded_keywords.slice(0, 20); // 最多 20 个扩展词
             }
             if (Array.isArray(p0.buyer_personas) && p0.buyer_personas.length > 0) {
-                pillar0Personas = p0.buyer_personas.map(p => p.industry_en).filter(Boolean).slice(0, 8);
+                pillar0Personas = p0.buyer_personas
+                    .map((p) => p.industry_en || p.industry_zh || p.industry || p.name)
+                    .filter(Boolean)
+                    .slice(0, 8);
             }
             if (Array.isArray(p0.boolean_queries) && p0.boolean_queries.length > 0) {
                 pillar0BooleanQueries = p0.boolean_queries.slice(0, 3);

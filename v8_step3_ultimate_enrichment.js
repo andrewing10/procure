@@ -8,10 +8,8 @@ const [inputFile, outputFile] = process.argv.slice(2);
 const SKIP_L3_INFERENCE = process.env.SKIP_L3_INFERENCE === 'true';
 
 const GEMINI_KEY   = process.env.GEMINI_KEY;
-// Step3 L3 供应链推断是最复杂的 LLM 任务
-// gemini-2.5-flash-preview-04-17 在 2026-05 是速度/质量最均衡的可用模型；
-// 如需最高精度可设 GEMINI_MODEL=gemini-2.5-pro-preview-05-06（更慢）
-const GEMINI_MODEL = process.env.GEMINI_MODEL      || 'gemini-2.5-flash-preview-04-17';
+// Step3 L3 供应链推断 — 与 zhimao llmClient / render.yaml 对齐（勿用已下线的 preview-04-17）
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
 const OPENAI_KEY   = process.env.OPENAI_API_KEY || '';
 // L3 推断是最复杂的任务，兜底用最强模型 gpt-4o（gpt-5.5 仅在部分账户可用）
 const OPENAI_MODEL = process.env.OPENAI_MODEL   || 'gpt-4o';
