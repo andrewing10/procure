@@ -6,6 +6,8 @@ const {
   finalizeJob,
   failJob,
   isJobCancelled,
+  releaseStaleClaims,
+  claimNextDiscoveryJob,
 } = require('./v8_zhimao_contract');
 
 // Self-heal: ensure Playwright Chromium binary is present before the first job runs.
@@ -179,46 +181,17 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
   });
 }
 
-async function pickPendingJob() {
+async function readClaimedJob(jobId) {
   const { data, error } = await supabase
     .from('discovery_jobs')
-    .select('id,category,country_iso,requested_by,session_id,parent_job_id,action_type,action_payload')
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true })
-    .limit(1)
+    .select('id,category,country_iso,requested_by,session_id,parent_job_id,action_type,action_payload,sweep_count')
+    .eq('id', jobId)
     .maybeSingle();
   if (error) {
-    // PostgREST schema cache 刚 migration 后短暂失效，"schema cache" 关键字代表可自愈错误
-    // 额外等 30s 让 PostgREST 完成 cache reload，避免每 15s 刷屏
-    if (error.message && error.message.toLowerCase().includes('schema cache')) {
-      console.warn('[worker] select pending job error (schema cache refreshing, waiting 30s):', error.message);
-      await sleep(30_000);
-    } else {
-      console.error('[worker] select pending job error:', error.message);
-    }
+    console.error('[worker] read claimed job error:', error.message);
     return null;
   }
   return data || null;
-}
-
-async function markRunning(jobId) {
-  // Guard: only update if still pending — prevents double-pickup in multi-worker setups
-  const { data, error } = await supabase
-    .from('discovery_jobs')
-    .update({ status: 'running', started_at: new Date().toISOString(), error_message: null })
-    .eq('id', jobId)
-    .eq('status', 'pending')
-    .select('id')
-    .maybeSingle();
-  if (error) {
-    console.error('[worker] mark running error:', error.message);
-    return false;
-  }
-  if (!data) {
-    console.warn(`[worker] job ${jobId} was already picked up by another worker, skipping`);
-    return false;
-  }
-  return true;
 }
 
 async function readMappingCount(jobId) {
@@ -300,19 +273,23 @@ async function main() {
       // Heartbeat every loop so admin panel shows last-seen time.
       await writeHeartbeat();
 
-      const job = await pickPendingJob();
+      await releaseStaleClaims(supabase, 900);
+      const claim = await claimNextDiscoveryJob(supabase);
+      if (!claim.ok) {
+        await sleep(POLL_MS);
+        continue;
+      }
+      if (!claim.job || !claim.job.job_id) {
+        await sleep(POLL_MS);
+        continue;
+      }
+
+      const job = await readClaimedJob(claim.job.job_id);
       if (!job) {
         await sleep(POLL_MS);
         continue;
       }
 
-      const runningOk = await markRunning(job.id);
-      if (!runningOk) {
-        await sleep(POLL_MS);
-        continue;
-      }
-
-      await recordStage(supabase, job.id, 'claimed');
       await recordStage(supabase, job.id, 'fetching');
 
       // 读取该 job 的历史 sweep 次数，传入流水线做深分页

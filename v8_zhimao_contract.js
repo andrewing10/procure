@@ -94,6 +94,31 @@ async function isJobCancelled(supabase, jobId) {
   return data?.status === 'cancelled';
 }
 
+async function releaseStaleClaims(supabase, staleSeconds = 900) {
+  const { data, error } = await supabase.rpc('release_stale_discovery_claims', {
+    p_stale_seconds: staleSeconds,
+  });
+  if (error) {
+    console.warn('[zhimao-contract] release_stale_discovery_claims failed:', error.message);
+    return { ok: false, error };
+  }
+  return { ok: true, released: Number(data || 0) };
+}
+
+async function claimNextDiscoveryJob(supabase, workerId) {
+  const { data, error } = await supabase.rpc('claim_next_discovery_job', {
+    p_worker_id: workerId || process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || 'procure-worker',
+  });
+  if (error) {
+    console.warn('[zhimao-contract] claim_next_discovery_job failed:', error.message);
+    return { ok: false, error };
+  }
+  if (!data || data.ok !== true) {
+    return { ok: true, job: null, reason: data?.reason || 'no_pending_job' };
+  }
+  return { ok: true, job: data };
+}
+
 /** discovery_job_leads 硬绑定：与 zhimao listDiscoveryJobIntelLeads 契约一致 */
 async function upsertJobLeadMapping(supabase, discoveryJobId, companyId, qualityGrade) {
   const grade = qualityGrade || 'qualified';
@@ -121,5 +146,7 @@ module.exports = {
   finalizeJob,
   failJob,
   isJobCancelled,
+  releaseStaleClaims,
+  claimNextDiscoveryJob,
   upsertJobLeadMapping,
 };
