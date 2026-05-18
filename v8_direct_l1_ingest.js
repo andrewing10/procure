@@ -15,6 +15,41 @@ const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
 
 const CHUNK_L1 = Math.min(Math.max(Number(process.env.DIRECT_L1_CHUNK || 80), 10), 200);
 
+/** zhimao 迁移 20260625100000；未部署时 PostgREST 报 PGRST204，step5 会 HALT */
+const ICP_EVIDENCE_COLUMNS = ['industry_match', 'industry_evidence', 'category_key'];
+
+function stripIcpEvidenceColumns(row) {
+  const out = { ...row };
+  for (const col of ICP_EVIDENCE_COLUMNS) delete out[col];
+  return out;
+}
+
+function isMissingIcpColumnError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  if (err?.code !== 'PGRST204' && !msg.includes('schema cache')) return false;
+  return ICP_EVIDENCE_COLUMNS.some((col) => msg.includes(col));
+}
+
+async function upsertL1Chunk(supabase, batchPayload) {
+  let payload = batchPayload;
+  let res = await supabase
+    .from('data_intel_l1_companies')
+    .upsert(payload, { onConflict: 'name_canonical,country', ignoreDuplicates: true })
+    .select('company_id,name_canonical,country');
+  if (res.error && isMissingIcpColumnError(res.error)) {
+    console.warn(
+      '[direct-l1] ICP columns missing on DB; retrying without industry_match/evidence/category_key. ' +
+        'Deploy zhimao migration 20260625100000_l1_industry_match_columns.sql',
+    );
+    payload = batchPayload.map(stripIcpEvidenceColumns);
+    res = await supabase
+      .from('data_intel_l1_companies')
+      .upsert(payload, { onConflict: 'name_canonical,country', ignoreDuplicates: true })
+      .select('company_id,name_canonical,country');
+  }
+  return res;
+}
+
 function normalizeNameCanonical(name) {
   const s = String(name || '').trim().toLowerCase();
   if (!s) return '';
@@ -332,10 +367,7 @@ async function directIngestQualifiedLeads(supabase, leads, opts = {}) {
     if (rows.length === 0) continue;
 
     const batchPayload = rows.map((x) => x.row);
-    const { data: inserted, error: upErr } = await supabase
-      .from('data_intel_l1_companies')
-      .upsert(batchPayload, { onConflict: 'name_canonical,country', ignoreDuplicates: true })
-      .select('company_id,name_canonical,country');
+    const { data: inserted, error: upErr } = await upsertL1Chunk(supabase, batchPayload);
 
     if (upErr) {
       errors.push(`L1 upsert: ${upErr.message}`);
