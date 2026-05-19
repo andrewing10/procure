@@ -12,11 +12,15 @@
 const { upsertJobLeadMapping } = require('./v8_zhimao_contract');
 const { inferProcurementSignalCount } = require('./v8_quality_gate');
 const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
+const { deriveL1CommerceFields } = require('@zhimao/buyer-commerce');
 
 const CHUNK_L1 = Math.min(Math.max(Number(process.env.DIRECT_L1_CHUNK || 80), 10), 200);
 
 /** zhimao 迁移 20260625100000；未部署时 PostgREST 报 PGRST204，step5 会 HALT */
 const ICP_EVIDENCE_COLUMNS = ['industry_match', 'industry_evidence', 'category_key'];
+
+/** zhimao 迁移 20260626120000 + 20260626130000；未部署时 strip 后由 DB 触发器补写 */
+const COMMERCE_COLUMNS = ['contact_bundle', 'sellable_skus', 'data_archetype', 'contactability_score'];
 
 function stripIcpEvidenceColumns(row) {
   const out = { ...row };
@@ -24,10 +28,22 @@ function stripIcpEvidenceColumns(row) {
   return out;
 }
 
+function stripCommerceColumns(row) {
+  const out = { ...row };
+  for (const col of COMMERCE_COLUMNS) delete out[col];
+  return out;
+}
+
 function isMissingIcpColumnError(err) {
   const msg = String(err?.message || '').toLowerCase();
   if (err?.code !== 'PGRST204' && !msg.includes('schema cache')) return false;
   return ICP_EVIDENCE_COLUMNS.some((col) => msg.includes(col));
+}
+
+function isMissingCommerceColumnError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  if (err?.code !== 'PGRST204' && !msg.includes('schema cache')) return false;
+  return COMMERCE_COLUMNS.some((col) => msg.includes(col));
 }
 
 async function upsertL1Chunk(supabase, batchPayload) {
@@ -42,6 +58,17 @@ async function upsertL1Chunk(supabase, batchPayload) {
         'Deploy zhimao migration 20260625100000_l1_industry_match_columns.sql',
     );
     payload = batchPayload.map(stripIcpEvidenceColumns);
+    res = await supabase
+      .from('data_intel_l1_companies')
+      .upsert(payload, { onConflict: 'name_canonical,country', ignoreDuplicates: true })
+      .select('company_id,name_canonical,country');
+  }
+  if (res.error && isMissingCommerceColumnError(res.error)) {
+    console.warn(
+      '[direct-l1] commerce columns missing; retrying without contact_bundle/sellable_skus. ' +
+        'Deploy zhimao migrations 20260626120000_buyer_commerce_entity.sql + 20260626130000_l1_commerce_ingest_trigger.sql',
+    );
+    payload = payload.map(stripCommerceColumns);
     res = await supabase
       .from('data_intel_l1_companies')
       .upsert(payload, { onConflict: 'name_canonical,country', ignoreDuplicates: true })
@@ -295,6 +322,13 @@ function buildL1Row(lead, nowIso) {
       return sigs;
     })(),
   };
+
+  const commerceInput = {
+    ...row,
+    intent_summary_zh: row.intent_summary || lead.intent_summary_zh || null,
+  };
+  const { intent_patch, ...commerce } = deriveL1CommerceFields(commerceInput);
+  Object.assign(row, commerce, intent_patch);
 
   Object.keys(row).forEach((k) => {
     if (row[k] === undefined) delete row[k];
