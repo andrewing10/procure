@@ -121,13 +121,15 @@ function applySourceBoost(lead) {
 
 const totalLeads = leads.length;
 const gradeStats = { premium: 0, qualified: 0, unqualified: 0 };
-// Batch A.4：ICP 闸门 balanced 阈值
-//   none  → 直接 unqualified
-//   low   → 直接 unqualified
-//   medium→ 保留 grade，但加 needs_human_review=true 软标记
-//   high  → 保持 grade
-//   null/undefined（未跑业态判定，向后兼容）→ 仅按 evaluateLead 决策
-const ICP_THRESHOLD = String(process.env.ICP_MATCH_THRESHOLD || 'balanced').toLowerCase();
+// Batch A.4：ICP 闸门阈值
+//
+//   soft (默认)  → 只丢 none（明确无关，如房产中介、餐厅），保留 low/medium/high
+//   balanced     → 丢 low+none（原默认，对"相邻行业"如包装、物流过于激进，量损失 30-40%）
+//   off          → 不拦截任何（全量进 L1，人工审核）
+//
+// 默认改为 soft：买家抓取场景中 industry_match=low 往往是采购频次低但真实进口的企业（如
+//   经销商、贸易商），balanced 会把它们整批丢弃，是"量不多"的主要漏斗损失点之一。
+const ICP_THRESHOLD = String(process.env.ICP_MATCH_THRESHOLD || 'soft').toLowerCase();
 const icpStats = { high: 0, medium: 0, low: 0, none: 0, unset: 0 };
 
 const validLeads = leads
@@ -138,8 +140,14 @@ const validLeads = leads
     const matchRaw = String(lead.industry_match || '').toLowerCase();
     const m = ['high', 'medium', 'low', 'none'].includes(matchRaw) ? matchRaw : 'unset';
     icpStats[m] += 1;
-    if (ICP_THRESHOLD !== 'off' && (m === 'low' || m === 'none')) {
-      // 强制降级：覆盖 evaluateLead，写入 unqualified，不入 L1
+    // 闸门逻辑：
+    //   balanced → 丢 low + none
+    //   soft     → 只丢 none
+    //   off      → 不拦截
+    const shouldDrop =
+      (ICP_THRESHOLD === 'balanced' && (m === 'low' || m === 'none')) ||
+      (ICP_THRESHOLD === 'soft'     && m === 'none');
+    if (shouldDrop) {
       lead._quality_grade = 'unqualified';
       gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
       return false;

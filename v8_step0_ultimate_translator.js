@@ -73,6 +73,30 @@ async function run() {
     const countryName = COUNTRY_NAMES[cc] || isoUpper;
     const tld         = `site:.${cc} OR site:.com.${cc}`;
 
+    /**
+     * 品类词净化：去掉"买家/buyer"类后缀和"...buyers in X"型语境词，
+     * 让 V8 搜索基于真实产品名而非营销短语。
+     * 原词保留在 category 里用于 DB 记录；搜索全程用 categoryClean。
+     *
+     * 例：
+     *   "居銮红酒买家"        → "居銮红酒"
+     *   "LED lighting buyers in Singapore" → "LED lighting"
+     *   "护肝片买家"          → "护肝片"
+     *   "mattress buyer"      → "mattress"
+     */
+    const categoryClean = category
+      // 英文：去掉 "buyers in/from/at Country" 型末尾修饰语
+      .replace(/\s+buyers?\s+(?:in|from|at|within|across|for)\s+.+$/i, '')
+      // 中文：去掉"买家/进口商/购买者/采购商/采购方"后缀
+      .replace(/[\s]*(买家|进口商|购买者|采购商|采购方|采购代理)\s*$/i, '')
+      // 英文：去掉末尾 " buyer/buyers/importer/importers/purchaser" 词
+      .replace(/[\s]+(buyer|buyers|importer|importers|purchaser|purchasers)\s*$/i, '')
+      .trim() || category;
+
+    if (categoryClean !== category) {
+        console.log(`[step0] category cleaned: "${category}" → "${categoryClean}"`);
+    }
+
     // ── Pillar 0：读取产业链扩展结果（由 zhimao interpret→expand-query 生成） ──
     let pillar0Keywords = [];
     let pillar0Personas = [];
@@ -103,10 +127,16 @@ async function run() {
 
     let baseQuery = '';
 
-    if (targetLang !== 'English') {
+    // 判断净化后的品类是否已是纯英文（无中文/日文/韩文/阿拉伯文等 Unicode 区段），
+    // 若是则跳过 LLM 翻译直接用英文模板——避免 LLM 误改导致 exit(1) + 节省费用。
+    const hasNonLatin = /[\u0080-\uFFFF]/.test(categoryClean);
+    const isAlreadyEnglish = !hasNonLatin;
+
+    if (targetLang !== 'English' && !isAlreadyEnglish) {
         // 生成 3 类买家意图词：进口/批发渠道词 + 采购行为词 + 本地行业身份词
+        // 使用净化后的 categoryClean 而非原始 category，避免"买家/buyers in X"干扰翻译
         const prompt = `You are a B2B procurement data expert.
-Translate the industrial category "${category}" to ${targetLang} and provide buyer intent keywords.
+Translate the industrial category "${categoryClean}" to ${targetLang} and provide buyer intent keywords.
 Return ONLY valid JSON with this exact structure:
 {
   "translated_category": "...",
@@ -179,8 +209,12 @@ Return ONLY valid JSON with this exact structure:
     }
 
     if (!baseQuery) {
-        // 英语市场：多样化买家意图词（不只是 importer/wholesaler）
-        baseQuery = `"${category}" ("importer" OR "wholesaler" OR "distributor" OR "buyer" OR "procurement" OR "sourcing")`;
+        // 英语市场 或 品类词已是英文：多样化买家意图词（不只是 importer/wholesaler）
+        // 使用净化后的 categoryClean 避免把"buyers in Singapore"再套进 query
+        if (isAlreadyEnglish && targetLang !== 'English') {
+            console.log(`[step0] category already English, skipping LLM translation for ${targetLang} market`);
+        }
+        baseQuery = `"${categoryClean}" ("importer" OR "wholesaler" OR "distributor" OR "buyer" OR "procurement" OR "sourcing")`;
     }
 
     // ── Pillar 0 注入：将产业链扩展词追加到搜索策略 ──────────────────────────
@@ -206,7 +240,8 @@ Return ONLY valid JSON with this exact structure:
         tld,
         countryName,
         countryCode: isoUpper,
-        category,
+        category,        // 保留原始品类词供 DB 记录展示
+        categoryClean,   // 净化后的搜索品类词，step1 用于构建 query
         // 传递 Pillar 0 原始数据给后续步骤备用
         pillar0Keywords: pillar0Keywords.length > 0 ? pillar0Keywords : undefined,
         pillar0BooleanQueries: pillar0BooleanQueries.length > 0 ? pillar0BooleanQueries : undefined,

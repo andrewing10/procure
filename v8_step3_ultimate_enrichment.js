@@ -9,6 +9,20 @@ const { extractSocialUrls } = require('./v8_lib_social_extract');
 const [inputFile, outputFile] = process.argv.slice(2);
 const SKIP_L3_INFERENCE = process.env.SKIP_L3_INFERENCE === 'true';
 
+/**
+ * 买家抓取矩阵：matrix.include_social_profiles 控制社媒 URL 富化。
+ * false → extractFromHTML 不传 socials Set，节省 Playwright 分析时间；
+ * true（默认）→ 正常聚合社媒 URL。
+ */
+const MATRIX_INCLUDE_SOCIAL = (() => {
+  try {
+    const raw = process.env.PILLAR0_PAYLOAD || '';
+    if (!raw) return true;
+    const p = JSON.parse(raw);
+    return p?.matrix?.include_social_profiles !== false;
+  } catch { return true; }
+})();
+
 const GEMINI_KEY   = process.env.GEMINI_KEY;
 // Step3 L3 供应链推断 — 与 zhimao llmClient / render.yaml 对齐（勿用已下线的 preview-04-17）
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
@@ -357,7 +371,10 @@ async function extractContactForLead(lead, contexts) {
         const ctx  = isFb ? contexts.mobile : contexts.desktop;
         const emails  = new Set();
         const phones  = new Set();
-        const socials = new Set(Array.isArray(lead.social_profile_urls) ? lead.social_profile_urls : []);
+        // 买家抓取矩阵：matrix.include_social_profiles=false 时跳过社媒 URL 聚合以节省时间
+        const socials = MATRIX_INCLUDE_SOCIAL
+            ? new Set(Array.isArray(lead.social_profile_urls) ? lead.social_profile_urls : [])
+            : null;
         let page;
         try {
             page = await ctx.newPage();
@@ -392,8 +409,10 @@ async function extractContactForLead(lead, contexts) {
         if (emails.size > 0) lead.primary_email = Array.from(emails)[0];
         const cleanPhones = Array.from(phones).filter(p => p.length < 20);
         if (cleanPhones.length > 0) lead.primary_phone = cleanPhones[0];
-        // 买家抓取矩阵：累加从官网/FB about 抽到的公开社媒主页（≤ 8 条）
-        if (socials.size > 0) lead.social_profile_urls = [...socials].slice(0, 8);
+        // 买家抓取矩阵：仅在 includeSocial=true 时写 social_profile_urls
+        if (MATRIX_INCLUDE_SOCIAL && socials instanceof Set && socials.size > 0) {
+            lead.social_profile_urls = [...socials].slice(0, 8);
+        }
 
         // 写入缓存（无论是否找到联系方式，避免下次重复爬取）
         setCachedContact(lead.domain, lead.primary_email, lead.primary_phone);

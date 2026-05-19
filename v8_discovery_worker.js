@@ -238,7 +238,18 @@ async function markDone(job) {
 }
 
 async function markFailed(jobId, msg) {
-  await failJob(supabase, jobId, msg);
+  // 尝试读取 master 写入的 job-scoped 崩溃文件，细化错误定位
+  let detailedMsg = msg;
+  const crashFile = `crash_${jobId}.json`;
+  try {
+    if (require('fs').existsSync(crashFile)) {
+      const info = JSON.parse(require('fs').readFileSync(crashFile, 'utf8'));
+      detailedMsg = `pipeline_crash:${info.step || 'unknown'}`;
+      require('fs').unlinkSync(crashFile);
+      console.warn(`[worker] crash detail: step=${info.step} script=${info.script} error=${info.error?.slice(0, 120)}`);
+    }
+  } catch (_) { /* non-fatal */ }
+  await failJob(supabase, jobId, detailedMsg);
 }
 
 /**

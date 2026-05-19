@@ -35,6 +35,14 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
         execSync(cmd, { stdio: 'inherit' });
     } catch (e) {
         console.error(`[HALT] Script crashed: ${scriptFile}. Error: ${e.message}`);
+        // 写入 job-scoped 崩溃文件，供 v8_discovery_worker.js 在 markFailed 时读取
+        const jobId = process.env.DISCOVERY_JOB_ID || 'unknown';
+        try {
+            fs.writeFileSync(
+                `crash_${jobId}.json`,
+                JSON.stringify({ step: stepName, script: scriptFile, error: String(e.message || '').slice(0, 300) })
+            );
+        } catch (_) { /* ignore crash-file write failure */ }
         process.exit(1);
     }
 

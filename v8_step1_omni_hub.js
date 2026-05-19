@@ -218,6 +218,38 @@ function searchOrganic(query, gl, num = 20, page = SEARCH_PAGE) {
   return serperPost('/search', body).then(r => r.organic || []);
 }
 
+/**
+ * 买家抓取矩阵 matrix.max_pages_per_pillar 驱动的多页 Serper 调用。
+ * 从当前 SEARCH_PAGE 开始，往后取 MATRIX_MAX_PAGES 页，并按 link 去重合并。
+ * MATRIX_MAX_PAGES=1（默认）退化为单次 searchOrganic，行为向后兼容。
+ */
+const MATRIX_MAX_PAGES = (() => {
+  try {
+    const m = readMatrixFromEnv();
+    return (m && m.maxPages) ? Math.min(5, Math.max(1, m.maxPages)) : 1;
+  } catch { return 1; }
+})();
+
+async function searchOrganicMultiPage(query, gl, num = 20) {
+  if (MATRIX_MAX_PAGES <= 1) return searchOrganic(query, gl, num);
+  const pagePromises = [];
+  for (let p = SEARCH_PAGE; p < SEARCH_PAGE + MATRIX_MAX_PAGES; p++) {
+    pagePromises.push(searchOrganic(query, gl, num, p));
+  }
+  const pages = await Promise.all(pagePromises);
+  const seen = new Set();
+  const merged = pages.flat().filter(r => {
+    const key = (r.link || '').toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  if (MATRIX_MAX_PAGES > 1) {
+    console.log(`[step1] multiPage: query="${query.slice(0, 60)}" pages=${MATRIX_MAX_PAGES} merged=${merged.length}`);
+  }
+  return merged;
+}
+
 // ─── Lead builders ─────────────────────────────────────────────────────────
 function fromOrganic(results, pillar, intent_signal) {
   return results.map(o => ({
@@ -243,7 +275,10 @@ function getVerifiedSources() {
 // 性能：原来 ~10 次 Serper 调用串行 ≈ 30-60s，现在全并行 ≈ 1-3s（取最慢一路）
 async function run() {
   const data = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
-  const { baseQuery, countryName, category, tld } = data;
+  // categoryClean 由 step0 净化（去掉"买家/buyers in X"等干扰词），用于构建搜索 query；
+  // 原始 category 仅保留供日志/元数据使用。
+  const { baseQuery, countryName, tld } = data;
+  const category = data.categoryClean || data.category;
   const cc   = countryCode || '';
   const year = new Date().getFullYear();
   const controls = loadReweightControls();
@@ -454,12 +489,12 @@ async function run() {
 
     // ── P2: 公司官网直接搜索（在目标国TLD下找自述为进口商/批发商的公司） ─────
     // 关键：用 site:.vn 等TLD直接找公司网站，不找聚合站
-    p2_direct_importer: searchOrganic(
+    p2_direct_importer: searchOrganicMultiPage(
       `"${category}" (importer OR wholesaler OR distributor) ${tld} -site:alibaba.com -site:made-in-china.com`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 2 Direct', 'SELF_DECLARED_IMPORTER')),
 
-    p2_sourcing_intent: searchOrganic(
+    p2_sourcing_intent: searchOrganicMultiPage(
       `"${category}" ("we import" OR "we source" OR "our suppliers" OR "looking for supplier" OR "wanted suppliers") ${tld}`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 2 Direct', 'ACTIVE_SOURCING')),
@@ -468,7 +503,7 @@ async function run() {
     // 修复说明：原 site:importyeti.com/volza.com 搜索结果的 URL 都在垃圾名单里
     // 会被 isJunkLead 全部过滤掉（100% Serper 配额浪费）。
     // 改为：搜索目标国公司的采购招聘页面，这类页面在公司官网上，URL 有效。
-    p3_jobs_procurement: searchOrganic(
+    p3_jobs_procurement: searchOrganicMultiPage(
       // Batch D.1：把 anchor 词加进 query，避免"procurement manager"拉到金融/IT 招聘
       anchorPrimary
         ? `"${anchorPrimary}" "procurement manager" OR "category manager" OR "buyer" job ${tld}`
@@ -476,7 +511,7 @@ async function run() {
       cc
     ).then(r => fromOrganic(r, 'Pillar 3 Jobs', 'PROCUREMENT_HIRING')),
 
-    p3_jobs_buyer: searchOrganic(
+    p3_jobs_buyer: searchOrganicMultiPage(
       anchorPrimary
         ? `"${anchorPrimary}" buyer job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`
         : `"${category}" ("buyer" OR "import buyer" OR "commercial buyer") job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`,
@@ -484,18 +519,18 @@ async function run() {
     ).then(r => fromOrganic(r, 'Pillar 3 Jobs', 'BUYER_HIRING')),
 
     // ── P4: 主动询盘意图（RFQ / 供应商征集 — 最明确的买家自我标识） ──────────
-    p4_rfq: searchOrganic(
+    p4_rfq: searchOrganicMultiPage(
       `"${category}" (RFQ OR "request for quotation" OR "request for proposal" OR "tender" OR "供应商征集") ${tld}`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 4 Intent', 'RFQ_POSTED')),
 
-    p4_sourcing_post: searchOrganic(
+    p4_sourcing_post: searchOrganicMultiPage(
       `"${category}" ("looking for manufacturers" OR "need factory" OR "sourcing from China" OR "procurement notice") ${countryName}`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 4 Intent', 'SOURCING_POST')),
 
     // ── P5: 政府采购/招标（机构采购商，预算确定，信号最强） ─────────────────
-    p5_tenders: searchOrganic(
+    p5_tenders: searchOrganicMultiPage(
       `"${category}" (tender OR RFP OR "request for proposal" OR procurement) (${tld} OR site:.gov.${cc})`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 5 Tenders', 'GOV_PROCUREMENT')),
@@ -503,12 +538,12 @@ async function run() {
     // ── P6: 行业协会与进口商目录（结构化来源） ─────────────────────────────
     // 修复说明：原来搜 "exhibitor list"（展商名录）找到的是卖家不是买家。
     // 改为：搜买家参观/注册信息，或进口商协会会员名录
-    p6_buyer_assoc: searchOrganic(
+    p6_buyer_assoc: searchOrganicMultiPage(
       `"${category}" importers association OR buyers club OR "member directory" ${countryName}`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 6 Association', 'ASSOCIATION_MEMBER')),
 
-    p6_trade_show_buyer: searchOrganic(
+    p6_trade_show_buyer: searchOrganicMultiPage(
       `"${category}" ("buyer visitor" OR "visitor registration" OR "trade visitors" OR "buying mission") ${year} ${countryName}`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 6 Association', 'TRADE_SHOW_BUYER')),
@@ -516,23 +551,23 @@ async function run() {
     // ── P7: 海关/贸易信号（真实进口行为，数据最权威） ───────────────────────
     // 修复说明：原来 site:importyeti.com 等结果 URL 在垃圾名单被全过滤。
     // 新策略：搜"含海关关键词的公司页面"（返回公司官网，而不是聚合站）
-    p7_customs_direct: searchOrganic(
+    p7_customs_direct: searchOrganicMultiPage(
       `"${category}" ("import" OR "importer of record" OR "customs entry" OR "HS code" OR "HTS") ${tld} company`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 7 Customs', 'CUSTOMS_SIGNAL')),
 
-    p7_bol_signal: searchOrganic(
+    p7_bol_signal: searchOrganicMultiPage(
       `"${category}" ("bill of lading" OR "海运提单" OR "شحنة" OR "connaissement") importer "${countryName}"`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 7 Customs', 'BOL_SIGNAL')),
 
     // ── P8: 电商买家信号（B2B电商平台上的买家侧入口） ────────────────────────
-    p8_b2b_buyer: searchOrganic(
+    p8_b2b_buyer: searchOrganicMultiPage(
       `"${category}" buyer OR "trade buyer" OR "retail buyer" ${countryName} -site:alibaba.com -site:made-in-china.com -site:globalsources.com`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 8 B2B', 'B2B_BUYER')),
 
-    p8_ecommerce_import: searchOrganic(
+    p8_ecommerce_import: searchOrganicMultiPage(
       `"${category}" ("private label" OR "OEM buyer" OR "contract manufacturing") ${countryName}`,
       cc
     ).then(r => fromOrganic(r, 'Pillar 8 B2B', 'PRIVATE_LABEL')),
@@ -562,7 +597,7 @@ async function run() {
             .replace(/\$\{category\}/g, category)
             .replace(/\$\{countryName\}/g, countryName);
 
-          return searchOrganic(q, cc, 20).then(r =>
+          return searchOrganicMultiPage(q, cc, 20).then(r =>
             r.map(o => ({
               ...o,
               pillar:                  'Pillar 10 VerifiedSource',
@@ -605,7 +640,7 @@ async function run() {
       // Batch D.1：anchor 命中时把品类原文换成业态短语，避免黄页站把无关行业拉进来
       const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
       const q = `(site:yellowpages.com OR site:yelp.com OR site:europages.com OR site:kompass.com) ${subject} ${countryName}${cityClause}`;
-      const r = await searchOrganic(q, cc, 20);
+      const r = await searchOrganicMultiPage(q, cc, 20);
       return r.map((o) => ({
         title: o.title, link: o.link, snippet: o.snippet,
         pillar: 'Pillar Yellow', intent_signal: 'YP_LISTING',
@@ -616,7 +651,7 @@ async function run() {
       const cityClause = mapsCities.length > 0 ? ` ("${mapsCities.slice(0, 3).join('" OR "')}")` : '';
       const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
       const q = `site:facebook.com ${subject} (buyer OR distributor OR importer OR wholesale) ${countryName}${cityClause}`;
-      const r = await searchOrganic(q, cc, 20);
+      const r = await searchOrganicMultiPage(q, cc, 20);
       return r.map((o) => ({
         title: o.title, link: null, snippet: o.snippet,
         pillar: 'Pillar FB Public', intent_signal: 'FB_PUBLIC_PROFILE',
@@ -629,7 +664,7 @@ async function run() {
     p_youtube_about: (async () => {
       const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
       const q = `site:youtube.com (inurl:about OR inurl:c OR inurl:@) ${subject} (company OR brand OR official) ${countryName}`;
-      const r = await searchOrganic(q, cc, 20);
+      const r = await searchOrganicMultiPage(q, cc, 20);
       return r.map((o) => ({
         title: o.title, link: null, snippet: o.snippet,
         pillar: 'Pillar YT About', intent_signal: 'YT_ABOUT',
@@ -641,7 +676,7 @@ async function run() {
     p_x_public: (async () => {
       const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
       const q = `(site:x.com OR site:twitter.com) ${subject} (buyer OR import OR procurement) ${countryName}`;
-      const r = await searchOrganic(q, cc, 20);
+      const r = await searchOrganicMultiPage(q, cc, 20);
       return r.map((o) => ({
         title: o.title, link: null, snippet: o.snippet,
         pillar: 'Pillar X Public', intent_signal: 'X_PUBLIC',
@@ -670,7 +705,7 @@ async function run() {
         // 对每个种子并发搜它的竞品和同类公司
         return Promise.all(
           relevant.map(seed =>
-            searchOrganic(
+            searchOrganicMultiPage(
               `"${category}" companies like "${seed.company_name}" OR competitors "${seed.company_name}" ${countryName} importer wholesaler`,
               cc, 20
             ).then(r => r.map(o => ({

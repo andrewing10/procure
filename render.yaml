@@ -54,6 +54,12 @@ services:
       # 同时把 v8_enrichment_queue_worker.js 注册为独立 worker 服务。
       - key: SKIP_SQLITE
         value: "true"
+      # ── ICP 质量闸门 ─────────────────────────────────────────────────
+      # soft     → 只丢 industry_match=none（默认）；保留 low（相邻行业真实进口商）
+      # balanced → 丢 low+none（过于激进，量损失 30-40%，不建议）
+      # off      → 全量进 L1
+      - key: ICP_MATCH_THRESHOLD
+        value: "soft"
       - key: PLAYWRIGHT_TIMEOUT
         value: "12000"
       - key: STEP3_PAGE_CONCURRENCY
