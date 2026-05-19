@@ -9,6 +9,8 @@ const {
   releaseStaleClaims,
   claimNextDiscoveryJob,
 } = require('./v8_zhimao_contract');
+const { readFunnelDoc, deleteFunnelFile } = require('./v8_lib_funnel');
+const { processEnrichmentBatch } = require('./v8_lib_enrichment_supabase');
 
 // Self-heal: ensure Playwright Chromium binary is present before the first job runs.
 // Render's build and runtime filesystems are separate; the browser cache from buildCommand
@@ -132,6 +134,17 @@ function makeCancelWatcher(jobId) {
   return { promise, cleanup, get triggered() { return cancelled; } };
 }
 
+function mergeDomainBlacklist(policies) {
+  const hosts = new Set();
+  for (const row of (policies || [])) {
+    for (const d of (row?.domain_blacklist || [])) {
+      const h = String(d || '').toLowerCase().replace(/^www\./, '');
+      if (h) hosts.add(h);
+    }
+  }
+  return [...hosts];
+}
+
 function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, reweightPolicies = []) {
   return new Promise((resolve) => {
     // 提取 Pillar 0 产业链扩展结果（由 zhimao interpret → expand-query 生成）
@@ -140,6 +153,7 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
       ? meta.action_payload
       : null;
     const pillar0Json = pillar0 ? JSON.stringify(pillar0) : '';
+    const domainBlacklist = mergeDomainBlacklist(reweightPolicies);
 
     const child = spawn(
       'node',
@@ -154,6 +168,7 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
           DISCOVERY_PARENT_JOB_ID: meta.parent_job_id ? String(meta.parent_job_id) : '',
           DISCOVERY_ACTION_TYPE: meta.action_type ? String(meta.action_type) : 'new_search',
           DISCOVERY_REWEIGHT_JSON: JSON.stringify(Array.isArray(reweightPolicies) ? reweightPolicies : []),
+          DISCOVERY_DOMAIN_BLACKLIST: JSON.stringify(domainBlacklist),
           PILLAR0_PAYLOAD: pillar0Json,
         },
       },
@@ -285,6 +300,14 @@ async function main() {
       await writeHeartbeat();
 
       await releaseStaleClaims(supabase, 900);
+      try {
+        const eq = await processEnrichmentBatch(supabase, 5);
+        if (eq.processed > 0) {
+          console.log(`[worker] enrichment_queue processed=${eq.processed}`);
+        }
+      } catch (e) {
+        console.warn('[worker] enrichment_queue tick failed:', e?.message || e);
+      }
       const claim = await claimNextDiscoveryJob(supabase);
       if (!claim.ok) {
         await sleep(POLL_MS);
@@ -328,9 +351,20 @@ async function main() {
         continue;
       }
 
-      // exit(2) = no new data this sweep — still mark done, update sweep_count
+      // exit(2) = no new data this sweep — mark done 但 completion_reason=completed_empty
+      let completionReason = 'success';
       if (exitCode === PIPELINE_EXIT.NO_DATA) {
+        completionReason = 'completed_empty';
         console.log(`[worker] job ${job.id} sweep=${sweepCount}: no new data (graceful stop).`);
+      }
+
+      const funnelDoc = readFunnelDoc(job.id);
+      if (funnelDoc) {
+        await supabase
+          .from('discovery_jobs')
+          .update({ funnel_json: funnelDoc })
+          .eq('id', job.id);
+        deleteFunnelFile(job.id);
       }
 
       // 补报中间 stage：流水线（step1-5）以黑盒子进程运行，这里在 markDone 前
@@ -341,7 +375,10 @@ async function main() {
       // 更新 sweep_count 方便下轮深分页
       await supabase
         .from('discovery_jobs')
-        .update({ sweep_count: sweepCount })
+        .update({
+          sweep_count: sweepCount,
+          completion_reason: completionReason,
+        })
         .eq('id', job.id);
 
       await markDone(job);

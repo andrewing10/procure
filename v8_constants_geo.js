@@ -32,6 +32,10 @@ const MAJOR_CITIES = {
   CL: ['Santiago', 'Valparaíso', 'Concepción', 'Antofagasta', 'Viña del Mar'],
   CO: ['Bogotá', 'Medellín', 'Cali', 'Barranquilla', 'Cartagena'],
   PE: ['Lima', 'Arequipa', 'Trujillo', 'Chiclayo', 'Piura'],
+  CN: ['Shanghai', 'Guangzhou', 'Shenzhen', 'Beijing', 'Chengdu'],
+  TW: ['Taipei', 'Kaohsiung', 'Taichung', 'Tainan', 'Hsinchu'],
+  HK: ['Hong Kong'],
+  MO: ['Macau'],
 };
 
 /** 首波抓取矩阵支持的 6 个平台（Pillar 映射见 PLATFORM_PILLAR_MAP.md）。 */

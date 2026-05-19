@@ -10,8 +10,20 @@ const {
   resolveCitiesForRun,
   isPlatformEnabled,
   readIndustryHintFromEnv,
+  readConvoControlsFromEnv,
   getIndustryAnchor,
 } = require('./v8_constants_geo');
+const {
+  readFullPillar0Payload,
+  readInlineSeeds,
+  buildQuerySubjects,
+  quoteSubject,
+  pickSubject,
+  collectBooleanQueries,
+  collectProcurementQueries,
+  sanitizeDiscoveryCategory,
+} = require('./v8_lib_pillar0');
+const { appendFunnelStep } = require('./v8_lib_funnel');
 const { extractSocialUrlsFromText } = require('./v8_lib_social_extract');
 const { getIndustryHint, DEFAULT_PLACE_BLACKLIST } = require('./v8_icp_taxonomy');
 
@@ -187,11 +199,35 @@ function filterByPlaceTypeBlacklist(placesRaw, blacklist) {
   });
 }
 
+/** mapTypes 正向偏好：命中 segment.mapTypes 的 Places 结果排在前面 */
+function rankPlacesByMapTypes(placesRaw, mapTypes) {
+  if (!Array.isArray(placesRaw) || placesRaw.length === 0) return placesRaw;
+  if (!Array.isArray(mapTypes) || mapTypes.length === 0) return placesRaw;
+  const prefer = new Set(mapTypes.map((t) => String(t || '').toLowerCase()));
+  const score = (p) => {
+    const types = Array.isArray(p.types) ? p.types : [];
+    return types.some((t) => prefer.has(String(t || '').toLowerCase())) ? 1 : 0;
+  };
+  return [...placesRaw].sort((a, b) => score(b) - score(a));
+}
+
+function leadMatchesKeywordSuppress(lead, suppressList) {
+  if (!Array.isArray(suppressList) || suppressList.length === 0) return false;
+  const text = `${lead.title || ''} ${lead.snippet || ''}`.toLowerCase();
+  return suppressList.some((kw) => {
+    const k = String(kw || '').trim().toLowerCase();
+    return k.length > 1 && text.includes(k);
+  });
+}
+
 // P1 Pillar 专用：先走 Google Places 原生，失败回 Serper /places
-async function fetchPlacesWithFallback(query, gl, placeTypeBlacklist) {
+async function fetchPlacesWithFallback(query, gl, placeTypeBlacklist, mapTypesPrefer) {
   const native = await fetchGooglePlacesNative(query, gl).catch(() => null);
   if (native && native.length > 0) {
-    const filtered = filterByPlaceTypeBlacklist(native, placeTypeBlacklist || []);
+    const filtered = rankPlacesByMapTypes(
+      filterByPlaceTypeBlacklist(native, placeTypeBlacklist || []),
+      mapTypesPrefer || [],
+    );
     return filtered.map(p => ({
       title:       p.name || '',
       website:     p.website || '',
@@ -275,14 +311,22 @@ function getVerifiedSources() {
 // 性能：原来 ~10 次 Serper 调用串行 ≈ 30-60s，现在全并行 ≈ 1-3s（取最慢一路）
 async function run() {
   const data = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
-  // categoryClean 由 step0 净化（去掉"买家/buyers in X"等干扰词），用于构建搜索 query；
-  // 原始 category 仅保留供日志/元数据使用。
+  const pillar0Payload = readFullPillar0Payload();
+  // categoryClean 由 step0 净化；再与 PILLAR0 兜底净化保持单源语义
   const { baseQuery, countryName, tld } = data;
-  const category = data.categoryClean || data.category;
+  const category = data.categoryClean || sanitizeDiscoveryCategory(data.category || '');
   const cc   = countryCode || '';
   const year = new Date().getFullYear();
   const controls = loadReweightControls();
+  const convo = readConvoControlsFromEnv();
+  const allKeywordSuppress = [...new Set([
+    ...controls.keywordSuppress,
+    ...(convo.negativeKeywords || []),
+  ])];
   console.log('[step1] reweight controls:', JSON.stringify(controls));
+  if (baseQuery) {
+    console.log(`[step0] baseQuery available (${baseQuery.slice(0, 100)}…) — boolean/procurement pillars will execute it`);
+  }
 
   // ── 买家抓取矩阵（Batch 3）：解析 PILLAR0_PAYLOAD.matrix ──────────────────
   // matrix.cities       → maps 类 pillar 多城市循环（空=按国家级 query 兼容老路径）
@@ -326,6 +370,9 @@ async function run() {
       if (industryHint.category_key && industryHint.category_key !== 'other') tries.push(industryHint.category_key);
     }
     tries.push(category);
+    for (const ov of (convo.icpOverrides || [])) {
+      if (ov) tries.unshift(ov);
+    }
     for (const k of tries) {
       const a = getIndustryAnchor(k);
       if (a) { industryAnchor = a; break; }
@@ -342,7 +389,17 @@ async function run() {
   // 取主 anchor（首选 EN，作为 P1 maps / P3 jobs / P11 LinkedIn 的核心 query 词）
   const anchorPrimary = industryAnchor && industryAnchor.en[0] ? industryAnchor.en[0] : '';
   const anchorAlt     = industryAnchor && industryAnchor.en[1] ? industryAnchor.en[1] : '';
-  const anchorAll     = industryAnchor ? [...industryAnchor.en, ...industryAnchor.zh].slice(0, 6) : [];
+  const mapTypesPrefer = industryAnchor && industryAnchor.mapTypes ? industryAnchor.mapTypes : [];
+
+  const querySubjects = buildQuerySubjects(data, category, industryAnchor, pillar0Payload);
+  const OQ = quoteSubject(pickSubject(querySubjects, category, SEARCH_PAGE));
+  const rot = (off) => pickSubject(querySubjects, category, SEARCH_PAGE + (off || 0));
+  const organicNum = controls.weights.generic < 0.5 ? 10 : (controls.weights.generic >= 1.2 ? 30 : 20);
+  const booleanQueries = collectBooleanQueries(data, pillar0Payload);
+  const procurementQueries = collectProcurementQueries(data, pillar0Payload);
+  if (querySubjects.length > 1) {
+    console.log(`[step1] querySubjects(${querySubjects.length}): ${querySubjects.slice(0, 4).join(' | ')}…`);
+  }
 
   // ── Pillar 定义（每个 Pillar 都是一个 Promise，全部同时启动） ──────────────
   //
@@ -359,6 +416,16 @@ async function run() {
     //    finalize 路径将 status 标记为 consumed（避免 Step1 内重复跑 query 而 mark 过早）。
     p0_seed: (async () => {
       const out = [];
+      const inline = readInlineSeeds(pillar0Payload);
+      for (const u of [...inline.social_urls, ...inline.company_urls]) {
+        out.push({
+          title: u,
+          link: u,
+          snippet: 'Inline seed from submit action_payload.seeds',
+          pillar: 'Pillar 0 Seed',
+          intent_signal: 'USER_SEED_INLINE',
+        });
+      }
       try {
         if (fs.existsSync('zhimao_seed_intelligence.json')) {
           const seeds = JSON.parse(fs.readFileSync('zhimao_seed_intelligence.json', 'utf8'));
@@ -416,6 +483,38 @@ async function run() {
       return out;
     })(),
 
+  // ── Pillar0 布尔查询（expand-query boolean_queries / step0 落盘）──────────
+    p_pillar0_boolean: (async () => {
+      const queries = booleanQueries.length > 0
+        ? booleanQueries
+        : (baseQuery ? [baseQuery] : []);
+      if (!queries.length) return [];
+      const pages = await Promise.all(
+        queries.slice(0, 5).map((bq) => searchOrganicMultiPage(bq, cc, organicNum).catch(() => [])),
+      );
+      return pages.flat().map((o) => ({
+        title: o.title,
+        link: o.link,
+        snippet: o.snippet,
+        pillar: 'Pillar 0 Boolean',
+        intent_signal: 'PILLAR0_BOOLEAN',
+      }));
+    })(),
+
+    p_procurement: (async () => {
+      if (!procurementQueries.length) return [];
+      const pages = await Promise.all(
+        procurementQueries.map((pq) => searchOrganicMultiPage(pq, cc, organicNum).catch(() => [])),
+      );
+      return pages.flat().map((o) => ({
+        title: o.title,
+        link: o.link,
+        snippet: o.snippet,
+        pillar: 'Pillar Procurement',
+        intent_signal: 'PROCUREMENT_QUERY',
+      }));
+    })(),
+
     // ── P1: Google Maps/Places（最可靠买家信号：业务类型注册为进口商/批发商） ─
     // 返回真实公司网站，命中率最高。
     // 深分页策略：Places 不支持 page 参数，改用 query 轮换（SEARCH_PAGE 奇偶 / 不同身份词）
@@ -430,13 +529,14 @@ async function run() {
           : (SEARCH_PAGE % 2 === 0
               ? 'procurement manager OR buyer OR purchasing'
               : 'wholesaler OR distributor OR importer');
-        return city ? `${category} ${anchorTerm} "${city}" ${countryName}` : `${category} ${anchorTerm} ${countryName}`;
+        const subj = rot(0);
+        return city ? `${subj} ${anchorTerm} "${city}" ${countryName}` : `${subj} ${anchorTerm} ${countryName}`;
       };
       const queries = mapsCities.length > 0
         ? mapsCities.map((city) => ({ city, q: buildQ(city) }))
         : [{ city: null, q: buildQ(null) }];
       const arrs = await Promise.all(queries.map(({ city, q }) =>
-        fetchPlacesWithFallback(q, cc, placeTypeBlacklist).then((ps) => ps.map((p) => ({ ...p, _city: city })))
+        fetchPlacesWithFallback(q, cc, placeTypeBlacklist, mapTypesPrefer).then((ps) => ps.map((p) => ({ ...p, _city: city })))
       ));
       const seen = new Set();
       return arrs.flat()
@@ -469,7 +569,7 @@ async function run() {
         ? mapsCities.map((city) => ({ city, q: buildQ(city) }))
         : [{ city: null, q: buildQ(null) }];
       const arrs = await Promise.all(queries.map(({ city, q }) =>
-        fetchPlacesWithFallback(q, cc, placeTypeBlacklist).then((ps) => ps.map((p) => ({ ...p, _city: city })))
+        fetchPlacesWithFallback(q, cc, placeTypeBlacklist, mapTypesPrefer).then((ps) => ps.map((p) => ({ ...p, _city: city })))
       ));
       const seen = new Set();
       return arrs.flat()
@@ -490,13 +590,13 @@ async function run() {
     // ── P2: 公司官网直接搜索（在目标国TLD下找自述为进口商/批发商的公司） ─────
     // 关键：用 site:.vn 等TLD直接找公司网站，不找聚合站
     p2_direct_importer: searchOrganicMultiPage(
-      `"${category}" (importer OR wholesaler OR distributor) ${tld} -site:alibaba.com -site:made-in-china.com`,
-      cc
+      `${OQ} (importer OR wholesaler OR distributor) ${tld} -site:alibaba.com -site:made-in-china.com`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 2 Direct', 'SELF_DECLARED_IMPORTER')),
 
     p2_sourcing_intent: searchOrganicMultiPage(
-      `"${category}" ("we import" OR "we source" OR "our suppliers" OR "looking for supplier" OR "wanted suppliers") ${tld}`,
-      cc
+      `${OQ} ("we import" OR "we source" OR "our suppliers" OR "looking for supplier" OR "wanted suppliers") ${tld}`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 2 Direct', 'ACTIVE_SOURCING')),
 
     // ── P3: 采购招聘信号（最可靠的买家信号之一：招采购经理 = 一定在采购）  ────
@@ -507,69 +607,69 @@ async function run() {
       // Batch D.1：把 anchor 词加进 query，避免"procurement manager"拉到金融/IT 招聘
       anchorPrimary
         ? `"${anchorPrimary}" "procurement manager" OR "category manager" OR "buyer" job ${tld}`
-        : `"${category}" ("procurement manager" OR "import manager" OR "sourcing manager" OR "purchasing manager") job ${tld}`,
-      cc
+        : `${OQ} ("procurement manager" OR "import manager" OR "sourcing manager" OR "purchasing manager") job ${tld}`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 3 Jobs', 'PROCUREMENT_HIRING')),
 
     p3_jobs_buyer: searchOrganicMultiPage(
       anchorPrimary
         ? `"${anchorPrimary}" buyer job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`
-        : `"${category}" ("buyer" OR "import buyer" OR "commercial buyer") job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`,
-      cc
+        : `${OQ} ("buyer" OR "import buyer" OR "commercial buyer") job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 3 Jobs', 'BUYER_HIRING')),
 
     // ── P4: 主动询盘意图（RFQ / 供应商征集 — 最明确的买家自我标识） ──────────
     p4_rfq: searchOrganicMultiPage(
-      `"${category}" (RFQ OR "request for quotation" OR "request for proposal" OR "tender" OR "供应商征集") ${tld}`,
-      cc
+      `${OQ} (RFQ OR "request for quotation" OR "request for proposal" OR "tender" OR "供应商征集") ${tld}`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 4 Intent', 'RFQ_POSTED')),
 
     p4_sourcing_post: searchOrganicMultiPage(
-      `"${category}" ("looking for manufacturers" OR "need factory" OR "sourcing from China" OR "procurement notice") ${countryName}`,
-      cc
+      `${OQ} ("looking for manufacturers" OR "need factory" OR "sourcing from China" OR "procurement notice") ${countryName}`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 4 Intent', 'SOURCING_POST')),
 
     // ── P5: 政府采购/招标（机构采购商，预算确定，信号最强） ─────────────────
     p5_tenders: searchOrganicMultiPage(
-      `"${category}" (tender OR RFP OR "request for proposal" OR procurement) (${tld} OR site:.gov.${cc})`,
-      cc
+      `${OQ} (tender OR RFP OR "request for proposal" OR procurement) (${tld} OR site:.gov.${cc})`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 5 Tenders', 'GOV_PROCUREMENT')),
 
     // ── P6: 行业协会与进口商目录（结构化来源） ─────────────────────────────
     // 修复说明：原来搜 "exhibitor list"（展商名录）找到的是卖家不是买家。
     // 改为：搜买家参观/注册信息，或进口商协会会员名录
     p6_buyer_assoc: searchOrganicMultiPage(
-      `"${category}" importers association OR buyers club OR "member directory" ${countryName}`,
-      cc
+      `${OQ} importers association OR buyers club OR "member directory" ${countryName}`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 6 Association', 'ASSOCIATION_MEMBER')),
 
     p6_trade_show_buyer: searchOrganicMultiPage(
-      `"${category}" ("buyer visitor" OR "visitor registration" OR "trade visitors" OR "buying mission") ${year} ${countryName}`,
-      cc
+      `${OQ} ("buyer visitor" OR "visitor registration" OR "trade visitors" OR "buying mission") ${year} ${countryName}`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 6 Association', 'TRADE_SHOW_BUYER')),
 
     // ── P7: 海关/贸易信号（真实进口行为，数据最权威） ───────────────────────
     // 修复说明：原来 site:importyeti.com 等结果 URL 在垃圾名单被全过滤。
     // 新策略：搜"含海关关键词的公司页面"（返回公司官网，而不是聚合站）
     p7_customs_direct: searchOrganicMultiPage(
-      `"${category}" ("import" OR "importer of record" OR "customs entry" OR "HS code" OR "HTS") ${tld} company`,
-      cc
+      `${OQ} ("import" OR "importer of record" OR "customs entry" OR "HS code" OR "HTS") ${tld} company`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 7 Customs', 'CUSTOMS_SIGNAL')),
 
     p7_bol_signal: searchOrganicMultiPage(
-      `"${category}" ("bill of lading" OR "海运提单" OR "شحنة" OR "connaissement") importer "${countryName}"`,
-      cc
+      `${OQ} ("bill of lading" OR "海运提单" OR "شحنة" OR "connaissement") importer "${countryName}"`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 7 Customs', 'BOL_SIGNAL')),
 
     // ── P8: 电商买家信号（B2B电商平台上的买家侧入口） ────────────────────────
     p8_b2b_buyer: searchOrganicMultiPage(
-      `"${category}" buyer OR "trade buyer" OR "retail buyer" ${countryName} -site:alibaba.com -site:made-in-china.com -site:globalsources.com`,
-      cc
+      `${OQ} buyer OR "trade buyer" OR "retail buyer" ${countryName} -site:alibaba.com -site:made-in-china.com -site:globalsources.com`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 8 B2B', 'B2B_BUYER')),
 
     p8_ecommerce_import: searchOrganicMultiPage(
-      `"${category}" ("private label" OR "OEM buyer" OR "contract manufacturing") ${countryName}`,
-      cc
+      `${OQ} ("private label" OR "OEM buyer" OR "contract manufacturing") ${countryName}`,
+      cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 8 B2B', 'PRIVATE_LABEL')),
 
     // ── P10: 区域专属高壁垒数据源定向搜索 ─────────────────────────────────────
@@ -593,11 +693,11 @@ async function run() {
       return Promise.all(
         applicableSources.map(src => {
           // 把 search_strategy 模板里的 ${category} 替换为实际品类
-          const q = (src.search_strategy || `site:${src.domain} "${category}"`)
+          const q = (src.search_strategy || `site:${src.domain} ${OQ}`)
             .replace(/\$\{category\}/g, category)
             .replace(/\$\{countryName\}/g, countryName);
 
-          return searchOrganicMultiPage(q, cc, 20).then(r =>
+          return searchOrganicMultiPage(q, cc, organicNum).then(r =>
             r.map(o => ({
               ...o,
               pillar:                  'Pillar 10 VerifiedSource',
@@ -621,7 +721,7 @@ async function run() {
       // 落到具体行业（"wholesale cosmetics" 比 "护肝片" 更易命中决策人 profile）
       anchorPrimary
         ? `site:linkedin.com/in "${anchorPrimary}" ("Procurement Director" OR "Category Manager" OR "Sourcing Manager" OR "Head of Purchasing") ${countryName}`
-        : `site:linkedin.com/in "${category}" ("Procurement Director" OR "Category Manager" OR "Sourcing Manager" OR "Import Manager" OR "Head of Purchasing") ${countryName}`,
+        : `site:linkedin.com/in ${OQ} ("Procurement Director" OR "Category Manager" OR "Sourcing Manager" OR "Import Manager" OR "Head of Purchasing") ${countryName}`,
       cc, 20
     ).then(r => r.map(o => ({
       title:         o.title,
@@ -638,9 +738,9 @@ async function run() {
     p_yellowpages: (async () => {
       const cityClause = mapsCities.length > 0 ? ` ("${mapsCities.slice(0, 3).join('" OR "')}")` : '';
       // Batch D.1：anchor 命中时把品类原文换成业态短语，避免黄页站把无关行业拉进来
-      const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
+      const subject = anchorPrimary ? `"${anchorPrimary}"` : `${OQ}`;
       const q = `(site:yellowpages.com OR site:yelp.com OR site:europages.com OR site:kompass.com) ${subject} ${countryName}${cityClause}`;
-      const r = await searchOrganicMultiPage(q, cc, 20);
+      const r = await searchOrganicMultiPage(q, cc, organicNum);
       return r.map((o) => ({
         title: o.title, link: o.link, snippet: o.snippet,
         pillar: 'Pillar Yellow', intent_signal: 'YP_LISTING',
@@ -649,9 +749,9 @@ async function run() {
 
     p_facebook_public: (async () => {
       const cityClause = mapsCities.length > 0 ? ` ("${mapsCities.slice(0, 3).join('" OR "')}")` : '';
-      const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
+      const subject = anchorPrimary ? `"${anchorPrimary}"` : `${OQ}`;
       const q = `site:facebook.com ${subject} (buyer OR distributor OR importer OR wholesale) ${countryName}${cityClause}`;
-      const r = await searchOrganicMultiPage(q, cc, 20);
+      const r = await searchOrganicMultiPage(q, cc, organicNum);
       return r.map((o) => ({
         title: o.title, link: null, snippet: o.snippet,
         pillar: 'Pillar FB Public', intent_signal: 'FB_PUBLIC_PROFILE',
@@ -662,9 +762,9 @@ async function run() {
     })(),
 
     p_youtube_about: (async () => {
-      const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
+      const subject = anchorPrimary ? `"${anchorPrimary}"` : `${OQ}`;
       const q = `site:youtube.com (inurl:about OR inurl:c OR inurl:@) ${subject} (company OR brand OR official) ${countryName}`;
-      const r = await searchOrganicMultiPage(q, cc, 20);
+      const r = await searchOrganicMultiPage(q, cc, organicNum);
       return r.map((o) => ({
         title: o.title, link: null, snippet: o.snippet,
         pillar: 'Pillar YT About', intent_signal: 'YT_ABOUT',
@@ -674,9 +774,9 @@ async function run() {
     })(),
 
     p_x_public: (async () => {
-      const subject = anchorPrimary ? `"${anchorPrimary}"` : `"${category}"`;
+      const subject = anchorPrimary ? `"${anchorPrimary}"` : `${OQ}`;
       const q = `(site:x.com OR site:twitter.com) ${subject} (buyer OR import OR procurement) ${countryName}`;
-      const r = await searchOrganicMultiPage(q, cc, 20);
+      const r = await searchOrganicMultiPage(q, cc, organicNum);
       return r.map((o) => ({
         title: o.title, link: null, snippet: o.snippet,
         pillar: 'Pillar X Public', intent_signal: 'X_PUBLIC',
@@ -706,8 +806,8 @@ async function run() {
         return Promise.all(
           relevant.map(seed =>
             searchOrganicMultiPage(
-              `"${category}" companies like "${seed.company_name}" OR competitors "${seed.company_name}" ${countryName} importer wholesaler`,
-              cc, 20
+              `${OQ} companies like "${seed.company_name}" OR competitors "${seed.company_name}" ${countryName} importer wholesaler`,
+              cc, organicNum
             ).then(r => r.map(o => ({
               ...o, pillar: 'Pillar 9 Lookalike',
               intent_signal: 'LOOKALIKE', seed_company: seed.company_name,
@@ -717,6 +817,26 @@ async function run() {
       } catch { return []; }
     }),
   };
+
+  if (controls.weights.generic < 0.35) {
+    const organicKeys = [
+      'p2_direct_importer', 'p2_sourcing_intent', 'p3_jobs_procurement', 'p3_jobs_buyer',
+      'p4_rfq', 'p4_sourcing_post', 'p5_tenders', 'p6_buyer_assoc', 'p6_trade_show_buyer',
+      'p7_customs_direct', 'p7_bol_signal', 'p8_b2b_buyer', 'p8_ecommerce_import',
+      'p10_verified_sources', 'p9_lookalike',
+    ];
+    organicKeys.forEach((k) => { delete pillarPromises[k]; });
+    console.log('[step1] Organic pillars OFF (generic weight < 0.35)');
+  }
+  if (controls.weights.geo < 0.35) {
+    delete pillarPromises.p1_maps_dist;
+    delete pillarPromises.p1_maps_trading;
+    console.log('[step1] Maps pillars OFF (geo weight < 0.35)');
+  }
+  if (controls.weights.contact < 0.35) {
+    delete pillarPromises.p_yellowpages;
+    console.log('[step1] Yellowpages OFF (contact weight < 0.35)');
+  }
 
   if (controls.disableLinkedin) {
     delete pillarPromises.p11_linkedin_decision;
@@ -743,7 +863,7 @@ async function run() {
 
   // ── 全并行执行（等最慢的那一路） ──────────────────────────────────────────
   const depthLabel = SEARCH_PAGE === 1 ? '浅层(p1)' : `深水区(p${SEARCH_PAGE} ≈ 第${(SEARCH_PAGE-1)*20+1}-${SEARCH_PAGE*20}条)`;
-  console.log(`[step1] Launching ${Object.keys(pillarPromises).length} pillars in parallel for "${category}" in ${countryName} [${depthLabel}]...`);
+  console.log(`[step1] Launching ${Object.keys(pillarPromises).length} pillars in parallel for ${OQ} in ${countryName} [${depthLabel}]...`);
   if (controls._policyCount > 0) {
     console.log(`[step1] Active policies: ${controls._policyCount}, weights:`, JSON.stringify(controls.weights));
   }
@@ -774,7 +894,12 @@ async function run() {
   // 构建策略域名黑名单 Set（O(1) 查找）
   const blacklistSet = new Set(controls.domainBlacklist.map(d => d.toLowerCase()));
 
+  let suppressDropped = 0;
   let filteredLeads = allLeads.filter(l => {
+    if (leadMatchesKeywordSuppress(l, allKeywordSuppress)) {
+      suppressDropped += 1;
+      return false;
+    }
     if (isJunkLead(l)) return false;
     // 策略域名黑名单过滤
     if (blacklistSet.size > 0 && l.link) {
@@ -816,8 +941,22 @@ async function run() {
   const pillarStats = {};
   filteredLeads.forEach(l => { pillarStats[l.pillar] = (pillarStats[l.pillar] || 0) + 1; });
 
-  console.log(`[step1] Done in ${Date.now() - startedAt}ms. Total=${filteredLeads.length} (junk_filtered=${junkCount})`);
+  console.log(`[step1] Done in ${Date.now() - startedAt}ms. Total=${filteredLeads.length} (junk_filtered=${junkCount}, suppress_dropped=${suppressDropped})`);
   console.log(`[step1] Pillar distribution:`, JSON.stringify(pillarStats, null, 2));
+
+  const jobId = process.env.DISCOVERY_JOB_ID || '';
+  if (jobId) {
+    appendFunnelStep(jobId, 'step1', {
+      before_filter: beforeFilter,
+      after_filter: filteredLeads.length,
+      junk_filtered: junkCount,
+      suppress_dropped: suppressDropped,
+      pillar_stats: pillarStats,
+      organic_num: organicNum,
+      boolean_queries: booleanQueries.length,
+      procurement_queries: procurementQueries.length,
+    });
+  }
 
   fs.writeFileSync(outputFile, JSON.stringify(filteredLeads, null, 2));
 }

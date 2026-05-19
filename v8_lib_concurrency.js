@@ -317,15 +317,36 @@ function isNewsDomain(link) {
     return false;
 }
 
+function loadDomainBlacklistFromEnv() {
+    const raw = process.env.DISCOVERY_DOMAIN_BLACKLIST || '[]';
+    try {
+        const arr = JSON.parse(raw);
+        return Array.isArray(arr)
+            ? arr.map((d) => String(d || '').toLowerCase().replace(/^www\./, '')).filter(Boolean)
+            : [];
+    } catch {
+        return [];
+    }
+}
+
 function preFilterRawLeads(rawItems) {
     if (!Array.isArray(rawItems)) return { kept: [], dropped: 0, reasons: {} };
     const kept = [];
-    const reasons = { listicle: 0, platform: 0, cn_supplier: 0, no_signal: 0, news_media: 0, closed_biz: 0 };
+    const domainBlacklist = loadDomainBlacklistFromEnv();
+    const blacklistSet = new Set(domainBlacklist);
+    const reasons = { listicle: 0, platform: 0, cn_supplier: 0, no_signal: 0, news_media: 0, closed_biz: 0, policy_domain: 0 };
     for (const r of rawItems) {
         const title = String(r.title || '').trim();
         const snippet = String(r.snippet || '').trim();
         const link = String(r.link || '').toLowerCase();
         const combined = `${title} ${snippet}`;
+
+        if (blacklistSet.size > 0 && link) {
+            try {
+                const host = new URL(link.startsWith('http') ? link : `https://${link}`).hostname.toLowerCase().replace(/^www\./, '');
+                if (blacklistSet.has(host)) { reasons.policy_domain += 1; continue; }
+            } catch { /* ignore */ }
+        }
 
         if (!title && !snippet) { reasons.no_signal += 1; continue; }
         if (LISTICLE_RE.test(title) || LISTICLE_RE.test(snippet)) { reasons.listicle += 1; continue; }

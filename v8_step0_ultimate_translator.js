@@ -101,6 +101,7 @@ async function run() {
     let pillar0Keywords = [];
     let pillar0Personas = [];
     let pillar0BooleanQueries = [];
+    let procurementQueries = [];
     try {
         const raw = process.env.PILLAR0_PAYLOAD;
         if (raw && raw.trim().startsWith('{')) {
@@ -115,7 +116,10 @@ async function run() {
                     .slice(0, 8);
             }
             if (Array.isArray(p0.boolean_queries) && p0.boolean_queries.length > 0) {
-                pillar0BooleanQueries = p0.boolean_queries.slice(0, 3);
+                pillar0BooleanQueries = p0.boolean_queries.slice(0, 5);
+            }
+            if (Array.isArray(p0.procurement_queries) && p0.procurement_queries.length > 0) {
+                procurementQueries = p0.procurement_queries.slice(0, 6);
             }
             if (pillar0Keywords.length > 0 || pillar0Personas.length > 0) {
                 console.log(`[step0] Pillar 0 payload loaded: ${pillar0Keywords.length} keywords, ${pillar0Personas.length} personas`);
@@ -245,6 +249,7 @@ Return ONLY valid JSON with this exact structure:
         // 传递 Pillar 0 原始数据给后续步骤备用
         pillar0Keywords: pillar0Keywords.length > 0 ? pillar0Keywords : undefined,
         pillar0BooleanQueries: pillar0BooleanQueries.length > 0 ? pillar0BooleanQueries : undefined,
+        procurementQueries: procurementQueries.length > 0 ? procurementQueries : undefined,
     }, null, 2));
     console.log(`[step0] Orchestration written → ${outputFile}`);
 }

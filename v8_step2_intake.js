@@ -1,6 +1,7 @@
 require('./load-env');
 const fs = require('fs');
 const { pMap, callGeminiJson, preFilterRawLeads } = require('./v8_lib_concurrency');
+const { appendFunnelStep } = require('./v8_lib_funnel');
 const { isJunkName } = require('./v8_quality_gate');
 const { readIndustryHintFromEnv } = require('./v8_constants_geo');
 const { getIndustryHint: deriveIndustryHint } = require('./v8_icp_taxonomy');
@@ -215,6 +216,16 @@ async function run() {
         if (r instanceof Error) { failedBatches += 1; continue; }
         if (r?.failed) { failedBatches += 1; continue; }
         if (r?.accepted?.length) accepted.push(...r.accepted);
+    }
+
+    const jobId = process.env.DISCOVERY_JOB_ID || '';
+    if (jobId) {
+        appendFunnelStep(jobId, 'step2', {
+            raw_in: raw.length,
+            prefilter_kept: filtered.length,
+            accepted: accepted.length,
+            failed_batches: failedBatches,
+        });
     }
 
     fs.writeFileSync(outputFile, JSON.stringify(accepted, null, 2));

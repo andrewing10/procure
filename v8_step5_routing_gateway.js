@@ -14,6 +14,8 @@ const Database = require('better-sqlite3');
 const { createClient } = require('@supabase/supabase-js');
 const { directIngestQualifiedLeads } = require('./v8_direct_l1_ingest');
 const { evaluateLead } = require('./v8_quality_gate');
+const { appendFunnelStep } = require('./v8_lib_funnel');
+const { enqueueEnrichmentLeads } = require('./v8_lib_enrichment_supabase');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 
@@ -169,6 +171,8 @@ if (droppedQuality > 0) {
   );
 }
 
+const supabaseEnrichmentQueue = [];
+
 validLeads.forEach((lead) => {
   const hasContact = !!(lead.primary_email || lead.primary_phone);
   const isHot = lead.confidence_score >= 90 && hasContact;
@@ -186,6 +190,14 @@ validLeads.forEach((lead) => {
     );
   } else if (lead.domain && insertQueue) {
     insertQueue.run(lead.company_name, lead.domain, lead.country || '', lead.confidence_score);
+  } else if (lead.domain && SKIP_SQLITE && !hasContact) {
+    supabaseEnrichmentQueue.push({
+      discovery_job_id: DISCOVERY_JOB_ID,
+      company_name: lead.company_name,
+      domain: lead.domain,
+      country_iso: String(lead.country || '').slice(0, 2).toUpperCase() || null,
+      payload_json: { confidence_score: lead.confidence_score, pillar: lead.pillar },
+    });
   }
 });
 
@@ -265,8 +277,30 @@ validLeads.forEach((lead) => {
     console.log(
       `[step5] ingest ok: resolvedLeads=${result.resolvedLeads}, edgesWritten=${result.edgesWritten}`,
     );
+    if (supabaseEnrichmentQueue.length > 0) {
+      const n = await enqueueEnrichmentLeads(supabase, supabaseEnrichmentQueue);
+      if (n > 0) console.log(`[step5] Supabase enrichment_queue: +${n} rows`);
+    }
+    if (DISCOVERY_JOB_ID) {
+      appendFunnelStep(DISCOVERY_JOB_ID, 'step5', {
+        total_in: totalLeads,
+        valid_leads: validLeads.length,
+        l1_resolved: result.resolvedLeads,
+        dropped_quality: droppedQuality,
+        grade_stats: gradeStats,
+        icp_stats: icpStats,
+        enrichment_queued: supabaseEnrichmentQueue.length,
+      });
+    }
   } else {
     console.log('[step5] No valid leads to persist.');
+    if (DISCOVERY_JOB_ID) {
+      appendFunnelStep(DISCOVERY_JOB_ID, 'step5', {
+        total_in: totalLeads,
+        valid_leads: 0,
+        dropped_quality: droppedQuality,
+      });
+    }
   }
   fs.writeFileSync(outputFile, JSON.stringify({ status: 'success', db_injected: validLeads.length }, null, 2));
   console.log(`[step5] Done → ${outputFile}`);
