@@ -385,8 +385,16 @@ function computeQualityGrade({
     const hasPhone = Boolean(primaryPhone && primaryPhone.trim() && primaryPhone.replace(/\D/g, '').length >= 6);
     const hasContact = hasRealDomain || hasEmail || hasPhone;
 
-    // C3：有采购信号时放宽联系方式要求（信号证明了商业存在）
-    if (!hasContact && procurementSignalCount <= 0) return 'unqualified';
+    // ── 根切修改（2026-05-20）─────────────────────────────────────────
+    // 旧规则："hasContact || procurementSignalCount > 0" → 只要有任何信号就放过 contact 全空的行
+    //         → 用户看到"信息薄 0 + 优质 30 分"的欺骗卡
+    // 新规则：**必须 hasContact 才能 qualified/premium**。
+    //   - 配合 v8_lib_contact_enricher.js 的 5 层兜底（首页→代理→BFS→LLM→Serper），
+    //     真实可触达的公司应当能 95%+ 抓到至少一个 contact 字段。
+    //   - 抓不到的 → unqualified 不进 L1，不污染 zhimao 买家池。
+    //   - procurementSignalCount 仍参与 premium 升级判定（C3 信号 ≥2 + 主域名 → premium），
+    //     但**不再当作放过 contact 缺失的免死金牌**。
+    if (!hasContact) return 'unqualified';
 
     // 第三关：L3 推断置信度（有时不存在，跳过）
     if (confidenceTier !== undefined && confidenceTier !== null) {

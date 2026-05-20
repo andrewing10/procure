@@ -5,6 +5,7 @@ const cheerio = require('cheerio');
 const { pMap, callGeminiJson } = require('./v8_lib_concurrency');
 const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
 const { extractSocialUrls } = require('./v8_lib_social_extract');
+const { enrichContactsForLead } = require('./v8_lib_contact_enricher');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 const SKIP_L3_INFERENCE = process.env.SKIP_L3_INFERENCE === 'true';
@@ -481,6 +482,41 @@ async function extractContactForLead(lead, contexts) {
         score = Math.min(score, 85);
     }
     lead.confidence_score = Math.min(score, 100);
+
+    // ─── 5 层兜底 enricher（仅在 Playwright + GMaps 都空时启用） ───────────
+    // 旧实现到此为止：contact 全空就放过，下游 quality_gate 因 procurementSignalCount>0
+    // 仍放它进 L1 → 用户看到"信息薄 0 + 优质 30 分"的欺骗卡。
+    // 现接入 v8_lib_contact_enricher 的 5 层管道：直连 → 代理 → BFS → LLM → Serper
+    // 任一层抓到就回填 primary_email/primary_phone；总 budget ~30s 控成本。
+    if (!lead.primary_email && !lead.primary_phone && lead.domain) {
+        try {
+            const enr = await enrichContactsForLead({
+                domain: lead.domain,
+                company_name: lead.company_name,
+                primary_email: lead.primary_email,
+                primary_phone: lead.primary_phone,
+            });
+            if (enr.filled) {
+                if (!lead.primary_email && enr.primary_email) lead.primary_email = enr.primary_email;
+                if (!lead.primary_phone && enr.primary_phone) lead.primary_phone = enr.primary_phone;
+                if (enr.primary_whatsapp) lead.primary_whatsapp = enr.primary_whatsapp;
+                lead._enricher_via = enr.via;
+                if (enr.llm_persons && enr.llm_persons.length > 0) {
+                    lead._enricher_persons = enr.llm_persons;
+                }
+                lead.confidence_score = Math.min((lead.confidence_score || 0) + 25, 100);
+                // 写缓存避免下次重抓
+                setCachedContact(lead.domain, lead.primary_email, lead.primary_phone);
+                console.log(`[step3] 5-layer enricher filled (${enr.via}): ${lead.company_name} | ${lead.primary_email || ''} | ${lead.primary_phone || ''}`);
+            } else {
+                lead._enricher_via = enr.via; // 'no_domain' | 'none' 等
+                if (enr.any_blocked) lead._enricher_any_blocked = true;
+            }
+        } catch (e) {
+            // 兜底失败一律安静吞，不影响主链
+            console.warn(`[step3] 5-layer enricher exception for ${lead.company_name}:`, e && e.message ? e.message : String(e));
+        }
+    }
     return lead;
 }
 
