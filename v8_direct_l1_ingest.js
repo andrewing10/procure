@@ -12,7 +12,63 @@
 const { upsertJobLeadMapping } = require('./v8_zhimao_contract');
 const { inferProcurementSignalCount } = require('./v8_quality_gate');
 const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
-const { deriveL1CommerceFields } = require('@zhimao/buyer-commerce');
+// ── buyer-commerce 内联（原 @zhimao/buyer-commerce/l1Commerce.cjs）──────────
+// 跨仓 file: 依赖在 Render 单仓部署时不存在，直接内联避免运行时 MODULE_NOT_FOUND。
+const PILLAR_DEBUG_RE = /^pillar\s*\d/i;
+function _trimOrNull(v) { const s = String(v == null ? '' : v).trim(); return s || null; }
+function buildContactBundleFromL1(row) {
+  return {
+    email: _trimOrNull(row.primary_email),
+    phone: _trimOrNull(row.primary_phone),
+    website: _trimOrNull(row.domain),
+    address: _trimOrNull(row.snippet) || _trimOrNull(row.city),
+    maps_place_id: _trimOrNull(row.place_id),
+  };
+}
+function contactabilityFromL1Bundle(bundle, row = {}) {
+  let s = 0;
+  if (bundle.website) s += 30;
+  if (bundle.email)   s += 20;
+  if (bundle.phone)   s += 10;
+  if (bundle.maps_place_id || bundle.address) s += 20;
+  if (Number(row.procurement_score ?? 0) > 0) s += 10;
+  return Math.min(100, Math.max(0, s));
+}
+function inferDataArchetypeFromL1(bundle, row = {}) {
+  const via = String(row.discovered_via ?? '').toLowerCase();
+  if (via.includes('maps') || via.includes('yellowpages') || via.includes('places')) return 'local_entity';
+  if (Number(row.procurement_score ?? 0) >= 40) return 'trade_intel';
+  if (bundle.email) return 'contact_graph';
+  if (bundle.phone) return 'local_entity';
+  return 'contact_graph';
+}
+function computeSellableSkusFromL1(bundle, row = {}, archetype) {
+  if (row.quality_grade === 'unqualified') return ['preview_only'];
+  const skus = [];
+  if (bundle.email) skus.push('email_reveal');
+  if (bundle.phone) skus.push('phone_reveal');
+  if (archetype === 'trade_intel' || Number(row.procurement_score ?? 0) >= 35) skus.push('trade_bundle');
+  if (!skus.length) skus.push('preview_only');
+  return [...new Set(skus)];
+}
+function sanitizeL1IntentText(raw, fallback) {
+  const t = _trimOrNull(raw);
+  if (!t || PILLAR_DEBUG_RE.test(t)) return _trimOrNull(fallback);
+  return t;
+}
+function deriveL1CommerceFields(row) {
+  const bundle = buildContactBundleFromL1(row);
+  const data_archetype = inferDataArchetypeFromL1(bundle, row);
+  const sellable_skus = computeSellableSkusFromL1(bundle, row, data_archetype);
+  const contactability_score = contactabilityFromL1Bundle(bundle, row);
+  const semanticRaw = typeof row.semantic_intent === 'string'
+    ? row.semantic_intent
+    : Array.isArray(row.semantic_intent) ? row.semantic_intent.join(', ') : null;
+  const cleanedSemantic = sanitizeL1IntentText(semanticRaw, row.intent_summary_zh);
+  const intent_patch = cleanedSemantic !== _trimOrNull(semanticRaw) ? { semantic_intent: cleanedSemantic } : {};
+  return { contact_bundle: bundle, sellable_skus, data_archetype, contactability_score, intent_patch };
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 const CHUNK_L1 = Math.min(Math.max(Number(process.env.DIRECT_L1_CHUNK || 80), 10), 200);
 

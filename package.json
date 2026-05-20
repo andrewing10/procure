@@ -12,7 +12,6 @@
     "smoke:step5":       "node scripts/step5_smoke.js"
   },
   "dependencies": {
-    "@zhimao/buyer-commerce": "file:../zhimao/packages/buyer-commerce",
     "@supabase/supabase-js": "^2.50.3",
     "axios":          "^1.16.0",
     "better-sqlite3": "^12.9.0",
