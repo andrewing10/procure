@@ -106,6 +106,36 @@ async function inferL3SupplyChain(leads) {
         const batchTotal = batches.length;
         const startedAt = Date.now();
 
+        // 业态画像树工程 — 反向验证锚点：
+        // expand-query 已经把"用 ${category} 的下游业态画像"作为 personas 输出，step1 用 personas
+        // 的 industry_en 搜到候选公司（不带 category）。这里 L3 必须反向验证"该公司是否真的采购 ${category}"，
+        // 否则会把"电子厂"全收进来，但很多电子厂其实不买纸箱（PCB 厂 vs 整机组装厂）。
+        const TARGET_CATEGORY = String(process.env.DISCOVERY_CATEGORY || '').trim().slice(0, 80);
+        const reverseVerifyBlock = TARGET_CATEGORY
+            ? `
+
+[REVERSE-VERIFICATION GATE — INDUSTRY PERSONA TREE]
+The user's original search target category is: "${TARGET_CATEGORY}".
+For EACH company, additionally output:
+  "target_category_match": "high" | "medium" | "low" | "none"
+    high   = company's primary operations REQUIRE "${TARGET_CATEGORY}" as core input/merchandise (must buy)
+    medium = plausibly procures "${TARGET_CATEGORY}" occasionally / auxiliarily
+    low    = unlikely buyer (industry adjacent but no clear procurement pathway)
+    none   = clearly NOT a buyer (different supply chain, e.g. service-only, software, finance)
+  "target_category_evidence": one short English sentence (≤80 chars) explaining WHY this company would
+    procure "${TARGET_CATEGORY}" — cite the specific use-case (e.g. "Packages e-commerce orders into
+    shipping cartons" / "Imports food products that need outer cartons for distribution").
+  "target_category_reason": short snake_case code: "core_input" | "auxiliary" | "adjacent" | "no_pathway"
+
+⚠ This is the most important field — it gates whether the lead is shown to the user.
+⚠ "Service" entity_role companies almost always = none/low for physical-goods categories.
+⚠ Be conservative: if you cannot articulate a specific procurement use-case, output "low" or "none".`
+            : '';
+
+        const reverseVerifyJsonHint = TARGET_CATEGORY
+            ? `,"target_category_match":"...","target_category_evidence":"...","target_category_reason":"..."`
+            : '';
+
         const prompt = `You are a Supply Chain Intelligence AI. Analyze each company and produce a structured L3 procurement inference.
 
 Rules:
@@ -115,10 +145,10 @@ Rules:
 4. confidence_tier: "High" (role is unambiguous), "Medium" (probable), "Low" (guessed).
 5. intent_summary: one English sentence — "<Name> is a <role> that procures <top materials> from upstream suppliers."
 6. purchase_cycle: "weekly" | "monthly" | "quarterly" | "annual" — best estimate.
-7. reason_codes: non-empty array from ["BOM_INFERENCE","ENTITY_ROLE_MANUFACTURER","ENTITY_ROLE_WHOLESALER","ENTITY_ROLE_RETAILER","ENTITY_ROLE_SERVICE","SUPPLY_CHAIN_GRAPH"].
+7. reason_codes: non-empty array from ["BOM_INFERENCE","ENTITY_ROLE_MANUFACTURER","ENTITY_ROLE_WHOLESALER","ENTITY_ROLE_RETAILER","ENTITY_ROLE_SERVICE","SUPPLY_CHAIN_GRAPH"].${reverseVerifyBlock}
 
 Output strict JSON only:
-{"results":[{"name":"Exact Company Name","entity_role":"...","confidence_tier":"...","primary_materials_top3":["...","...","..."],"procurement_items":[{"category":"...","priority":1,"source":"bom","type":"explicit"}],"intent_summary":"...","purchase_cycle":"...","reason_codes":["..."]}]}
+{"results":[{"name":"Exact Company Name","entity_role":"...","confidence_tier":"...","primary_materials_top3":["...","...","..."],"procurement_items":[{"category":"...","priority":1,"source":"bom","type":"explicit"}],"intent_summary":"...","purchase_cycle":"...","reason_codes":["..."]${reverseVerifyJsonHint}}]}
 
 Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet || '').slice(0, 120) })))}`;
 
@@ -152,6 +182,20 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                 : [];
             if (r.entity_role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
             else if (r.entity_role === 'Wholesaler' || r.entity_role === 'Retailer') lead.confidence_score = (lead.confidence_score || 50) + 10;
+            // 业态画像树工程：反向验证字段（仅在 DISCOVERY_CATEGORY 注入时由 LLM 输出）
+            // 写入 inference_breakdown 既有 JSON，无需 schema 变更；step5 闸门读这里。
+            const reverseMatchRaw = String(r.target_category_match || '').toLowerCase();
+            const reverseMatch = ['high', 'medium', 'low', 'none'].includes(reverseMatchRaw)
+                ? reverseMatchRaw
+                : null;
+            const reverseEvidence = typeof r.target_category_evidence === 'string'
+                ? r.target_category_evidence.trim().slice(0, 120)
+                : '';
+            const reverseReasonRaw = String(r.target_category_reason || '').toLowerCase();
+            const reverseReason = ['core_input', 'auxiliary', 'adjacent', 'no_pathway'].includes(reverseReasonRaw)
+                ? reverseReasonRaw
+                : null;
+
             lead.inference_breakdown = {
                 category:               lead.inferred_bom[0] || null,
                 entity_role:            r.entity_role,
@@ -167,7 +211,12 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                 intent_summary:         r.intent_summary || '',
                 purchase_cycle:         normalizePurchaseCycle(r.purchase_cycle) || 'quarterly',
                 reason_codes:           Array.isArray(r.reason_codes) ? r.reason_codes : ['BOM_INFERENCE'],
-                model_version:          'v8-gemini-l3-v1',
+                // ── 业态画像树反向验证（target_category_* 仅在 worker 注入了 DISCOVERY_CATEGORY 时填充）──
+                target_category:        process.env.DISCOVERY_CATEGORY || null,
+                target_category_match:  reverseMatch,        // 'high'|'medium'|'low'|'none'|null
+                target_category_evidence: reverseEvidence || null,
+                target_category_reason: reverseReason,       // 'core_input'|'auxiliary'|'adjacent'|'no_pathway'|null
+                model_version:          'v8-gemini-l3-v2',   // bump：新增反向验证字段
                 demand_source:          'inferred',
                 graph_snapshot_version: 'v1',
                 created_at:             now,

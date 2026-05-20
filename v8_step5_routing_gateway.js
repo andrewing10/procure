@@ -143,6 +143,24 @@ const icpStats = { high: 0, medium: 0, low: 0, none: 0, unset: 0 };
 // 不写入 L1（用户搜 MY 看到 CN 公司是核心错乱体验）。
 const TARGET_COUNTRY_ISO = String(process.env.DISCOVERY_COUNTRY_ISO || '').toUpperCase();
 
+// ── 业态画像树工程：反向验证闸门 ─────────────────────────────────────────────
+// step3 L3 prompt 已在 DISCOVERY_CATEGORY 注入时输出 target_category_match：
+//   high   → 该公司核心采购该品类（强买家）
+//   medium → 偶发性采购（弱买家但有意义）
+//   low    → 不太可能采购（业态相邻但无明确路径）
+//   none   → 明确不采购（服务业、不同供应链）
+// 闸门策略与 ICP 阈值对齐，但更激进：reverse-verify 失败直接判为 unqualified，
+// 因为这是 LLM 在拿到 company_name + snippet 后做的"是否会买"的反向推断，
+// 比 industry_match 更强、更直接。
+//
+// REVERSE_VERIFY_MODE：
+//   strict   → 丢 low + none（默认在 default category 时启用，建议生产）
+//   balanced → 仅丢 none
+//   off      → 不拦截（用户取消反向验证、调试用）
+const REVERSE_VERIFY_MODE = String(process.env.REVERSE_VERIFY_MODE || 'balanced').toLowerCase();
+const reverseStats = { high: 0, medium: 0, low: 0, none: 0, unset: 0 };
+const TARGET_CATEGORY_FROM_ENV = String(process.env.DISCOVERY_CATEGORY || '').trim();
+
 const validLeads = leads
   .map(applySourceBoost)
   .filter((lead) => {
@@ -173,9 +191,49 @@ const validLeads = leads
       (ICP_THRESHOLD === 'soft'     && m === 'none');
     if (shouldDrop) {
       lead._quality_grade = 'unqualified';
+      lead.reject_codes = Array.isArray(lead.reject_codes)
+        ? [...lead.reject_codes, 'ICP_MATCH_LOW']
+        : ['ICP_MATCH_LOW'];
       gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
       return false;
     }
+
+    // ── 业态画像树反向验证闸门 ───────────────────────────────────────────────
+    // 仅在用户输入了 TARGET_CATEGORY 且 REVERSE_VERIFY_MODE != 'off' 时生效。
+    // 例外：seed/HVC 来源（pillar 0）跳过反向验证（已是种子库已验证企业）。
+    const isSeedSource =
+      String(lead.pillar || '').match(/Pillar 0|Seed/i) || lead.verified_source_id;
+    if (
+      TARGET_CATEGORY_FROM_ENV &&
+      REVERSE_VERIFY_MODE !== 'off' &&
+      !isSeedSource &&
+      lead.inference_breakdown &&
+      typeof lead.inference_breakdown === 'object'
+    ) {
+      const rmRaw = String(lead.inference_breakdown.target_category_match || '').toLowerCase();
+      const rm = ['high', 'medium', 'low', 'none'].includes(rmRaw) ? rmRaw : 'unset';
+      reverseStats[rm] += 1;
+      const reverseDrop =
+        (REVERSE_VERIFY_MODE === 'strict'   && (rm === 'low' || rm === 'none')) ||
+        (REVERSE_VERIFY_MODE === 'balanced' && rm === 'none');
+      if (reverseDrop) {
+        lead._quality_grade = 'unqualified';
+        lead.reject_codes = Array.isArray(lead.reject_codes)
+          ? [...lead.reject_codes, 'REVERSE_VERIFY_FAIL']
+          : ['REVERSE_VERIFY_FAIL'];
+        gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
+        return false;
+      }
+      // 通过反向验证：把 evidence 透传到 lead 顶层（给前端 lead 卡展示"为什么这家公司是买家"）
+      if (lead.inference_breakdown.target_category_evidence) {
+        lead.target_category_evidence = lead.inference_breakdown.target_category_evidence;
+      }
+      if (rm === 'medium' || rm === 'low') lead.needs_human_review = true;
+    } else if (TARGET_CATEGORY_FROM_ENV && !isSeedSource) {
+      // L3 没填反向验证（SKIP_L3_INFERENCE 或 LLM 失败）→ 计入 unset，不拦截
+      reverseStats.unset += 1;
+    }
+
     gradeStats[grade] = (gradeStats[grade] || 0) + 1;
     lead._quality_grade = grade;
     if (m === 'medium') lead.needs_human_review = true;
@@ -183,13 +241,16 @@ const validLeads = leads
   });
 
 const droppedQuality = totalLeads - validLeads.length;
+const reverseLog = TARGET_CATEGORY_FROM_ENV
+  ? ` reverse(${REVERSE_VERIFY_MODE},${TARGET_CATEGORY_FROM_ENV})=high:${reverseStats.high} medium:${reverseStats.medium} low:${reverseStats.low} none:${reverseStats.none} unset:${reverseStats.unset}`
+  : '';
 if (droppedQuality > 0) {
   console.log(
-    `[step5] quality-gate veto: dropped ${droppedQuality}/${totalLeads}. grade=premium:${gradeStats.premium} qualified:${gradeStats.qualified} unqualified:${gradeStats.unqualified}; icp=high:${icpStats.high} medium:${icpStats.medium} low:${icpStats.low} none:${icpStats.none} unset:${icpStats.unset} (threshold=${ICP_THRESHOLD})`,
+    `[step5] quality-gate veto: dropped ${droppedQuality}/${totalLeads}. grade=premium:${gradeStats.premium} qualified:${gradeStats.qualified} unqualified:${gradeStats.unqualified}; icp=high:${icpStats.high} medium:${icpStats.medium} low:${icpStats.low} none:${icpStats.none} unset:${icpStats.unset} (threshold=${ICP_THRESHOLD})${reverseLog}`,
   );
 } else {
   console.log(
-    `[step5] quality-gate pass: ${validLeads.length}/${totalLeads}. premium=${gradeStats.premium} qualified=${gradeStats.qualified}; icp=high:${icpStats.high} medium:${icpStats.medium} unset:${icpStats.unset}`,
+    `[step5] quality-gate pass: ${validLeads.length}/${totalLeads}. premium=${gradeStats.premium} qualified=${gradeStats.qualified}; icp=high:${icpStats.high} medium:${icpStats.medium} unset:${icpStats.unset}${reverseLog}`,
   );
 }
 

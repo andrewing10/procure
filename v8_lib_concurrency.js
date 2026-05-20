@@ -296,12 +296,15 @@ const NEWS_DOMAIN_HOSTS = new Set([
 ]);
 const NEWS_DOMAIN_RE = /\.(news|press|media|journalist|tribune|gazette|herald|chronicle|times\.com\.sg|daily|weekly|post\.com)$/i;
 
+// 注意：importyeti / volza / panjiva 不在此 PLATFORM 黑名单——它们是真实进口商目录的
+// 强信号源。step1 fromOrganic 把这些站的 link 转为 source_url（lead.link=null），
+// preFilterRawLeads 不会因 link=null 把它们当 no_signal 丢掉（看 line 351：仅在 title+snippet 都空时丢）。
 const PLATFORM_HOSTS = [
     'alibaba.com', 'aliexpress.com', 'amazon.com', 'thomasnet.com',
     'globalsources.com', 'made-in-china.com', 'tradeindia.com',
     'indiamart.com', 'tradewheel.com', 'ec21.com', 'ecplaza.net',
-    'tradekey.com', 'go4worldbusiness.com', 'panjiva.com',
-    'importyeti.com', 'volza.com', 'reddit.com', 'quora.com',
+    'tradekey.com', 'go4worldbusiness.com',
+    'reddit.com', 'quora.com',
     'wikipedia.org', 'wikihow.com', 'youtube.com',
     'facebook.com', 'instagram.com', 'linkedin.com', 'x.com', 'twitter.com', 'tiktok.com',
 ];

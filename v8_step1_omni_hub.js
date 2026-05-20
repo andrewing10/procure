@@ -287,11 +287,57 @@ async function searchOrganicMultiPage(query, gl, num = 20) {
 }
 
 // ─── Lead builders ─────────────────────────────────────────────────────────
+
+/**
+ * "信号源域名"：这些站本身不是采购商主页，但 snippet 里包含真实买家公司名。
+ * fromOrganic 自动把这些站的 link 转为 source_url（lead.link=null），
+ * 让 LLM step2 从 snippet 抽取公司名，step3 不会用这些聚合站当 contact 富化目标。
+ *
+ * 设计原则（与 P11 LinkedIn 现有处理一致）：
+ *   - link 设为 null  → 后续 isJunkDomain / preFilterRawLeads 不会把整条 lead 当垃圾丢掉
+ *   - source_url 保留 → 用户可看到证据来源
+ *   - snippet 保留    → LLM 抽取公司名（这些站的 snippet 通常是 "Company X imports XXX
+ *                       from supplier Y, 12 shipments in 2025" 这类高质量买家信号）
+ */
+const SIGNAL_SOURCE_HOSTS = new Set([
+  'importyeti.com', 'www.importyeti.com',
+  'volza.com', 'www.volza.com',
+  'panjiva.com', 'www.panjiva.com',
+  'importgenius.com', 'www.importgenius.com',
+  'tradesparq.com', 'www.tradesparq.com',
+  'linkedin.com', 'www.linkedin.com',
+  'glassdoor.com', 'www.glassdoor.com',
+  'indeed.com', 'www.indeed.com',
+  'zhipin.com', 'www.zhipin.com',
+  'liepin.com', 'www.liepin.com',
+]);
+
+function isSignalSourceHost(link) {
+  if (!link || typeof link !== 'string') return false;
+  try {
+    const url = new URL(link.startsWith('http') ? link : `https://${link}`);
+    const host = url.hostname.toLowerCase();
+    if (SIGNAL_SOURCE_HOSTS.has(host)) return true;
+    // 子域兜底：m.linkedin.com / api.importyeti.com 等
+    for (const h of SIGNAL_SOURCE_HOSTS) {
+      if (host.endsWith('.' + h)) return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
 function fromOrganic(results, pillar, intent_signal) {
-  return results.map(o => ({
-    title: o.title, link: o.link, snippet: o.snippet,
-    pillar, ...(intent_signal ? { intent_signal } : {}),
-  }));
+  return results.map(o => {
+    const isSignal = isSignalSourceHost(o.link);
+    return {
+      title:   o.title,
+      link:    isSignal ? null : o.link,           // 信号源不当公司主页域名
+      snippet: o.snippet,
+      pillar,
+      ...(intent_signal ? { intent_signal } : {}),
+      ...(isSignal ? { source_url: o.link } : {}), // 留作证据溯源
+    };
+  });
 }
 
 // ─── 区域专属数据源注册表（单源加载，避免每次 run() 重读文件）──────────────
@@ -587,6 +633,61 @@ async function run() {
         }));
     })(),
 
+    // ── P1c (新增 2026-05): 业态画像 LBS —— 基于 expand-query 生成的 buyer_personas ─
+    //
+    // 设计：原有 p1_maps_dist / p1_maps_trading 把 category 当 query 主词，命中的多是
+    // "卖该品类的供应商门店"（如纸箱搜索 → A-Z Packaging, Welch Packaging）。
+    //
+    // 业态画像反向找买家：用 LLM 推断的下游应用业态（如"纸箱"对应"electronics
+    // manufacturer / food processor / e-commerce warehouse / 3pl"）作为 query 主词，
+    // Maps 命中的就是真实采购该品类的业态实体（电商仓库、食品厂等）。
+    //
+    // 限速：最多 3 个高分 persona × min(3, mapsCities.length 或单国家) = 最多 9 次 Maps 调用。
+    // 成本：Google Places 单次 ~$0.017，9 次 = ~$0.15/job，可接受。
+    p1_maps_personas: (async () => {
+      const personas = Array.isArray(pillar0Payload.buyer_personas)
+        ? pillar0Payload.buyer_personas
+            .filter((p) => p && typeof p.industry_en === 'string' && p.industry_en.trim())
+            .slice(0, 3)  // 限速：最多 3 个高分 persona
+        : [];
+      if (personas.length === 0) return [];  // 无业态画像时跳过（不影响向后兼容）
+
+      const cityList = mapsCities.length > 0 ? mapsCities.slice(0, 3) : [null];  // 限速：最多 3 城市
+      const queries = [];
+      for (const persona of personas) {
+        const personaTerm = String(persona.industry_en).trim();
+        for (const city of cityList) {
+          queries.push({
+            city,
+            personaName: persona.industry_zh || personaTerm,
+            q: city ? `${personaTerm} "${city}" ${countryName}` : `${personaTerm} ${countryName}`,
+          });
+        }
+      }
+      console.log(`[step1] p1_maps_personas: ${queries.length} queries (${personas.length} personas × ${cityList.length} cities)`);
+
+      const arrs = await Promise.all(queries.map(({ city, personaName, q }) =>
+        fetchPlacesWithFallback(q, cc, placeTypeBlacklist, mapTypesPrefer).then((ps) =>
+          ps.map((p) => ({ ...p, _city: city, _persona: personaName }))
+        )
+      ));
+      const seen = new Set();
+      return arrs.flat()
+        .filter((p) => p.website || p.phoneNumber)
+        .filter((p) => {
+          const k = (p.place_id || p.website || `${p.title}|${p.address}`).toLowerCase();
+          if (seen.has(k)) return false;
+          seen.add(k); return true;
+        })
+        .map((p) => ({
+          title: p.title, link: p.website, snippet: p.address, phone: p.phoneNumber,
+          pillar: 'Pillar 1 LBS', intent_signal: 'PERSONA_VERIFIED_BUYER',
+          _gmaps_source: p._source || 'serper_places',
+          _city: p._city || null, _persona: p._persona || null,
+          maps_url: p.maps_url || null, place_id: p.place_id || null,
+        }));
+    })(),
+
     // ── P2: 公司官网直接搜索（在目标国TLD下找自述为进口商/批发商的公司） ─────
     // 关键：用 site:.vn 等TLD直接找公司网站，不找聚合站
     p2_direct_importer: searchOrganicMultiPage(
@@ -600,9 +701,15 @@ async function run() {
     ).then(r => fromOrganic(r, 'Pillar 2 Direct', 'ACTIVE_SOURCING')),
 
     // ── P3: 采购招聘信号（最可靠的买家信号之一：招采购经理 = 一定在采购）  ────
-    // 修复说明：原 site:importyeti.com/volza.com 搜索结果的 URL 都在垃圾名单里
-    // 会被 isJunkLead 全部过滤掉（100% Serper 配额浪费）。
-    // 改为：搜索目标国公司的采购招聘页面，这类页面在公司官网上，URL 有效。
+    //
+    // 设计修订（2026-05）：
+    //   原版本 -site:linkedin.com -site:glassdoor.com 主动排除主流招聘平台，
+    //   导致命中率极低——而 LinkedIn/Glassdoor 恰是采购岗位招聘的主战场。
+    //
+    // 现版本：保留 LinkedIn/Glassdoor 搜索结果，由 fromOrganic 自动识别
+    //   SIGNAL_SOURCE_HOSTS 把这些站的 link → null + source_url，避免被当
+    //   公司主页域名（与 P11 LinkedIn 现有 source_url 模式一致）。
+    //   step2 LLM 从招聘 snippet（"XX 公司招聘采购经理"）抽公司名 → step3 富化。
     p3_jobs_procurement: searchOrganicMultiPage(
       // Batch D.1：把 anchor 词加进 query，避免"procurement manager"拉到金融/IT 招聘
       anchorPrimary
@@ -613,8 +720,8 @@ async function run() {
 
     p3_jobs_buyer: searchOrganicMultiPage(
       anchorPrimary
-        ? `"${anchorPrimary}" buyer job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`
-        : `${OQ} ("buyer" OR "import buyer" OR "commercial buyer") job hiring ${countryName} -site:linkedin.com -site:glassdoor.com`,
+        ? `"${anchorPrimary}" buyer job hiring ${countryName}`
+        : `${OQ} ("buyer" OR "import buyer" OR "commercial buyer") job hiring ${countryName}`,
       cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 3 Jobs', 'BUYER_HIRING')),
 
@@ -649,12 +756,26 @@ async function run() {
     ).then(r => fromOrganic(r, 'Pillar 6 Association', 'TRADE_SHOW_BUYER')),
 
     // ── P7: 海关/贸易信号（真实进口行为，数据最权威） ───────────────────────
-    // 修复说明：原来 site:importyeti.com 等结果 URL 在垃圾名单被全过滤。
-    // 新策略：搜"含海关关键词的公司页面"（返回公司官网，而不是聚合站）
+    //
+    // 设计：分双路并行，互补抓取：
+    //
+    //   ① p7_customs_direct: 搜"含海关关键词的公司主页"（少数大公司在主页明示进口资质）
+    //      → 返回公司官网 → step3 直接富化
+    //
+    //   ② p7_customs_signal_source（新增 2026-05）: 直接 site: 限定海关聚合站
+    //      → 返回 importyeti / volza / panjiva 的公司清单页面
+    //      → fromOrganic 自动把 link 设为 null + source_url，snippet 含公司名
+    //      → step2 LLM 从 snippet 抽公司名 → step3 用公司名独立解析 domain 富化
+    //      → 这是从"靠公司主页 SEO"→"靠贸易数据库实证"的范式升级
     p7_customs_direct: searchOrganicMultiPage(
       `${OQ} ("import" OR "importer of record" OR "customs entry" OR "HS code" OR "HTS") ${tld} company`,
       cc, organicNum
     ).then(r => fromOrganic(r, 'Pillar 7 Customs', 'CUSTOMS_SIGNAL')),
+
+    p7_customs_signal_source: searchOrganicMultiPage(
+      `${OQ} importer "${countryName}" (site:importyeti.com OR site:volza.com OR site:panjiva.com)`,
+      cc, organicNum
+    ).then(r => fromOrganic(r, 'Pillar 7 Customs', 'CUSTOMS_DB')),
 
     p7_bol_signal: searchOrganicMultiPage(
       `${OQ} ("bill of lading" OR "海运提单" OR "شحنة" OR "connaissement") importer "${countryName}"`,
@@ -822,7 +943,8 @@ async function run() {
     const organicKeys = [
       'p2_direct_importer', 'p2_sourcing_intent', 'p3_jobs_procurement', 'p3_jobs_buyer',
       'p4_rfq', 'p4_sourcing_post', 'p5_tenders', 'p6_buyer_assoc', 'p6_trade_show_buyer',
-      'p7_customs_direct', 'p7_bol_signal', 'p8_b2b_buyer', 'p8_ecommerce_import',
+      'p7_customs_direct', 'p7_customs_signal_source', 'p7_bol_signal',
+      'p8_b2b_buyer', 'p8_ecommerce_import',
       'p10_verified_sources', 'p9_lookalike',
     ];
     organicKeys.forEach((k) => { delete pillarPromises[k]; });
@@ -831,6 +953,7 @@ async function run() {
   if (controls.weights.geo < 0.35) {
     delete pillarPromises.p1_maps_dist;
     delete pillarPromises.p1_maps_trading;
+    delete pillarPromises.p1_maps_personas;
     console.log('[step1] Maps pillars OFF (geo weight < 0.35)');
   }
   if (controls.weights.contact < 0.35) {
@@ -852,6 +975,7 @@ async function run() {
     if (!isPlatformEnabled(matrix, 'maps')) {
       delete pillarPromises.p1_maps_dist;
       delete pillarPromises.p1_maps_trading;
+      delete pillarPromises.p1_maps_personas;
     }
     if (!isPlatformEnabled(matrix, 'yellowpages'))      delete pillarPromises.p_yellowpages;
     if (!isPlatformEnabled(matrix, 'facebook_public'))  delete pillarPromises.p_facebook_public;

@@ -48,9 +48,9 @@ const JUNK_DOMAIN_HOSTS = new Set([
     'ebay.com', 'www.ebay.com',
     'etsy.com', 'www.etsy.com',
     'shopify.com', 'www.shopify.com',
-    'importyeti.com', 'www.importyeti.com',
-    'volza.com', 'www.volza.com',
-    'panjiva.com', 'www.panjiva.com',
+    // 注意：importyeti / volza / panjiva 不再列入 JUNK，它们是真实进口商目录的强信号源。
+    // step1 fromOrganic 会自动把这些站的 link 转为 source_url（不当公司域名），
+    // snippet 里的真实买家公司名照常进入 LLM 抽取。详见 SIGNAL_SOURCE_HOSTS。
     'tradesparq.com',
     'dungedon.com',
     'bing.com', 'www.bing.com',
