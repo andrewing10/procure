@@ -173,6 +173,8 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
           DISCOVERY_REWEIGHT_JSON: JSON.stringify(Array.isArray(reweightPolicies) ? reweightPolicies : []),
           DISCOVERY_DOMAIN_BLACKLIST: JSON.stringify(domainBlacklist),
           PILLAR0_PAYLOAD: pillar0Json,
+          DISCOVERY_COUNTRY_ISO: countryIso || '',
+          DISCOVERY_CATEGORY: category || '',
           // proxy_hint 桥接：Render env (USE_PROXY/BRD_USER/BRD_PASS) 优先；
           // 若 Render 未配置，则从 action_payload.proxy_hint 读取（由 zhimao submit 注入）
           ...(() => {

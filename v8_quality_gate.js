@@ -120,7 +120,30 @@ const AGGREGATOR_DOMAIN_HOSTS = new Set([
     'made-in-china.com', 'www.made-in-china.com',
     'ec21.com', 'www.ec21.com',
     'ecplaza.net', 'www.ecplaza.net',
+    // 公司目录/评级聚合站：实测 vaneerden.bbb.org 这种被误判 premium
+    'bbb.org', 'www.bbb.org',
+    'globalimporter.net', 'www.globalimporter.net', 'free.globalimporter.net',
+    'thomasnet.com', 'www.thomasnet.com',
+    'manta.com', 'www.manta.com',
+    'dnb.com', 'www.dnb.com',
+    'crunchbase.com', 'www.crunchbase.com',
 ]);
+
+/**
+ * 域名是否为聚合/目录站（公司不在此站持有真实主页，仅被列表收录）。
+ * Premium 判定时要求公司有真实主域名，不能仅凭出现在聚合站。
+ */
+function isAggregatorDomain(raw) {
+    if (!raw || !raw.trim()) return false;
+    const host = getHost(raw);
+    if (!host) return false;
+    if (AGGREGATOR_DOMAIN_HOSTS.has(host)) return true;
+    // 子域兜底：xxx.bbb.org / free.globalimporter.net 等
+    for (const agg of AGGREGATOR_DOMAIN_HOSTS) {
+        if (host === agg || host.endsWith('.' + agg)) return true;
+    }
+    return false;
+}
 const NEWS_TEXT_RE = /\b(news|press|journal|报道|新闻|专访|记者|通讯社)\b/i;
 const SOCIAL_TEXT_RE = /\b(facebook|instagram|linkedin|x\.com|twitter|youtube|tiktok|social)\b/i;
 
@@ -371,11 +394,16 @@ function computeQualityGrade({
         if (hasProcurementItems === false) return 'unqualified';
     }
 
-    // C3 Premium 升级：有采购信号直接 premium（进口证据/招聘信号 = 确定性买家）
-    if (procurementSignalCount >= 2 && (hasRealDomain || hasEmail)) return 'premium';
+    // Premium 升级要求：必须有公司主域名（非聚合/目录站如 bbb.org / globalimporter.net）。
+    // 实测 vaneerden 域名是 bbb.org（评级聚合站）被误判 premium——聚合站只能证明公司
+    // 出现在目录里，不能证明它是高质量买家主体。
+    const hasOwnedDomain = hasRealDomain && !isAggregatorDomain(domain);
 
-    // Premium：高置信 L3 + 真实域名或验证邮箱
-    if (confidenceTier && confidenceTier.toLowerCase() === 'high' && (hasRealDomain || hasEmail)) return 'premium';
+    // C3 Premium 升级：有采购信号 + 公司主域名 → premium（进口证据/招聘信号 = 确定性买家）
+    if (procurementSignalCount >= 2 && hasOwnedDomain) return 'premium';
+
+    // Premium：高置信 L3 + 公司主域名或验证邮箱
+    if (confidenceTier && confidenceTier.toLowerCase() === 'high' && (hasOwnedDomain || hasEmail)) return 'premium';
 
     // Qualified：有联系方式但未达到 premium
     return 'qualified';
@@ -486,6 +514,7 @@ function evaluateLead(lead) {
 
 module.exports = {
     isJunkDomain,
+    isAggregatorDomain,
     isJunkName,
     isBizTypeBlacklisted,
     computeQualityGrade,

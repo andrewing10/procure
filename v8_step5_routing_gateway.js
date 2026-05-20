@@ -107,9 +107,12 @@ function applySourceBoost(lead) {
   ).length;
 
   if (dimensionCount >= 2) {
+    // 不再强制 >= 92。Combo 仅作为 +20 增量 boost，让 confidence_score 真实反映
+    // "contact 完整度 + L3 推断"——避免 BOL_SIGNAL（航运/海关数据）+ 流水号邮箱
+    // 这种"商业证据强但联系方式垃圾"的 lead 被强制拉到 92 误导用户。
+    // 商业证据强度由 quality_grade=premium 单独表达，与 score 解耦。
     const prev = Number(lead.confidence_score ?? 60) + total;
-    const forced = Math.max(prev, 92);
-    lead.confidence_score = Math.min(100, forced);
+    lead.confidence_score = Math.min(100, prev + 20);
     lead._combo_triggered = true;
     return lead;
   }
@@ -126,18 +129,37 @@ const gradeStats = { premium: 0, qualified: 0, unqualified: 0 };
 // Batch A.4：ICP 闸门阈值
 //
 //   soft (默认)  → 只丢 none（明确无关，如房产中介、餐厅），保留 low/medium/high
-//   balanced     → 丢 low+none（原默认，对"相邻行业"如包装、物流过于激进，量损失 30-40%）
+//   balanced     → 丢 low+none
 //   off          → 不拦截任何（全量进 L1，人工审核）
 //
-// 默认改为 soft：买家抓取场景中 industry_match=low 往往是采购频次低但真实进口的企业（如
-//   经销商、贸易商），balanced 会把它们整批丢弃，是"量不多"的主要漏斗损失点之一。
+// 默认保持 soft：买家抓取场景中 industry_match=low 往往是采购频次低但真实进口的企业
+// （如物流公司采购纸箱、贸易商采购包装材料），balanced 会把它们整批丢弃。
 const ICP_THRESHOLD = String(process.env.ICP_MATCH_THRESHOLD || 'soft').toLowerCase();
 const icpStats = { high: 0, medium: 0, low: 0, none: 0, unset: 0 };
+
+// 目标国：从 worker 注入的 DISCOVERY_COUNTRY_ISO，用于校验 lead.country 是否一致。
+// 实测 (job 2ba18da6) 36 条 MY 结果中有 6 条是 US/DE/AU/CN，根因是 LLM 推断的国家与
+// 用户搜索目标国不一致仍然写入。这里做兜底过滤：跨国结果直接降级为 unqualified，
+// 不写入 L1（用户搜 MY 看到 CN 公司是核心错乱体验）。
+const TARGET_COUNTRY_ISO = String(process.env.DISCOVERY_COUNTRY_ISO || '').toUpperCase();
 
 const validLeads = leads
   .map(applySourceBoost)
   .filter((lead) => {
-    if (!String(lead.country || '').trim()) return false;
+    const leadCountry = String(lead.country || '').trim().toUpperCase();
+    if (!leadCountry) return false;
+
+    // 跨国校验：lead.country 与本次 job 目标国不一致 → 降级丢弃
+    // 例外：seed/HVC 类来源（pillar 0）是种子库反哺，允许跨国
+    if (TARGET_COUNTRY_ISO && leadCountry !== TARGET_COUNTRY_ISO) {
+      const isSeedSource = String(lead.pillar || '').match(/Pillar 0|Seed/i) || lead.verified_source_id;
+      if (!isSeedSource) {
+        lead._quality_grade = 'unqualified';
+        gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
+        return false;
+      }
+    }
+
     const { qualified, grade } = evaluateLead(lead);
     const matchRaw = String(lead.industry_match || '').toLowerCase();
     const m = ['high', 'medium', 'low', 'none'].includes(matchRaw) ? matchRaw : 'unset';

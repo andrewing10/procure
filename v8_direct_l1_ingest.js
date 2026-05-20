@@ -309,7 +309,10 @@ function buildL1Row(lead, nowIso) {
     domain: extractDomain(lead.domain) || null,
     primary_email: lead.primary_email || null,
     primary_phone: lead.primary_phone || null,
-    address_line: lead.snippet ? String(lead.snippet).slice(0, 500) : null,
+    // address_line 必须是真实地址：仅在 Google Places 等真实地址源命中时填写。
+    // 严禁灌入 step1 搜索 snippet（搜索摘要会是文章/词典/营销文案，造成"地址=法律定义"等问题）。
+    // 原始 snippet 仍写入 .snippet 字段，供调试追溯，但前端展示层只取 address_line。
+    address_line: (lead._gmaps_address || lead.formatted_address || null) || null,
     place_type: lead.entity_role || null,
     snippet: lead.snippet ? String(lead.snippet).slice(0, 2000) : null,
     source: 'v8_pipeline',

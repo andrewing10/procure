@@ -96,7 +96,9 @@ function buildPrompt(batch, triggerBlock, industryHint) {
 [CRITICAL RULES]
 1. ANTI-POLLUTION: If the snippet indicates the company is based in China, or is a Chinese exporter/supplier selling abroad, YOU MUST return null.
 2. ANTI-BLOG: If the title/snippet is a listicle, article, review, or guide (e.g. "Top 10 ...", "Best ... for ...", "How to ...", "Guide to ...", "X things you should ...", "Review:", "vs."), YOU MUST return null -- we only want real buyer company entities.
-3. ANTI-PLATFORM: If the result is a known marketplace, directory platform, or aggregator (Alibaba, Amazon, Thomasnet, etc.) rather than an end-buyer company, return null.${triggerBlock}${icpBlock}
+3. ANTI-PLATFORM: If the result is a known marketplace, directory platform, or aggregator (Alibaba, Amazon, Thomasnet, etc.) rather than an end-buyer company, return null.
+4. ANTI-DEFINITION: If the snippet is a legal clause, dictionary entry, technical definition, or academic description (e.g. "A clause inserted in...", "In law, ...", "Definition of ...", "refers to the practice of..."), YOU MUST return null -- these are not company profiles.
+5. ANTI-REFERENCE-DOC: If the snippet is clearly from a document index, shipping manifest, bill of lading reference, or invoice template rather than a company webpage, return null.${triggerBlock}${icpBlock}
 ${fmt}
 Input: ${JSON.stringify(batch.map(r => ({ t: r.title, s: r.snippet })))}`;
 }
