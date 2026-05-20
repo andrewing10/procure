@@ -1,6 +1,6 @@
 require('dotenv').config();
 const fs    = require('fs');
-const https = require('https');
+const { callGeminiJson } = require('./v8_lib_concurrency');
 
 const [inputFile, outputFile, countryCode, ...catArgs] = process.argv.slice(2);
 const category = catArgs.join(' ') || 'Industrial';
@@ -11,13 +11,15 @@ const GEMINI_MODEL = process.env.GEMINI_FAST_MODEL || process.env.GEMINI_MODEL |
 const OPENAI_KEY   = process.env.OPENAI_API_KEY  || '';
 // 翻译是简单任务，用快速低成本模型兜底
 const OPENAI_MODEL = process.env.OPENAI_FAST_MODEL || 'gpt-4.1-mini';
-// 无 Gemini 时，若 OpenAI 也未配置才退出；否则直接走 OpenAI 路径
-if (!GEMINI_KEY && !OPENAI_KEY) {
-    console.error('[step0] GEMINI_KEY or OPENAI_API_KEY is required');
+const CLAUDE_KEY   = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL   || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
+// 无 Gemini/Claude/OpenAI 三家全空才退出
+if (!GEMINI_KEY && !CLAUDE_KEY && !OPENAI_KEY) {
+    console.error('[step0] GEMINI_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY at least one required');
     process.exit(1);
 }
 if (!GEMINI_KEY) {
-    console.warn('[step0] GEMINI_KEY not set — will use OpenAI only for translation.');
+    console.warn('[step0] GEMINI_KEY not set — will use Claude/OpenAI fallback for translation.');
 }
 
 // 国家名称映射（与 zhimao apps/web/lib/search/v8DiscoveryCountrySupport.ts 同步）
@@ -148,61 +150,25 @@ Return ONLY valid JSON with this exact structure:
   "buying_intent_words": ["looking for supplier equivalent", "sourcing equivalent"],
   "company_type_words": ["trading company equivalent", "distributor equivalent"]
 }`;
-        const reqData  = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, responseMimeType: 'application/json' } });
-
-        // ── 优先 Gemini Flash-Lite，失败后回退 OpenAI ───────────────────────
+        // 与 zhimao apps/web 业态画像树工程对齐：统一走 callGeminiJson
+        // 三家级联：Gemini (flash-lite) → Claude (sonnet-4-6) → OpenAI (gpt-4.1-mini)
         let content = null;
-        if (GEMINI_KEY) {
-            const resData = await new Promise(resolve => {
-                const req = https.request({
-                    hostname: 'generativelanguage.googleapis.com',
-                    path: `/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                }, res => {
-                    let body = ''; res.on('data', c => body += c); res.on('end', () => resolve(body));
-                });
-                req.setTimeout(15000, () => { req.destroy(); resolve(null); });
-                req.on('error', () => resolve(null)); req.write(reqData); req.end();
+        try {
+            content = await callGeminiJson(prompt, {
+                apiKey: GEMINI_KEY,
+                model: GEMINI_MODEL,
+                temperature: 0.1,
+                timeoutMs: 15_000,
+                maxRetries: 2,
+                label: 'step0/translate',
+                openaiApiKey: OPENAI_KEY,
+                openaiModel: OPENAI_MODEL,
+                claudeApiKey: CLAUDE_KEY,
+                claudeModel: CLAUDE_MODEL,
             });
-            try {
-                if (resData) {
-                    const parsed  = JSON.parse(resData);
-                    content = JSON.parse(parsed.candidates[0].content.parts[0].text);
-                }
-            } catch (_) { content = null; }
-        }
-
-        // OpenAI 兜底
-        if (!content && OPENAI_KEY) {
-            try {
-                // GPT-5 系列：max_tokens → max_completion_tokens（实测 2026-05-20）
-                const isGpt5Plus = /^gpt-5/i.test(OPENAI_MODEL);
-                const tokenField = isGpt5Plus ? 'max_completion_tokens' : 'max_tokens';
-                const oaBody = JSON.stringify({
-                    model: OPENAI_MODEL, temperature: 0.1,
-                    [tokenField]: 2048,
-                    response_format: { type: 'json_object' },
-                    messages: [
-                        { role: 'system', content: 'You are a B2B procurement data expert. Always respond with valid JSON.' },
-                        { role: 'user', content: prompt },
-                    ],
-                });
-                const oaRes = await new Promise(resolve => {
-                    const req = https.request({
-                        hostname: 'api.openai.com', path: '/v1/chat/completions',
-                        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
-                    }, res => {
-                        let body = ''; res.on('data', c => body += c); res.on('end', () => resolve(body));
-                    });
-                    req.setTimeout(20000, () => { req.destroy(); resolve(null); });
-                    req.on('error', () => resolve(null)); req.write(oaBody); req.end();
-                });
-                if (oaRes) {
-                    const parsed = JSON.parse(oaRes);
-                    content = JSON.parse(parsed.choices[0].message.content);
-                    console.log(`[step0] OpenAI fallback succeeded for translation`);
-                }
-            } catch (_) { content = null; }
+        } catch (e) {
+            console.warn(`[step0] callGeminiJson failed: ${e.message.slice(0, 120)}`);
+            content = null;
         }
 
         if (content) {

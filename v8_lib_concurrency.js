@@ -136,13 +136,19 @@ async function requestJsonWithRetry({
     return { statusCode: 0, error: lastError, attempts: attempt };
 }
 
-// 与 zhimao / render.yaml 对齐；模型下线时按序尝试（避免 preview-04-17 整批 L3 失败）
+// 与 zhimao apps/web/lib/search/llmClient.ts 对齐（业态画像树工程标准）
+// 实测见 zhimao apps/web/scripts/test-gemini-models.mjs（2026-05-20）：
+//   - gemini-3-flash-preview   ~1.4s ✓ 最快（默认 fallback 首位）
+//   - gemini-3.1-pro-preview   ~4.5s ✓ 但复杂 JSON schema 偶尔 >15s（30s timeout 覆盖）
+//   - gemini-2.5-flash         ~4.5s ✓ 第三档
+//   - gemini-2.5-pro           >12s timeout ✗ 已剔除
+//   - gemini-3.1-pro / gemini-3-pro   404 不存在
 const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
 const GEMINI_MODEL_FALLBACK_CHAIN = [
     DEFAULT_GEMINI_MODEL,
     'gemini-3-flash-preview',
+    'gemini-3.1-pro-preview',
     'gemini-2.5-flash',
-    'gemini-2.5-pro',
 ].filter((m, i, a) => m && a.indexOf(m) === i);
 
 // Claude fallback — 用户指令 2026-05-20：把 Claude 调到 Gemini 之后、OpenAI 之前
@@ -295,13 +301,20 @@ async function callGeminiJson(promptText, {
     }
     console.warn(`[${label}] → Falling back to OpenAI ${openaiModel}...`);
     try {
-        // GPT-5 系列：max_tokens → max_completion_tokens（实测 2026-05-20，参数名变更）
+        // GPT-5 reasoning 系列实测约束（2026-05-20 procure/scripts/test-gpt55-temperature.cjs）：
+        //   - gpt-5 / gpt-5.5：reasoning model → 必须 max_completion_tokens；temperature 只支持 1（默认）
+        //   - gpt-5.4 / gpt-5.4-mini：chat model → 同样用 max_completion_tokens；temperature 支持自定义
+        //   - gpt-4.x：用 max_tokens；temperature 支持自定义
         const isGpt5Plus = /^gpt-5/i.test(openaiModel);
+        // gpt-5.0 / gpt-5.5 等"纯 reasoning"模型；gpt-5.4 是 chat 变体支持 temperature
+        const isGpt5Reasoning = /^gpt-5(\.\d+)?$/i.test(openaiModel) && !/^gpt-5\.4/i.test(openaiModel);
         const tokenField = isGpt5Plus ? 'max_completion_tokens' : 'max_tokens';
         const oaBody = JSON.stringify({
             model: openaiModel,
-            temperature,
-            [tokenField]: 4096,
+            // reasoning 模型不传 temperature；chat 模型传配置值
+            ...(isGpt5Reasoning ? {} : { temperature }),
+            // reasoning 模型给更大 budget（reasoning tokens 会占用 max_completion_tokens）
+            [tokenField]: isGpt5Reasoning ? 8192 : 4096,
             response_format: { type: 'json_object' },
             messages: [
                 { role: 'system', content: 'You are a B2B procurement data extraction assistant. Always respond with valid JSON.' },
