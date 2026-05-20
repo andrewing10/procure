@@ -175,8 +175,12 @@ Return ONLY valid JSON with this exact structure:
         // OpenAI 兜底
         if (!content && OPENAI_KEY) {
             try {
+                // GPT-5 系列：max_tokens → max_completion_tokens（实测 2026-05-20）
+                const isGpt5Plus = /^gpt-5/i.test(OPENAI_MODEL);
+                const tokenField = isGpt5Plus ? 'max_completion_tokens' : 'max_tokens';
                 const oaBody = JSON.stringify({
                     model: OPENAI_MODEL, temperature: 0.1,
+                    [tokenField]: 2048,
                     response_format: { type: 'json_object' },
                     messages: [
                         { role: 'system', content: 'You are a B2B procurement data expert. Always respond with valid JSON.' },

@@ -145,16 +145,33 @@ const GEMINI_MODEL_FALLBACK_CHAIN = [
     'gemini-2.5-pro',
 ].filter((m, i, a) => m && a.indexOf(m) === i);
 
+// Claude fallback — 用户指令 2026-05-20：把 Claude 调到 Gemini 之后、OpenAI 之前
+// 用户钦定默认 model: claude-sonnet-4-6（性价比 + 稳定，2.3s）
+// 实测（zhimao apps/web/scripts/test-claude-openai-models.mjs）：
+//   - claude-sonnet-4-6 2.3s ✓ 默认
+//   - claude-opus-4-7   1.4s ✓ 最快质量兜底
+//   - claude-opus-4-6   1.7s ✓
+//   - claude-sonnet-4-5 1.5s ✓ 更便宜兜底
+//   - claude-sonnet-4-7 404 不存在
+const DEFAULT_CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
+const CLAUDE_MODEL_FALLBACK_CHAIN = [
+    DEFAULT_CLAUDE_MODEL,
+    'claude-sonnet-4-6',
+    'claude-opus-4-7',
+    'claude-opus-4-6',
+    'claude-sonnet-4-5',
+].filter((m, i, a) => m && a.indexOf(m) === i);
+
 function isGeminiModelUnavailableError(err) {
     const msg = String(err?.message || err || '').toLowerCase();
     return msg.includes('not found') || msg.includes('not supported') || msg.includes('is not found for api version');
 }
 
 // ─── callGeminiJson ─────────────────────────────────────────────────────────
-// 模型分级策略（按任务复杂度）：
-//   复杂任务（L3）→ GEMINI_MODEL（默认 gemini-3.1-pro-preview）
-//   简单任务     → GEMINI_FAST_MODEL（默认 gemini-3.1-flash-lite）
-//   Gemini 全失败 → OpenAI 自动兜底（OPENAI_API_KEY）
+// Provider 优先级（用户指令 2026-05-20）：
+//   1. Gemini（GEMINI_MODEL，默认 gemini-3.1-pro-preview，含模型 fallback chain）
+//   2. Claude（ANTHROPIC_API_KEY，默认 claude-opus-4-7，含模型 fallback chain）← NEW
+//   3. OpenAI（OPENAI_API_KEY，默认 gpt-5.4）
 async function callGeminiJson(promptText, {
     apiKey,
     model = DEFAULT_GEMINI_MODEL,
@@ -163,8 +180,10 @@ async function callGeminiJson(promptText, {
     maxRetries = 3,
     label = 'gemini',
     openaiApiKey = process.env.OPENAI_API_KEY || '',
-    // 兜底模型：gpt-4o（广泛可用）；如账户支持 gpt-5.5 可在 env 中覆盖
-    openaiModel  = process.env.OPENAI_MODEL    || 'gpt-4o',
+    // OpenAI 兜底：用户硬规则 GPT-5.4+
+    openaiModel  = process.env.OPENAI_MODEL    || 'gpt-5.4',
+    claudeApiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '',
+    claudeModel  = DEFAULT_CLAUDE_MODEL,
     disableFallback = false,
 } = {}) {
     if (!apiKey) throw new Error('GEMINI_KEY required');
@@ -212,15 +231,77 @@ async function callGeminiJson(promptText, {
         }
     }
 
-    // ── 2. OpenAI 兜底（Gemini 限流/错误时自动切换）────────────────────────────
+    // ── 2. Claude 兜底（用户指令 2026-05-20：Claude 在 OpenAI 之前）────────────
+    let claudeError = null;
+    if (!disableFallback && claudeApiKey) {
+        const claudeModelsToTry = [claudeModel, ...CLAUDE_MODEL_FALLBACK_CHAIN].filter(
+            (m, i, a) => m && a.indexOf(m) === i,
+        );
+        for (const tryClaudeModel of claudeModelsToTry) {
+            try {
+                console.warn(`[${label}] → Falling back to Claude ${tryClaudeModel}...`);
+                const claudeBody = JSON.stringify({
+                    model: tryClaudeModel,
+                    max_tokens: 4096,
+                    temperature,
+                    system:
+                        'You are a B2B procurement data extraction assistant. Respond ONLY with a valid JSON object. No markdown fences, no explanation.',
+                    messages: [{ role: 'user', content: promptText }],
+                });
+                const r = await requestJsonWithRetry({
+                    hostname: 'api.anthropic.com',
+                    path: '/v1/messages',
+                    method: 'POST',
+                    headers: {
+                        'x-api-key': claudeApiKey,
+                        'anthropic-version': '2023-06-01',
+                    },
+                    body: claudeBody,
+                    timeoutMs: timeoutMs + 5_000,
+                    maxRetries: 2,
+                    label: `${label}/claude-fallback`,
+                });
+                if (r.error) throw new Error(`claude_failed: ${r.error.message}`);
+                if (!r.json) throw new Error(`claude_parse_failed: status=${r.statusCode}`);
+                if (r.json.error) throw new Error(`claude_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
+                const text = (r.json?.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('').trim();
+                if (!text) throw new Error('claude_empty_response');
+                // Claude 偶尔包 ```json ... ```，剥一下
+                const cleaned = text.replace(/^```[a-z]*\n?/im, '').replace(/\n?```$/m, '').trim();
+                const result = JSON.parse(cleaned);
+                if (tryClaudeModel !== claudeModel) {
+                    console.log(`[${label}] Claude succeeded with fallback model ${tryClaudeModel}`);
+                } else {
+                    console.log(`[${label}] Claude fallback succeeded (${tryClaudeModel})`);
+                }
+                return result;
+            } catch (clErr) {
+                claudeError = clErr;
+                const msg = String(clErr.message || '');
+                // 模型不存在 → 试下一个；其他错误 → 中断 Claude 链路转 OpenAI
+                if (msg.includes('not_found') || msg.includes('404') || msg.includes('claude_text_not_json')) {
+                    console.warn(`[${label}] Claude model ${tryClaudeModel} not available (${msg.slice(0, 80)}), trying next…`);
+                    continue;
+                }
+                console.warn(`[${label}] Claude failed (${msg.slice(0, 100)})`);
+                break;
+            }
+        }
+    }
+
+    // ── 3. OpenAI 兜底（用户指令 2026-05-20：第三位）─────────────────────────
     if (disableFallback || !openaiApiKey) {
         throw geminiError;
     }
     console.warn(`[${label}] → Falling back to OpenAI ${openaiModel}...`);
     try {
+        // GPT-5 系列：max_tokens → max_completion_tokens（实测 2026-05-20，参数名变更）
+        const isGpt5Plus = /^gpt-5/i.test(openaiModel);
+        const tokenField = isGpt5Plus ? 'max_completion_tokens' : 'max_tokens';
         const oaBody = JSON.stringify({
             model: openaiModel,
             temperature,
+            [tokenField]: 4096,
             response_format: { type: 'json_object' },
             messages: [
                 { role: 'system', content: 'You are a B2B procurement data extraction assistant. Always respond with valid JSON.' },
@@ -233,7 +314,7 @@ async function callGeminiJson(promptText, {
             method: 'POST',
             headers: { Authorization: `Bearer ${openaiApiKey}` },
             body: oaBody,
-            timeoutMs: timeoutMs + 10_000, // OpenAI 通常比 Gemini 慢，给额外余量
+            timeoutMs: timeoutMs + 10_000,
             maxRetries: 2,
             label: `${label}/openai-fallback`,
         });
@@ -246,7 +327,8 @@ async function callGeminiJson(promptText, {
         console.log(`[${label}] OpenAI fallback succeeded`);
         return result;
     } catch (oaErr) {
-        throw new Error(`both_llm_failed: gemini=(${geminiError.message.slice(0, 80)}), openai=(${oaErr.message.slice(0, 80)})`);
+        const claudeMsg = claudeError ? `, claude=(${String(claudeError.message || '').slice(0, 60)})` : '';
+        throw new Error(`all_llm_failed: gemini=(${geminiError.message.slice(0, 60)})${claudeMsg}, openai=(${oaErr.message.slice(0, 60)})`);
     }
 }
 

@@ -27,8 +27,11 @@ const GEMINI_KEY   = process.env.GEMINI_KEY;
 // Step3 L3 供应链推断 — 与 zhimao llmClient / render.yaml 对齐（勿用已下线的 preview-04-17）
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
 const OPENAI_KEY   = process.env.OPENAI_API_KEY || '';
-// L3 推断是最复杂的任务，兜底用最强模型 gpt-4o（gpt-5.5 仅在部分账户可用）
-const OPENAI_MODEL = process.env.OPENAI_MODEL   || 'gpt-4o';
+// L3 推断是最复杂的任务；用户指令 2026-05-20：OpenAI 第三位、用 GPT-5.4+
+// （render.yaml 生产 env 已设 OPENAI_MODEL=gpt-5.5；本地 .env 可覆盖）
+const OPENAI_MODEL = process.env.OPENAI_MODEL   || 'gpt-5.4';
+const CLAUDE_KEY   = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 if (!GEMINI_KEY) { console.error('[step3] GEMINI_KEY env var is required'); process.exit(1); }
 
 const GMAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
@@ -160,6 +163,8 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                 label: `step3/L3.b${batchIndex}`,
                 openaiApiKey: OPENAI_KEY,
                 openaiModel:  OPENAI_MODEL,
+                claudeApiKey: CLAUDE_KEY,
+                claudeModel:  CLAUDE_MODEL,
             });
         } catch (e) {
             console.warn(`[step3] L3 batch ${batchIndex}/${batchTotal} FAILED after ${Date.now() - startedAt}ms: ${e.message}`);
