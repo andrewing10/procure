@@ -84,11 +84,60 @@ const fileBus = {
     t5_final:         `${sessionId}/05_final_routing.json`,
 };
 
+/**
+ * 热读 action_payload.negative_keywords 并合并到 CONVO_CONTROLS。
+ * 在 step1 完成后调用，让 step2/step5 的 keywordSuppress 能感知运行期注入的排除词。
+ * Supabase 不可用时静默降级（不阻断 pipeline）。
+ */
+async function refreshLiveNegativeKeywords() {
+    const jobId = process.env.DISCOVERY_JOB_ID;
+    const url   = process.env.SUPABASE_URL;
+    const key   = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!jobId || !url || !key) return;
+
+    try {
+        const res = await fetch(
+            `${url}/rest/v1/discovery_jobs?id=eq.${encodeURIComponent(jobId)}&select=action_payload`,
+            { headers: { apikey: key, Authorization: `Bearer ${key}`, Accept: 'application/json' } }
+        );
+        if (!res.ok) return;
+        const rows = await res.json();
+        const ap = rows?.[0]?.action_payload;
+        if (!ap || typeof ap !== 'object') return;
+
+        const liveKw = Array.isArray(ap.negative_keywords)
+            ? ap.negative_keywords.filter(k => typeof k === 'string' && k.trim()).map(k => k.trim())
+            : [];
+        if (liveKw.length === 0) return;
+
+        // 合并到现有 CONVO_CONTROLS
+        let controls = {};
+        try {
+            const raw = process.env.CONVO_CONTROLS;
+            if (raw) controls = JSON.parse(raw);
+        } catch { /* ignore */ }
+
+        const existingKw = Array.isArray(controls.keywordSuppress) ? controls.keywordSuppress : [];
+        const merged = [...new Set([...existingKw, ...liveKw])];
+        controls.keywordSuppress = merged;
+        process.env.CONVO_CONTROLS = JSON.stringify(controls);
+
+        console.log(`[master] live negative_keywords refreshed: [${merged.join(', ')}] — will apply from step2 onwards`);
+    } catch (e) {
+        console.warn(`[master] refreshLiveNegativeKeywords failed (non-fatal):`, e?.message || e);
+    }
+}
+
 // PHASE 0: Geo-Drill & Bilingual Dorks
 runAssertedStep("0. Geo-Orchestrator & Translator", "v8_step0_ultimate_translator.js", [], fileBus.t0_orchestration, `"${countryCode}" "${category}"`);
 
 // PHASE 1: Multi-Pillar Omni-Collection
 runAssertedStep("1. Omni-Pillar Collection (6+1 Hub)", "v8_step1_omni_hub.js", fileBus.t0_orchestration, fileBus.t1_raw_pool, `"${countryCode}"`);
+
+// ── 热读排除词（step1 结束后，step2 开始前）──────────────────────────────────
+// 用户在 step1 运行期间通过前端注入的 negative_keywords 会写入 action_payload；
+// 此处从 DB 同步最新词表到 CONVO_CONTROLS，让 step2 preFilterRawLeads 能感知。
+(async () => { try { await refreshLiveNegativeKeywords(); } catch (_) {} })();
 
 // PHASE 2: LLM Anti-Hallucination & CN-Filter Intake
 runAssertedStep("2. Strict Entity Intake", "v8_step2_intake.js", fileBus.t1_raw_pool, fileBus.t2_intake);
