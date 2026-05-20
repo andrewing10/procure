@@ -237,7 +237,11 @@ function inferEntityType({ domain, snippet, companyName }) {
     const host = getHost(domain);
     const text = `${snippet || ''} ${companyName || ''}`.toLowerCase();
     if (SOCIAL_DOMAIN_HOSTS.has(host) || SOCIAL_TEXT_RE.test(text)) return 'social';
-    if (AGGREGATOR_DOMAIN_HOSTS.has(host)) return 'aggregator';
+    // bug 修复：旧实现只查 AGGREGATOR_DOMAIN_HOSTS.has(host) 精确匹配，
+    // foo.bbb.org / free.globalimporter.net 这种子域全漏过——下游 isAggregatorDomain 又做了子域检查，
+    // 导致 entity_type='company' 通过但 premium 判定时 hasOwnedDomain=false。
+    // 现统一用 isAggregatorDomain，子域也算 aggregator。
+    if (isAggregatorDomain(domain)) return 'aggregator';
     if (NEWS_TEXT_RE.test(text)) return 'media';
     return 'company';
 }
@@ -418,7 +422,11 @@ function computeQualityGrade({
 }
 
 // ── 已结业/停止营业检测 ─────────────────────────────────────────────────────
-const CLOSED_BIZ_RE = /\b(permanently\s+clos|closed\s+down|ceased\s+operat|no\s+longer\s+operat|out\s+of\s+business|went\s+bankrupt|liquidat|already\s+clos|has\s+clos|have\s+clos|已结业|已停业|停止营业|结业清货|倒闭|停办|已停止营业|停业了|不再营业)\b/i;
+// bug 修复：旧 regex 用 `permanently\s+clos\b` —— `\b` 在 `clos|e` 之间不是词边界
+// （e 是词字符），导致最常见的 "permanently closed" 永远匹配不到 → CLOSED_BIZ 自检从来没生效。
+// 现把所有 `clos` / `operat` / `liquidat` 等截断动词词根改为带 `\w*` 后缀，
+// 兼容 closed / closing / operated / liquidated 等屈折变体。
+const CLOSED_BIZ_RE = /(permanently\s+clos\w*|closed\s+down|ceased\s+operat\w*|no\s+longer\s+operat\w*|out\s+of\s+business|went\s+bankrupt|liquidat\w*|already\s+clos\w*|has\s+clos\w*|have\s+clos\w*|已结业|已停业|停止营业|结业清货|倒闭|停办|已停止营业|停业了|不再营业)/i;
 
 /**
  * snippet/summary 是否含结业信号
@@ -465,8 +473,36 @@ function inferProcurementSignalCount(lead) {
     return Math.min(count, 5);
 }
 
+/**
+ * 所有 unqualified 的精确 reason 枚举。
+ * 运维 / 矩阵 dashboard 可按 reason 分组统计 worker 拒绝分布。
+ *
+ * 用于 metric 上报（每个 V8 跑批结束后聚合）：
+ *   reason -> count -> 占比；以便发现某天突涨某 reason 时定位上游问题。
+ */
+const REJECT_REASONS = Object.freeze({
+    NO_COMPANY_NAME:       'no_company_name',
+    JUNK_NAME:             'junk_name',
+    JUNK_DOMAIN:           'junk_domain',
+    CLOSED_BUSINESS:       'closed_business',
+    COUNTRY_MISMATCH:      'country_mismatch',
+    ENTITY_TYPE_SOCIAL:    'entity_type_social',
+    ENTITY_TYPE_MEDIA:     'entity_type_media',
+    ENTITY_TYPE_AGGREGATOR:'entity_type_aggregator',
+    BIZ_TYPE_BLACKLISTED:  'biz_type_blacklisted',
+    NO_CONTACT:            'no_contact',
+    CONFIDENCE_LOW:        'confidence_low',
+    NO_PROCUREMENT_ITEMS:  'no_procurement_items',
+});
+
 function evaluateLead(lead) {
-    if (!lead || !lead.company_name) return { qualified: false, grade: 'unqualified', reason: 'no_company_name' };
+    // ─── A 公司名级 ────────────────────────────────────────────────────
+    if (!lead || !lead.company_name) {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.NO_COMPANY_NAME };
+    }
+    if (isJunkName(lead.company_name)) {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.JUNK_NAME };
+    }
 
     const snippetText = [
         lead.snippet,
@@ -475,35 +511,73 @@ function evaluateLead(lead) {
         lead.intent_summary_zh,
     ].filter(Boolean).join(' ');
 
+    // ─── B 业态级 ──────────────────────────────────────────────────────
+    if (isBizTypeBlacklisted(lead.company_name)) {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.BIZ_TYPE_BLACKLISTED };
+    }
+
+    // ─── C 实体类型级（先于 junk_domain：social/aggregator 是更精确的语义判定，
+    //                  facebook.com / instagram.com / foo.bbb.org 这种应该报 social/aggregator
+    //                  而非更宽泛的 junk_domain）─────────────────────────
     const entityType = inferEntityType({
         domain: lead.domain,
         snippet: snippetText,
         companyName: lead.company_name,
     });
-
-    // 拦截新闻媒体来源
-    if (isJunkDomain(lead.domain) && lead.domain) {
-        return { qualified: false, grade: 'unqualified', reason: 'junk_domain' };
+    if (entityType === 'social') {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.ENTITY_TYPE_SOCIAL };
+    }
+    if (entityType === 'media') {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.ENTITY_TYPE_MEDIA };
+    }
+    if (entityType === 'aggregator') {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.ENTITY_TYPE_AGGREGATOR };
     }
 
-    // 拦截已结业商家（检查 snippet / summary）
+    // ─── D 域名级（兜底）──────────────────────────────────────────────
+    if (lead.domain && isJunkDomain(lead.domain)) {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.JUNK_DOMAIN };
+    }
+
+    // ─── E 已结业 ──────────────────────────────────────────────────────
     if (isClosedBusiness(snippetText)) {
-        return { qualified: false, grade: 'unqualified', reason: 'closed_business' };
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.CLOSED_BUSINESS };
     }
 
+    // ─── F 国家级 ──────────────────────────────────────────────────────
     const countryMatch = assessCountryMatchLevel({
         targetCountry: lead.country,
         text: snippetText,
         domain: lead.domain,
         phone: lead.primary_phone,
     });
+    if (countryMatch === 'low') {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.COUNTRY_MISMATCH };
+    }
 
+    // ─── G 联系方式级（根切：!hasContact 一律 unqualified） ─────────────
+    const domainIsJunk = isJunkDomain(lead.domain);
+    const hasRealDomain = Boolean(lead.domain && String(lead.domain).trim()) && !domainIsJunk;
+    const hasEmail = Boolean(lead.primary_email && String(lead.primary_email).trim() && String(lead.primary_email).includes('@'));
+    const hasPhone = Boolean(lead.primary_phone && String(lead.primary_phone).trim() && String(lead.primary_phone).replace(/\D/g, '').length >= 6);
+    const hasContact = hasRealDomain || hasEmail || hasPhone;
+    if (!hasContact) {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.NO_CONTACT };
+    }
+
+    // ─── H L3 推断级 ──────────────────────────────────────────────────
     const ib = (lead.inference_breakdown && typeof lead.inference_breakdown === 'object')
         ? lead.inference_breakdown
         : null;
+    if (ib && ib.confidence_tier && String(ib.confidence_tier).toLowerCase() === 'low') {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.CONFIDENCE_LOW };
+    }
+    if (ib && ib.confidence_tier && Array.isArray(ib.procurement_items) && ib.procurement_items.length === 0) {
+        return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.NO_PROCUREMENT_ITEMS };
+    }
 
+    // ─── I 走到这里 = qualified 或 premium，交由 computeQualityGrade 升级判断 ─
     const procurementSignalCount = inferProcurementSignalCount(lead);
-
     const grade = computeQualityGrade({
         nameCanonical:           lead.company_name,
         domain:                  lead.domain          || null,
@@ -517,7 +591,12 @@ function evaluateLead(lead) {
         procurementSignalCount:  procurementSignalCount,
     });
 
-    return { qualified: grade !== 'unqualified', grade };
+    // 兜底：computeQualityGrade 仍可能返回 unqualified（如 confidenceTier=low + hasProcurementItems=false 等
+    // 已被前面捕获的组合）。此处不应触发，但保留兜底 reason 以便发现规则漂移。
+    if (grade === 'unqualified') {
+        return { qualified: false, grade: 'unqualified', reason: 'compute_grade_unqualified' };
+    }
+    return { qualified: true, grade };
 }
 
 module.exports = {
@@ -529,4 +608,5 @@ module.exports = {
     isClosedBusiness,
     inferProcurementSignalCount,
     evaluateLead,
+    REJECT_REASONS,
 };
