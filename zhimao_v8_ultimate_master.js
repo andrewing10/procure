@@ -16,16 +16,45 @@ const category = args.slice(1).join(' ');
 const sessionId = `v8_ultimate_${countryCode}_${Date.now()}`;
 fs.mkdirSync(sessionId, { recursive: true });
 
+/**
+ * Graceful cancel 标志：worker 通过 SIGTERM 通知取消。
+ * 普通 step 接到信号后，等当前 execSync 子进程结束（或被中断），
+ * 然后跳过剩余的富化步骤，但**强制运行 step4（去重）和 step5（持久化）**。
+ * 这样即使用户取消，已采集/富化的数据也能落库，不会全损。
+ */
+let gracefulCancel = false;
+process.on('SIGTERM', () => {
+    if (!gracefulCancel) {
+        gracefulCancel = true;
+        console.warn('\n[master] SIGTERM received — graceful cancel mode: will skip remaining enrichment but COMPLETE step4+5 to persist collected data.');
+    }
+});
+
 function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs = "") {
+    // ── Graceful cancel：跳过耗时的富化步骤，但不跳过去重和持久化 ──────────────
+    // step4 = "4. Global Dedupe", step5 = "5. Routing & Persistence"
+    const isPersistenceStep = stepName.startsWith("4.") || stepName.startsWith("5.");
+    if (gracefulCancel && !isPersistenceStep) {
+        console.warn(`[master] graceful cancel — skipping ${stepName}`);
+        return null;
+    }
+
     console.log(`\n>>> [STEP: ${stepName}] <<<`);
 
     const inputs = Array.isArray(inputFiles) ? inputFiles : [inputFiles];
     inputs.forEach(inf => {
         if (inf && !fs.existsSync(inf)) {
+            if (gracefulCancel) {
+                // cancel 期间输入文件缺失（该步骤被跳过），静默退出
+                console.warn(`[master] graceful cancel — input '${inf}' missing for ${stepName}, skipping`);
+                return;
+            }
             console.error(`[HALT] Required input '${inf}' missing.`);
             process.exit(1);
         }
     });
+    // 如果 cancel 期间所有 input 都缺失，直接跳过
+    if (gracefulCancel && inputs.every(inf => inf && !fs.existsSync(inf))) return null;
 
     const inputArg = inputs.join(',');
     const cmd = `node ${scriptFile} "${inputArg}" "${outputFile}" ${extraArgs}`;
@@ -34,6 +63,15 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
     try {
         execSync(cmd, { stdio: 'inherit' });
     } catch (e) {
+        if (gracefulCancel) {
+            // step 被 cancel 中断（execSync 异常），检查输出是否有部分数据
+            if (fs.existsSync(outputFile)) {
+                console.warn(`[master] graceful cancel — ${stepName} interrupted but partial output exists, continuing to persistence...`);
+                return null;
+            }
+            console.warn(`[master] graceful cancel — ${stepName} interrupted, no output, skipping.`);
+            return null;
+        }
         console.error(`[HALT] Script crashed: ${scriptFile}. Error: ${e.message}`);
         // 写入 job-scoped 崩溃文件，供 v8_discovery_worker.js 在 markFailed 时读取
         const jobId = process.env.DISCOVERY_JOB_ID || 'unknown';
@@ -161,9 +199,21 @@ if (process.env.TAX_VERIFY_ENABLED === 'true') {
 }
 
 // PHASE 4: Global Dedupe & Schema Normalization
-runAssertedStep("4. Global Dedupe", "v8_step4_dedupe.js", fileBus.t3_enriched, fileBus.t4_deduped, `"${countryCode}"`);
+// graceful cancel 期间：用最佳可用输入（step3 输出 → step2 输出），确保有数据可去重
+const bestAvailableForDedupe = [fileBus.t3_enriched, fileBus.t2_intake]
+    .find(f => fs.existsSync(f)) ?? fileBus.t3_enriched;
+if (gracefulCancel && bestAvailableForDedupe !== fileBus.t3_enriched) {
+    console.warn(`[master] graceful cancel — step3 output missing, using ${bestAvailableForDedupe} for dedupe`);
+}
+runAssertedStep("4. Global Dedupe", "v8_step4_dedupe.js", bestAvailableForDedupe, fileBus.t4_deduped, `"${countryCode}"`);
 
 // PHASE 5: Routing Gateway → Supabase L1 + graph edges
 runAssertedStep("5. Routing & Persistence Gateway", "v8_step5_routing_gateway.js", fileBus.t4_deduped, fileBus.t5_final);
 
-console.log(`\n[V8 PIPELINE COMPLETE] Session: ${sessionId}`);
+if (gracefulCancel) {
+    console.log(`\n[V8 PIPELINE GRACEFUL CANCEL] Data persisted. Session: ${sessionId}`);
+    // 退出码 4 = graceful cancel with data — worker 识别后执行 finalize（不计为失败）
+    process.exitCode = 4;
+} else {
+    console.log(`\n[V8 PIPELINE COMPLETE] Session: ${sessionId}`);
+}

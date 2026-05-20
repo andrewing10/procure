@@ -44,11 +44,14 @@ function sleep(ms) {
 //   0 → 全量写入成功
 //   1 → 脚本崩溃 / 配置错误 → markFailed
 //   2 → 本轮无新数据（graceful stop）→ markDone 但标记 result_count 来自 bulk 侧
+//   3 → 子进程被 cancel SIGTERM 终止（无数据持久化），语义上不是"失败"
+//   4 → graceful cancel with data：SIGTERM 到达后 master 仍完成了 step4/5 持久化
 const PIPELINE_EXIT = {
   SUCCESS: 0,
   CRASH: 1,
   NO_DATA: 2,
-  CANCELLED: 3, // 子进程被 cancel SIGTERM 终止，语义上不是"失败"
+  CANCELLED: 3,
+  GRACEFUL_CANCEL_WITH_DATA: 4,
 };
 
 async function readReweightPolicies(job) {
@@ -183,8 +186,14 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
     child.on('close', (code) => {
       watcher.cleanup();
       if (watcher.triggered) {
-        // 被 cancel 信号终止，使用专属退出码，不污染"失败"统计
-        resolve(PIPELINE_EXIT.CANCELLED);
+        // cancel 信号已发送。
+        // exit 4 = master 完成了 graceful cancel with data，应 finalize
+        // 其他 = 被中途杀死，跳过 finalize
+        if (code === PIPELINE_EXIT.GRACEFUL_CANCEL_WITH_DATA) {
+          resolve(PIPELINE_EXIT.GRACEFUL_CANCEL_WITH_DATA);
+        } else {
+          resolve(PIPELINE_EXIT.CANCELLED);
+        }
         return;
       }
       resolve(code ?? 1);
@@ -339,10 +348,16 @@ async function main() {
       const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount, job, reweightPolicies);
 
       // CANCELLED 退出码 或 DB 仍显示 cancelled → 均跳过 finalize，不计为失败
+      // 例外：退出码 4（GRACEFUL_CANCEL_WITH_DATA）= master 已完成 step4/5，有数据入库 → 正常 finalize
       if (exitCode === PIPELINE_EXIT.CANCELLED || await isJobCancelled(supabase, job.id)) {
-        console.log(`[worker] job ${job.id} cancelled — skip finalize`);
-        await sleep(1000);
-        continue;
+        if (exitCode === PIPELINE_EXIT.GRACEFUL_CANCEL_WITH_DATA) {
+          console.log(`[worker] job ${job.id} cancelled but master persisted data (exit 4) — running finalize`);
+          // 继续往下走，正常 markDone
+        } else {
+          console.log(`[worker] job ${job.id} cancelled — skip finalize`);
+          await sleep(1000);
+          continue;
+        }
       }
 
       if (exitCode === PIPELINE_EXIT.CRASH) {
