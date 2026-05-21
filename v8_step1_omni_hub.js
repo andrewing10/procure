@@ -17,9 +17,11 @@ const {
   readFullPillar0Payload,
   readInlineSeeds,
   buildQuerySubjects,
+  buildLocalQuerySubjects,
   quoteSubject,
   pickSubject,
   collectBooleanQueries,
+  collectLocalBooleanQueries,
   collectProcurementQueries,
   sanitizeDiscoveryCategory,
 } = require('./v8_lib_pillar0');
@@ -443,8 +445,18 @@ async function run() {
   const organicNum = controls.weights.generic < 0.5 ? 10 : (controls.weights.generic >= 1.2 ? 30 : 20);
   const booleanQueries = collectBooleanQueries(data, pillar0Payload);
   const procurementQueries = collectProcurementQueries(data, pillar0Payload);
+  // P1 本地化（2026-05-21）：收集目标国母语 boolean / subjects，p_pillar0_boolean
+  // 同时跑英文 + 本地语两批，提升日本/德国/西班牙等非英语市场的 SERP 命中率。
+  const localBooleanQueries = collectLocalBooleanQueries(data, pillar0Payload);
+  const localQuerySubjects = buildLocalQuerySubjects(data, pillar0Payload);
   if (querySubjects.length > 1) {
     console.log(`[step1] querySubjects(${querySubjects.length}): ${querySubjects.slice(0, 4).join(' | ')}…`);
+  }
+  if (localQuerySubjects.length > 0 || localBooleanQueries.length > 0) {
+    console.log(
+      `[step1] localized search active: ${localQuerySubjects.length} local subjects, ` +
+      `${localBooleanQueries.length} local boolean queries (target_lang=${data?.targetLanguageHint || data?.targetLang || '?'})`
+    );
   }
 
   // ── Pillar 定义（每个 Pillar 都是一个 Promise，全部同时启动） ──────────────
@@ -530,21 +542,40 @@ async function run() {
     })(),
 
   // ── Pillar0 布尔查询（expand-query boolean_queries / step0 落盘）──────────
+    // P1 multi-lang rotation（2026-05-21）：同时跑英文 boolean + 本地语 boolean，
+    // 让 SERP 同时命中"国际化大品牌"和"本地连锁/商社/协会"。
     p_pillar0_boolean: (async () => {
-      const queries = booleanQueries.length > 0
+      const enQueries = booleanQueries.length > 0
         ? booleanQueries
         : (baseQuery ? [baseQuery] : []);
-      if (!queries.length) return [];
-      const pages = await Promise.all(
-        queries.slice(0, 5).map((bq) => searchOrganicMultiPage(bq, cc, organicNum).catch(() => [])),
+      const localQueries = localBooleanQueries; // 本地语 boolean（jp/de/es/...）
+      if (enQueries.length === 0 && localQueries.length === 0) return [];
+
+      const enPages = await Promise.all(
+        enQueries.slice(0, 5).map((bq) => searchOrganicMultiPage(bq, cc, organicNum).catch(() => [])),
       );
-      return pages.flat().map((o) => ({
+      const localPages = await Promise.all(
+        localQueries.slice(0, 3).map((bq) => searchOrganicMultiPage(bq, cc, organicNum).catch(() => [])),
+      );
+
+      const enResults = enPages.flat().map((o) => ({
         title: o.title,
         link: o.link,
         snippet: o.snippet,
         pillar: 'Pillar 0 Boolean',
         intent_signal: 'PILLAR0_BOOLEAN',
       }));
+      const localResults = localPages.flat().map((o) => ({
+        title: o.title,
+        link: o.link,
+        snippet: o.snippet,
+        pillar: 'Pillar 0 Boolean Local',
+        intent_signal: 'PILLAR0_BOOLEAN_LOCAL',
+      }));
+      if (localResults.length > 0) {
+        console.log(`[step1] p_pillar0_boolean: en=${enResults.length} local=${localResults.length}`);
+      }
+      return [...enResults, ...localResults];
     })(),
 
     p_procurement: (async () => {

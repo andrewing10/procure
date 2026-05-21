@@ -104,6 +104,12 @@ async function run() {
     let pillar0Personas = [];
     let pillar0BooleanQueries = [];
     let procurementQueries = [];
+    // P1 本地化（2026-05-21）：从 PILLAR0_PAYLOAD 读取 zhimao 已生成的目标国母语字段，
+    // 优先级高于 step0 自己 LLM 翻译路径（zhimao LLM 一次推理得出的本地词更精准）。
+    let pillar0LocalKeywords = [];
+    let pillar0LocalPersonas = [];
+    let pillar0LocalBooleanQueries = [];
+    let pillar0TargetLanguage = '';
     try {
         const raw = process.env.PILLAR0_PAYLOAD;
         if (raw && raw.trim().startsWith('{')) {
@@ -116,15 +122,32 @@ async function run() {
                     .map((p) => p.industry_en || p.industry_zh || p.industry || p.name)
                     .filter(Boolean)
                     .slice(0, 8);
+                // 本地语 personas（如日文 industry_local）
+                pillar0LocalPersonas = p0.buyer_personas
+                    .map((p) => p.industry_local)
+                    .filter((s) => typeof s === 'string' && s.trim())
+                    .slice(0, 8);
             }
             if (Array.isArray(p0.boolean_queries) && p0.boolean_queries.length > 0) {
                 pillar0BooleanQueries = p0.boolean_queries.slice(0, 5);
             }
+            if (Array.isArray(p0.boolean_queries_local) && p0.boolean_queries_local.length > 0) {
+                pillar0LocalBooleanQueries = p0.boolean_queries_local.slice(0, 5);
+            }
+            if (Array.isArray(p0.expanded_keywords_local) && p0.expanded_keywords_local.length > 0) {
+                pillar0LocalKeywords = p0.expanded_keywords_local.slice(0, 20);
+            }
             if (Array.isArray(p0.procurement_queries) && p0.procurement_queries.length > 0) {
                 procurementQueries = p0.procurement_queries.slice(0, 6);
             }
+            if (typeof p0.target_language === 'string' && p0.target_language.trim()) {
+                pillar0TargetLanguage = p0.target_language.trim();
+            }
             if (pillar0Keywords.length > 0 || pillar0Personas.length > 0) {
                 console.log(`[step0] Pillar 0 payload loaded: ${pillar0Keywords.length} keywords, ${pillar0Personas.length} personas`);
+                if (pillar0LocalKeywords.length > 0 || pillar0LocalPersonas.length > 0) {
+                    console.log(`[step0] Pillar 0 LOCAL (${pillar0TargetLanguage || targetLang || 'unknown'}) loaded: ${pillar0LocalKeywords.length} keywords, ${pillar0LocalPersonas.length} personas, ${pillar0LocalBooleanQueries.length} boolean`);
+                }
             }
         }
     } catch (e) {
@@ -132,13 +155,42 @@ async function run() {
     }
 
     let baseQuery = '';
+    // 本地语翻译产物（jp/de/es/...）；P0 修复后会与英文 pillar0 并联到最终 query，
+    // 而不是被 pillar0 覆盖。
+    let translatedCategory = '';
+    let nativeIntents = [];
 
     // 判断净化后的品类是否已是纯英文（无中文/日文/韩文/阿拉伯文等 Unicode 区段），
     // 若是则跳过 LLM 翻译直接用英文模板——避免 LLM 误改导致 exit(1) + 节省费用。
     const hasNonLatin = /[\u0080-\uFFFF]/.test(categoryClean);
     const isAlreadyEnglish = !hasNonLatin;
 
-    if (targetLang !== 'English' && !isAlreadyEnglish) {
+    // P1 优先级（2026-05-21）：如果 zhimao 已经给了本地化字段（pillar0LocalPersonas
+     // 至少 1 条 + pillar0LocalBoolean 至少 1 条），跳过 step0 自己 LLM 翻译，
+     // 直接用 zhimao 输出的本地词构建 baseQuery —— 减少 LLM 调用 + 避免双重翻译漂移。
+    const hasZhimaoLocal = pillar0LocalPersonas.length > 0 && pillar0LocalBooleanQueries.length > 0;
+    if (hasZhimaoLocal) {
+        translatedCategory = pillar0LocalPersonas[0]; // 用第一个本地 persona 作为本地品类
+        // 从 boolean_queries_local 抽取 4 个最高频的本地意图词（最简方法：split AND/OR 取前 4 个 quoted token）
+        const intentSet = new Set();
+        for (const bq of pillar0LocalBooleanQueries) {
+            const matches = String(bq).match(/"([^"]+)"/g) || [];
+            for (const m of matches) {
+                const w = m.replace(/"/g, '').trim();
+                if (w && !intentSet.has(w)) {
+                    intentSet.add(w);
+                    if (intentSet.size >= 6) break;
+                }
+            }
+            if (intentSet.size >= 6) break;
+        }
+        nativeIntents = Array.from(intentSet).slice(0, 4);
+        if (translatedCategory && nativeIntents.length > 0) {
+            const nativeStr = nativeIntents.map(i => `"${i}"`).join(' OR ');
+            baseQuery = `"${translatedCategory}" (${nativeStr})`;
+            console.log(`[step0] zhimao-local baseQuery: "${translatedCategory}" + ${nativeIntents.length} intent words (${pillar0TargetLanguage || targetLang})`);
+        }
+    } else if (targetLang !== 'English' && !isAlreadyEnglish) {
         // 生成 3 类买家意图词：进口/批发渠道词 + 采购行为词 + 本地行业身份词
         // 使用净化后的 categoryClean 而非原始 category，避免"买家/buyers in X"干扰翻译
         const prompt = `You are a B2B procurement data expert.
@@ -177,8 +229,13 @@ Return ONLY valid JSON with this exact structure:
                 ...(content.buying_intent_words || []),
                 ...(content.company_type_words  || []),
             ].slice(0, 4); // 最多 4 个，避免 query 过长
-            const nativeStr = allIntents.map(i => `"${i}"`).join(' OR ');
-            baseQuery = `"${content.translated_category}" (${nativeStr})`;
+            translatedCategory = String(content.translated_category || '').trim();
+            nativeIntents = allIntents.map(i => String(i || '').trim()).filter(Boolean);
+            const nativeStr = nativeIntents.map(i => `"${i}"`).join(' OR ');
+            if (translatedCategory && nativeStr) {
+                baseQuery = `"${translatedCategory}" (${nativeStr})`;
+                console.log(`[step0] native baseQuery: "${translatedCategory}" + ${nativeIntents.length} intent words (${targetLang})`);
+            }
         }
     }
 
@@ -193,32 +250,61 @@ Return ONLY valid JSON with this exact structure:
 
     // ── Pillar 0 注入：将产业链扩展词追加到搜索策略 ──────────────────────────
     // 例：搜"电池"时扩展为"drone manufacturer OR e-bike assembler OR energy storage brand"
-    // 这让 V8 矩阵能直接找到下游真实买家，而不是搜原始品类词
+    //
+    // P0 修复（2026-05-21）：原来的逻辑是 baseQuery = ... 整个覆盖，导致
+    // step0 LLM 刚翻译好的日文/西文/... baseQuery 被英文 pillar0 完全替换，
+    // 失去本地化优势（日本本地买家网站 90% 用日文，搜不到）。
+    // 新策略：把英文 pillar0 层与本地语 baseQuery 并联——优先生成
+    //   `(本地品类 OR (英文行业层)) AND (本地意图 OR 英文意图)`
+    // 让 SERP 同时命中本地买家网站 + 国际化大品牌。
+    let englishLayer = '';
     if (pillar0Personas.length > 0 || pillar0Keywords.length > 0) {
-        // 优先用买家画像（industry_en）构建精准意图查询
         const intentTerms = [
             ...pillar0Personas.slice(0, 5).map(p => `"${p}"`),
             ...pillar0Keywords.slice(0, 8).map(k => `"${k}"`),
         ];
         if (intentTerms.length > 0) {
-            const intentClause = intentTerms.join(' OR ');
-            // 组合成：(原始品类 OR 扩展下游买家词) AND 采购意图词
-            baseQuery = `(${intentClause}) AND ("importer" OR "buyer" OR "procurement" OR "sourcing" OR "supplier")`;
-            console.log(`[step0] Pillar 0 enhanced query: ${baseQuery.slice(0, 120)}...`);
+            englishLayer = intentTerms.join(' OR ');
         }
     }
 
-    // 写出 step0 结果（含 Pillar 0 扩展词，供 step1+ 使用）
+    if (englishLayer) {
+        const englishIntent = '"importer" OR "buyer" OR "procurement" OR "sourcing" OR "supplier"';
+        if (translatedCategory) {
+            // 本地语 + 英文行业层并联（最完整：日本本地连锁 + 国际化大品牌）
+            const subjectClause = `"${translatedCategory}" OR ${englishLayer}`;
+            const nativeStr = nativeIntents.length > 0
+                ? nativeIntents.map(i => `"${i}"`).join(' OR ') + ' OR '
+                : '';
+            const intentClause = nativeStr + englishIntent;
+            baseQuery = `(${subjectClause}) AND (${intentClause})`;
+            console.log(`[step0] bilingual baseQuery: native + en-pillar0 merged (${targetLang} + English)`);
+        } else {
+            // 没有本地翻译（英语市场 / 翻译失败），退化为原英文 pillar0 query
+            baseQuery = `(${englishLayer}) AND (${englishIntent})`;
+            console.log('[step0] english-only baseQuery: en-pillar0 only');
+        }
+    }
+
+    // 写出 step0 结果（含 Pillar 0 扩展词 + P1 本地化字段，供 step1+ 使用）
     fs.writeFileSync(outputFile, JSON.stringify({
         baseQuery,
         tld,
         countryName,
         countryCode: isoUpper,
-        category,        // 保留原始品类词供 DB 记录展示
-        categoryClean,   // 净化后的搜索品类词，step1 用于构建 query
+        targetLang,                                    // 本地化语种（供 step1 multi-lang rotation 用）
+        targetLanguageHint: pillar0TargetLanguage || targetLang,
+        category,                                      // 保留原始品类词供 DB 记录展示
+        categoryClean,                                 // 净化后的搜索品类词，step1 用于构建 query
+        translatedCategory: translatedCategory || undefined,  // 本地语品类（如 "メガネ"）
+        nativeIntents: nativeIntents.length > 0 ? nativeIntents : undefined,
         // 传递 Pillar 0 原始数据给后续步骤备用
         pillar0Keywords: pillar0Keywords.length > 0 ? pillar0Keywords : undefined,
         pillar0BooleanQueries: pillar0BooleanQueries.length > 0 ? pillar0BooleanQueries : undefined,
+        // P1 本地化（2026-05-21）：transparently pass-through 给 step1 multi-lang rotation
+        pillar0LocalKeywords: pillar0LocalKeywords.length > 0 ? pillar0LocalKeywords : undefined,
+        pillar0LocalPersonas: pillar0LocalPersonas.length > 0 ? pillar0LocalPersonas : undefined,
+        pillar0LocalBooleanQueries: pillar0LocalBooleanQueries.length > 0 ? pillar0LocalBooleanQueries : undefined,
         procurementQueries: procurementQueries.length > 0 ? procurementQueries : undefined,
     }, null, 2));
     console.log(`[step0] Orchestration written → ${outputFile}`);

@@ -3,6 +3,20 @@
  */
 const { sanitizeDiscoveryCategory } = require('./v8_lib_category_sanitize');
 
+/**
+ * 判定一个字符串是否为"纯拉丁可搜索词"（与 zhimao apps/web/lib/skills/querySearchKeywords.ts
+ * isLatinSearchKeyword 镜像）。CJK 字符进 SERP quoted 查询命中率几乎为 0
+ * （SERP 主要索引拉丁文）；buildQuerySubjects 会把 subjects 用 quoteSubject 包成
+ * `"主题"` quoted long string 丢给 SERP，所以 CJK 主题必须过滤掉。
+ */
+function isLatinSearchSubject(s) {
+  const t = String(s || '').trim();
+  if (!t) return false;
+  if (/[\u4e00-\u9fff]/.test(t)) return false;
+  const latin = t.replace(/[^a-zA-Z]/g, '');
+  return latin.length >= 3;
+}
+
 function readFullPillar0Payload() {
   const raw = process.env.PILLAR0_PAYLOAD || '';
   if (!raw.trim()) return {};
@@ -41,21 +55,30 @@ function buildQuerySubjects(step0Data, category, industryAnchor, payload) {
   if (Array.isArray(p.buyer_personas)) {
     for (const persona of p.buyer_personas) {
       if (persona && typeof persona.industry_en === 'string') subjects.push(persona.industry_en);
-      if (persona && typeof persona.industry_zh === 'string') subjects.push(persona.industry_zh);
+      // industry_zh 不再 push 进 subjects —— 它们是展示用 label，不是 SERP 搜索词；
+      // CJK quoted 字符串送 SERP 必 0 命中，反而挤占有效 query 配额。
     }
   }
   if (industryAnchor) {
-    subjects.push(...(industryAnchor.en || []), ...(industryAnchor.zh || []));
+    subjects.push(...(industryAnchor.en || []));
+    // industryAnchor.zh 同上，不进 subjects
   }
+  // 统一过 latin filter（双保险，防 zhimao 老 cache 含 CJK 污染 term）
+  // + dedupe + 取前 12 条
   const seen = new Set();
   const out = [];
   for (const s of subjects) {
-    const t = String(s || '').trim();
-    if (!t) continue;
+    if (!isLatinSearchSubject(s)) continue;
+    const t = String(s).trim();
     const k = t.toLowerCase();
     if (seen.has(k)) continue;
     seen.add(k);
     out.push(t);
+  }
+  // 兜底：如果过滤后空了（极端情况：用户输入纯中文 + 翻译失败），保留原始
+  // category 字面值，让 step1 至少能跑（后续 boolean_queries 仍可能命中）
+  if (out.length === 0 && cat) {
+    out.push(cat);
   }
   return out.slice(0, 12);
 }
@@ -88,6 +111,65 @@ function collectBooleanQueries(step0Data, payload) {
   return out;
 }
 
+/**
+ * P1 本地化（2026-05-21）：收集目标国母语 boolean_queries（日文/西文/...）。
+ * 与 collectBooleanQueries 完全独立通道；step1 的 p_pillar0_boolean pillar
+ * 会同时跑英文 + 本地语两批，最大化命中本地买家网站。
+ */
+function collectLocalBooleanQueries(step0Data, payload) {
+  const p = payload || readFullPillar0Payload();
+  const fromFile = Array.isArray(step0Data?.pillar0LocalBooleanQueries)
+    ? step0Data.pillar0LocalBooleanQueries
+    : [];
+  const fromPayload = Array.isArray(p.boolean_queries_local) ? p.boolean_queries_local : [];
+  const seen = new Set();
+  const out = [];
+  for (const q of [...fromFile, ...fromPayload]) {
+    const s = String(q || '').trim();
+    if (!s || s.length < 8 || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
+/**
+ * P1 本地化：构建本地语 querySubjects（独立于英文 querySubjects）。
+ * 用于 step1 multi-lang rotation：让部分 pillar 用本地语 subject 拼 query。
+ */
+function buildLocalQuerySubjects(step0Data, payload) {
+  const p = payload || readFullPillar0Payload();
+  const out = [];
+  const seen = new Set();
+  const push = (s) => {
+    const t = String(s || '').trim();
+    if (!t) return;
+    const k = t.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(t);
+  };
+  // step0 落盘字段优先（zhimao 已生成）
+  if (step0Data?.translatedCategory) push(step0Data.translatedCategory);
+  if (Array.isArray(step0Data?.pillar0LocalKeywords)) {
+    for (const k of step0Data.pillar0LocalKeywords) push(k);
+  }
+  if (Array.isArray(step0Data?.pillar0LocalPersonas)) {
+    for (const k of step0Data.pillar0LocalPersonas) push(k);
+  }
+  // PILLAR0_PAYLOAD 兜底（极少用，因为 step0 已经把 payload 内容落盘）
+  if (Array.isArray(p.expanded_keywords_local)) {
+    for (const k of p.expanded_keywords_local) push(k);
+  }
+  if (Array.isArray(p.buyer_personas)) {
+    for (const persona of p.buyer_personas) {
+      if (persona && typeof persona.industry_local === 'string') push(persona.industry_local);
+    }
+  }
+  return out.slice(0, 12);
+}
+
 function collectProcurementQueries(step0Data, payload) {
   const p = payload || readFullPillar0Payload();
   const fromFile = Array.isArray(step0Data?.procurementQueries)
@@ -110,9 +192,11 @@ module.exports = {
   readFullPillar0Payload,
   readInlineSeeds,
   buildQuerySubjects,
+  buildLocalQuerySubjects,
   quoteSubject,
   pickSubject,
   collectBooleanQueries,
+  collectLocalBooleanQueries,
   collectProcurementQueries,
   sanitizeDiscoveryCategory,
 };
