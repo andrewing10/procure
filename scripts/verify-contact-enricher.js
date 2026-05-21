@@ -12,7 +12,13 @@ const {
   isLikelyValidEmail,
   isLikelyValidPhone,
   normalizePhone,
+  llmExtractContactFromImage,
 } = require('../v8_lib_contact_enricher');
+const {
+  capturePageScreenshot,
+  isAnyScreenshotProviderAvailable,
+  listAvailableScreenshotProviders,
+} = require('../v8_lib_page_screenshot.cjs');
 
 const homeHtml = `
 <!doctype html>
@@ -139,5 +145,71 @@ if (vtOk) pass++;
 else fail++;
 
 console.log('');
-console.log(`${pass}/${pass + fail} pass`);
-process.exit(fail === 0 ? 0 : 1);
+
+// ── ADV-2：vision 抽取链路烟雾测（仅在配置 SCREENSHOTONE_API_KEY 时跑） ─
+console.log('[ADV-2 vision pipeline]');
+console.log(`  isAnyScreenshotProviderAvailable: ${isAnyScreenshotProviderAvailable()}`);
+console.log(`  providers available: [${listAvailableScreenshotProviders().join(', ')}]`);
+
+if (isAnyScreenshotProviderAvailable()) {
+  (async () => {
+    let visionPass = 0;
+    let visionFail = 0;
+    // Test 1: 真实有 contact 的页面，应当抽到 person
+    const t0 = Date.now();
+    const shot = await capturePageScreenshot('https://www.zoho.com/contact.html', { timeoutMs: 25_000 });
+    if (!shot) {
+      console.log(`  FAIL  截图失败（${Date.now() - t0}ms）`);
+      visionFail++;
+    } else {
+      console.log(`  PASS  截图成功 ${Math.round(shot.bytes / 1024)}KB（${shot.provider}, ${Date.now() - t0}ms）`);
+      visionPass++;
+      const t1 = Date.now();
+      const vis = await llmExtractContactFromImage({
+        imageBase64: shot.base64,
+        imageMime: shot.mime,
+        companyName: 'Zoho Corp',
+        domain: 'zoho.com',
+      });
+      console.log(`        vision LLM: ok=${vis.ok}  persons=${vis.persons.length}  reason=${vis.reason || '—'}  ${Date.now() - t1}ms`);
+      for (const p of vis.persons.slice(0, 5)) {
+        console.log(`          · role=${p.role || '—'}  email=${p.email || '—'}  phone=${p.phone || '—'}  conf=${p.confidence}`);
+      }
+      if (vis.ok && vis.persons.length > 0) {
+        const allDomain = vis.persons.every((p) => !p.email || /@(?:zoho|zohocorp)\./.test(p.email));
+        if (allDomain) {
+          console.log('        PASS  所有 email 为 zoho 同域 ✓');
+          visionPass++;
+        } else {
+          console.log('        FAIL  存在非同域 email');
+          visionFail++;
+        }
+      } else {
+        console.log('        FAIL  vision 应当抽到 ≥1 person');
+        visionFail++;
+      }
+    }
+    // Test 2: 输入 invalid imageBase64 → 应当软失败
+    const visBad = await llmExtractContactFromImage({ imageBase64: '', imageMime: 'image/jpeg' });
+    if (!visBad.ok && visBad.reason === 'no_image') {
+      console.log('  PASS  invalid imageBase64 → 软失败 reason=no_image ✓');
+      visionPass++;
+    } else {
+      console.log(`  FAIL  invalid imageBase64 应当 reason=no_image，实际 ${visBad.reason}`);
+      visionFail++;
+    }
+    pass += visionPass;
+    fail += visionFail;
+    console.log('');
+    console.log(`${pass}/${pass + fail} pass`);
+    process.exit(fail === 0 ? 0 : 1);
+  })().catch((e) => {
+    console.error('vision pipeline 异常:', e);
+    process.exit(1);
+  });
+} else {
+  console.log('  SKIP  capability_missing（未配置 SCREENSHOTONE_API_KEY），跳过 vision case');
+  console.log('');
+  console.log(`${pass}/${pass + fail} pass`);
+  process.exit(fail === 0 ? 0 : 1);
+}

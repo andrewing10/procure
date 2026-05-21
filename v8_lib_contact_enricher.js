@@ -1,23 +1,25 @@
 /**
- * v8_lib_contact_enricher.js — 联系方式抓取 5 层管道（procure 仓 CJS 版）
+ * v8_lib_contact_enricher.js — 联系方式抓取 6 层管道（procure 仓 CJS 版）
  *
- * 镜像 zhimao 仓 `apps/web/lib/skills/{htmlFetcher,contactExtractor,contactLlmExtract}.ts`
- * 三个 lib 的核心逻辑，用于把 v8 step3 enrich 的命中率从 ~20% 拉到 ~80%+。
+ * 镜像 zhimao 仓 `apps/web/lib/skills/{htmlFetcher,contactExtractor,contactLlmExtract,pageScreenshot}.ts`
+ * 四个 lib 的核心逻辑，用于把 v8 step3 enrich 的命中率从 ~20% 拉到 ~85%+。
  *
- * 5 层链路（按顺序，命中即返回，全空才下沉）：
- *   ① 直连 fetch（Chrome UA + 8s）      — 抽 mailto:/tel:/wa.me + 反混淆 + 不带+本地号
- *   ② Bright Data 代理重试              — 403/429/5xx/超时时启用（USE_PROXY=true）
- *   ③ BFS 1 层 contact 子页             — 从 <a href> 发现 contact 内链 + 12 条常见路径兜底
- *   ④ Gemini Flash 视觉抽取             — 静态全空时调用，认 "采购经理 + 邮箱" 语义
- *   ⑤ Serper site:domain 搜索兜底       — 必须 @domain 同域邮箱才纳入（防第三方污染）
+ * 6 层链路（按顺序，命中即返回，全空才下沉；2026-05-21 ADV-2 加 ⑤ 视觉抽取）：
+ *   ① 直连 fetch（Chrome UA + 8s）           — 抽 mailto:/tel:/wa.me + 反混淆 + 不带+本地号
+ *   ② Bright Data 代理重试                   — 403/429/5xx/超时时启用（USE_PROXY=true）
+ *   ③ BFS 1 层 contact 子页                  — 从 <a href> 发现 contact 内链 + 12 条常见路径兜底
+ *   ④ Gemini Flash 文本视觉抽取（visible_text）— 静态全空时调用，认 "采购经理 + 邮箱" 语义
+ *   ⑤ Gemini Vision 截图抽取（PROD-3 / ADV-2）— SCREENSHOTONE_API_KEY 截图 → multimodal 抽 contact
+ *   ⑥ Serper site:domain 搜索兜底            — 必须 @domain 同域邮箱才纳入（防第三方污染）
  *
  * 设计原则：
  *   - 失败安静返回 { emails: [], phones: [], whatsapps: [] }，不抛 step3 主流程
- *   - 单 URL 最长 8s，每层有自己的超时；5 层总 budget ~30s（per company）
- *   - LLM/Serper 仅在前几层全空时才调用，控本（命中率高的公司根本走不到 ④⑤）
+ *   - 单 URL 最长 8s，每层有自己的超时；6 层总 budget ~60s（per company）
+ *   - LLM/Vision/Serper 仅在前几层全空时才调用，控本（命中率高的公司根本走不到 ④⑤⑥）
+ *   - ⑤ Vision 层 capability_missing（无 SCREENSHOTONE_API_KEY）时静默 skip，不影响主流程
  *
- * ⚠️ 修改后必须**同步**修改 zhimao 仓的三个 lib，否则 zhimao 这边的"手工解锁补全"
- * 与 worker 入库前的 enrich 会出现规则漂移，再次出现"明明 footer 有却抓不到"。
+ * ⚠️ 修改后必须**同步**修改 zhimao 仓 `apps/web/lib/skills/*.ts`，否则 zhimao 这边的
+ * "手工解锁补全" 与 worker 入库前的 enrich 会出现规则漂移，再次出现 "明明 footer 有却抓不到"。
  */
 
 'use strict';
@@ -457,7 +459,113 @@ ${text.slice(0, 6000)}`;
   }
 }
 
-// ─── ⑤：Serper 同域邮箱搜索兜底 ──────────────────────────────────────────
+// ─── ⑤：Gemini Vision 截图抽取兜底（ADV-2，2026-05-21 落地） ─────────────
+/**
+ * 给一张截图（base64 + mime）喂给 Gemini Vision，认 "采购经理 + 邮箱 + 二维码 + 客服小窗"
+ * 这种纯视觉布局，把 contact 实体抽出来。
+ *
+ * 镜像 zhimao 仓 `apps/web/lib/skills/contactLlmExtract.ts` 的 llmExtractContactFromImage。
+ * 接口与 llmExtractContactFromText 对齐，方便同一个 enrich 主链调用。
+ */
+async function llmExtractContactFromImage(args) {
+  const apiKey = (process.env.GEMINI_KEY || '').trim();
+  if (!apiKey) return { ok: false, persons: [], reason: 'no_gemini_key' };
+
+  const { imageBase64, imageMime, companyName, domain } = args || {};
+  if (!imageBase64 || !imageMime) {
+    return { ok: false, persons: [], reason: 'no_image' };
+  }
+  if (typeof imageBase64 !== 'string' || imageBase64.length < 200) {
+    return { ok: false, persons: [], reason: 'image_too_small' };
+  }
+
+  const model = process.env.GEMINI_FAST_MODEL || 'gemini-1.5-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const prompt = `You are a B2B contact extraction assistant for cross-border procurement.
+Given a screenshot of a company website (homepage / contact / about page), extract structured CONTACT information.
+
+What to extract from the IMAGE:
+1. Person + role pairs (priority): "Purchasing Manager / Procurement Director / Sourcing Lead / Sales Manager + email/phone".
+2. Department contacts: "sales@... / info@... / contact@..." (lower priority but still useful).
+3. WhatsApp number (often shown as a green icon + number, or a QR code with caption).
+4. Phone numbers (international with +, or local without + such as 03-7710 5555).
+5. If a contact card / customer-service popup / QR-code caption is visible, prioritize text from there.
+
+Rules:
+- DO NOT fabricate any email/phone/name. Leave field as null if not visible in the image.
+- Free-mail (gmail/yahoo/hotmail) is OK only if no business-domain email is visible.
+- confidence: role+name+email all present = 0.9; email+role only = 0.7; generic info@ only = 0.4.
+- Output up to 5 persons.
+
+Strict JSON output:
+{ persons: [ { email, phone, whatsapp, name, role, confidence } ] }
+If nothing visible: { persons: [] }
+
+company_name: ${companyName || 'unknown'}
+domain: ${domain || 'unknown'}`;
+
+  try {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 22_000);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              { text: prompt },
+              { inline_data: { mime_type: imageMime, data: imageBase64 } },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0,
+          maxOutputTokens: 1200,
+          responseMimeType: 'application/json',
+        },
+      }),
+    });
+    clearTimeout(tid);
+    if (!res.ok) return { ok: false, persons: [], reason: `gemini_vision_http_${res.status}` };
+    const j = await res.json();
+    const raw = j?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    if (!raw) return { ok: false, persons: [], reason: 'gemini_vision_empty_response' };
+    let parsed;
+    try {
+      const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+      parsed = JSON.parse(cleaned);
+    } catch {
+      return { ok: false, persons: [], reason: 'vision_invalid_json' };
+    }
+    if (!parsed || !Array.isArray(parsed.persons)) {
+      return { ok: false, persons: [], reason: 'no_persons_field' };
+    }
+    const persons = [];
+    for (const p of parsed.persons.slice(0, 5)) {
+      if (!p || typeof p !== 'object') continue;
+      const email = typeof p.email === 'string' ? p.email.trim().toLowerCase() : null;
+      const phone = typeof p.phone === 'string' ? p.phone.trim() : null;
+      const whatsapp = typeof p.whatsapp === 'string' ? p.whatsapp.trim() : null;
+      if (!email && !phone && !whatsapp) continue;
+      persons.push({
+        email,
+        phone,
+        whatsapp,
+        name: typeof p.name === 'string' ? p.name.trim() : null,
+        role: typeof p.role === 'string' ? p.role.trim() : null,
+        confidence: typeof p.confidence === 'number' ? Math.max(0, Math.min(1, p.confidence)) : 0.5,
+      });
+    }
+    return { ok: persons.length > 0, persons };
+  } catch {
+    return { ok: false, persons: [], reason: 'gemini_vision_exception' };
+  }
+}
+
+// ─── ⑥：Serper 同域邮箱搜索兜底 ──────────────────────────────────────────
 async function serperFallbackForDomain(domain, companyName) {
   const apiKey = (process.env.SERPER_API_KEY || '').trim();
   if (!apiKey || !domain) return { emails: [], phones: [] };
@@ -601,7 +709,65 @@ async function enrichContactsForLead(lead) {
     }
   }
 
-  // ── ⑤ 阶段：Serper 同域名邮箱搜索（仍然全空时的最后一搏） ──────────
+  // ── ⑤ 阶段：Vision 截图抽取兜底（ADV-2，仅当文本 LLM 也空 + 截图能力可用） ─
+  // capability_missing（无 SCREENSHOTONE_API_KEY）静默跳过，保留 ⑥ Serper 兜底机会
+  if (accumulator.emails.size === 0 && accumulator.phones.size === 0) {
+    let pageScreenshot;
+    try {
+      // 延迟 require，避免 Render worker 启动时 v8_lib_page_screenshot 找不到也阻塞主流程
+      pageScreenshot = require('./v8_lib_page_screenshot.cjs');
+    } catch {
+      pageScreenshot = null;
+    }
+    if (pageScreenshot && pageScreenshot.isAnyScreenshotProviderAvailable()) {
+      try {
+        const shot = await pageScreenshot.capturePageScreenshot(homeUrl, { timeoutMs: 22_000 });
+        if (shot) {
+          const vis = await llmExtractContactFromImage({
+            imageBase64: shot.base64,
+            imageMime: shot.mime,
+            companyName: lead.company_name || null,
+            domain: host,
+          });
+          result.fetch_log.push({
+            url: homeUrl,
+            status: 200,
+            via: `vision_${shot.provider}`,
+            vision: { ok: vis.ok, persons: vis.persons.length, reason: vis.reason || null },
+          });
+          if (vis.ok && vis.persons.length > 0) {
+            // 与 ④ 文本 LLM 合并到同一字段：result.llm_persons
+            // 这样下游 step3 / 写库逻辑不需要区分文本 vs 视觉来源
+            result.llm_persons = (result.llm_persons || []).concat(
+              vis.persons.map((p) => ({ ...p, _via: 'vision' })),
+            );
+            for (const p of vis.persons) {
+              if (p.email && isLikelyValidEmail(p.email)) accumulator.emails.add(p.email);
+              if (p.phone) {
+                const np = normalizePhone(p.phone);
+                if (isLikelyValidPhone(np)) accumulator.phones.add(np);
+              }
+              if (p.whatsapp) {
+                const nw = normalizePhone(p.whatsapp);
+                if (isLikelyValidPhone(nw)) accumulator.whatsapps.add(nw);
+              }
+            }
+            if (accumulator.emails.size > 0 || accumulator.phones.size > 0) {
+              result.via = 'vision';
+            }
+          }
+        } else {
+          result.fetch_log.push({ url: homeUrl, status: 0, via: 'vision_screenshot_fail' });
+        }
+      } catch {
+        result.fetch_log.push({ url: homeUrl, status: 0, via: 'vision_exception' });
+      }
+    } else {
+      result.fetch_log.push({ url: homeUrl, status: 0, via: 'vision_capability_missing' });
+    }
+  }
+
+  // ── ⑥ 阶段：Serper 同域名邮箱搜索（仍然全空时的最后一搏） ──────────
   if (accumulator.emails.size === 0 && accumulator.phones.size === 0) {
     const serper = await serperFallbackForDomain(host, lead.company_name);
     for (const e of serper.emails) accumulator.emails.add(e);
@@ -627,6 +793,7 @@ module.exports = {
   extractContactsFromHtmlV2,
   bfsContactPages,
   llmExtractContactFromText,
+  llmExtractContactFromImage,
   serperFallbackForDomain,
   enrichContactsForLead,
   htmlToVisibleText,
