@@ -28,6 +28,10 @@ const fetch = require('node-fetch');
 const cheerio = require('cheerio');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
+// 2026-05-23 双仓镜像：B2B 买家邮箱质量裁判（NON_BUYER_HOSTS / placeholder / brand-match）
+//   见 AGENTS.md "NON_BUYER_EMAIL_HOSTS 双仓镜像" + zhimao apps/web/lib/skills/emailQuality.ts
+const { filterBuyerEmails, isBuyerEmail } = require('./v8_lib_email_quality');
+
 // ─── 常量 ───────────────────────────────────────────────────────────────
 const CHROME_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -774,9 +778,48 @@ async function enrichContactsForLead(lead) {
     if (accumulator.emails.size > 0) result.via = 'serper';
   }
 
+  // ── ⑦ 收口：B2B 买家邮箱质量裁判（双仓镜像；2026-05-23 加） ──────────
+  // 5 层 BFS / Serper / LLM 可能抓回 support@bebee.com / chairman@sec.gov /
+  // jane.doe@... 这种 placeholder/aggregator/政府/媒体邮箱 — 历史上质量门只看
+  // lead.domain 漏掉这一类，本回放到收口处用 filterBuyerEmails 二次过滤：
+  //   · accepted    — 同主域 or 免费邮箱（warn）
+  //   · rejected    — placeholder / aggregator / brand mismatch
+  // 全 reject 时 primary_email 一律置 null，filled 退化为 phone-only 或全 false。
+  if (accumulator.emails.size > 0) {
+    const verdict = filterBuyerEmails([...accumulator.emails], host);
+    accumulator.emails = new Set(verdict.accepted);
+    result.email_filter = {
+      total_collected: verdict.accepted.length + verdict.rejected.length + verdict.warnings.length,
+      accepted: verdict.accepted.length,
+      warnings: verdict.warnings,
+      rejected: verdict.rejected,
+    };
+    if (verdict.rejected.length > 0) {
+      result.fetch_log.push({
+        url: `email_quality_gate`,
+        status: 200,
+        via: 'filter',
+        dropped: verdict.rejected.map((r) => `${r.email}=${r.reason}`),
+      });
+    }
+  }
+
   // 写回结果（按优先级：原 lead 已有的不覆盖；mailto/tel 类源在 extractContactsFromHtmlV2 已排序过）
   if (!result.primary_email && accumulator.emails.size > 0) {
     result.primary_email = [...accumulator.emails][0];
+  }
+  // 已有 primary_email 但本轮过滤把它毙了 → 也清空，避免下游用旧 placeholder
+  if (result.primary_email) {
+    const v = isBuyerEmail(result.primary_email, host);
+    if (!v.ok) {
+      result.fetch_log.push({
+        url: `email_quality_gate`,
+        status: 200,
+        via: 'filter',
+        cleared_primary: { email: result.primary_email, reason: v.reason },
+      });
+      result.primary_email = null;
+    }
   }
   if (!result.primary_phone && accumulator.phones.size > 0) {
     result.primary_phone = [...accumulator.phones][0];

@@ -491,6 +491,12 @@ const REJECT_REASONS = Object.freeze({
     ENTITY_TYPE_AGGREGATOR:'entity_type_aggregator',
     BIZ_TYPE_BLACKLISTED:  'biz_type_blacklisted',
     NO_CONTACT:            'no_contact',
+    // 2026-05-23 新增邮箱质量类（双仓镜像，见 v8_lib_email_quality.js）：
+    //   解决 5 层 enricher 抓回 chairman@sec.gov / support@bebee.com / jane.doe@... 这种
+    //   非买家邮箱时，旧规则只看 lead.domain 漏放过的根切问题
+    PLACEHOLDER_EMAIL:     'placeholder_email',     // jane.doe@ / email@address.com / example@…
+    AGGREGATOR_EMAIL:      'aggregator_email',      // 邮箱 host ∈ NON_BUYER_EMAIL_HOSTS（招聘/媒体/政府/数据库）
+    EMAIL_BRAND_MISMATCH:  'email_brand_mismatch',  // 邮箱 host 与 lead.domain 主域不匹配且非免费邮箱
     CONFIDENCE_LOW:        'confidence_low',
     NO_PROCUREMENT_ITEMS:  'no_procurement_items',
 });
@@ -556,9 +562,36 @@ function evaluateLead(lead) {
     }
 
     // ─── G 联系方式级（根切：!hasContact 一律 unqualified） ─────────────
+    // 2026-05-23 双仓镜像加：先用 v8_lib_email_quality.isBuyerEmail 把 primary_email
+    // 做一次"买家邮箱"复查 — placeholder/aggregator/brand-mismatch 三类直接返回
+    // 对应 reject reason，避免它们伪装成 hasContact 通过 G 闸继续走 H 段。
+    const { isBuyerEmail } = require('./v8_lib_email_quality');
     const domainIsJunk = isJunkDomain(lead.domain);
     const hasRealDomain = Boolean(lead.domain && String(lead.domain).trim()) && !domainIsJunk;
-    const hasEmail = Boolean(lead.primary_email && String(lead.primary_email).trim() && String(lead.primary_email).includes('@'));
+    const rawEmail = lead.primary_email ? String(lead.primary_email).trim() : '';
+    let hasEmail = false;
+    if (rawEmail && rawEmail.includes('@')) {
+        const verdict = isBuyerEmail(rawEmail, lead.domain || null);
+        if (!verdict.ok) {
+            // 注意：不直接返回 reject reason — 因为可能 phone 仍然可触达。先把 hasEmail 置 false，
+            // 再走下面 hasContact 兜底；只有"邮箱被毙 + 无其他联系方式"才用具体 email reason。
+            hasEmail = false;
+            // 仅在 phone+domain 都不可用时才用具体 email reason 替代 NO_CONTACT
+            const phoneFallback = Boolean(rawEmail && String(lead.primary_phone || '').trim() && String(lead.primary_phone).replace(/\D/g, '').length >= 6);
+            if (!hasRealDomain && !phoneFallback) {
+                const reasonMap = {
+                    placeholder_email:    REJECT_REASONS.PLACEHOLDER_EMAIL,
+                    aggregator_email:     REJECT_REASONS.AGGREGATOR_EMAIL,
+                    brand_mismatch:       REJECT_REASONS.EMAIL_BRAND_MISMATCH,
+                    invalid_format:       REJECT_REASONS.NO_CONTACT,
+                };
+                const r = reasonMap[verdict.reason] || REJECT_REASONS.NO_CONTACT;
+                return { qualified: false, grade: 'unqualified', reason: r };
+            }
+        } else {
+            hasEmail = true;
+        }
+    }
     const hasPhone = Boolean(lead.primary_phone && String(lead.primary_phone).trim() && String(lead.primary_phone).replace(/\D/g, '').length >= 6);
     const hasContact = hasRealDomain || hasEmail || hasPhone;
     if (!hasContact) {

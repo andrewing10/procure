@@ -255,10 +255,27 @@ if (droppedQuality > 0) {
 }
 
 const supabaseEnrichmentQueue = [];
+let enqueueRejected = 0;
+
+// 2026-05-23 双仓修：判断 lead.domain 是否真的可作为后续 step3 contact 抓取的入口。
+// 旧逻辑只判 `lead.domain` truthy，导致 inferred 类 lead 给个 garbage 字符串（如 "/"、
+// "n/a"、纯白空格 trim 失败）也进 enrichment_queue，下游 worker 取出来跑 step3 立即返回
+// contact_hit=0 ——日志里出现的 6 条连续 0% hit + 53ms 早返回正是这个 case。
+function isUsableDomain(d) {
+  if (typeof d !== 'string') return false;
+  const cleaned = d.trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0];
+  if (!cleaned || cleaned.length < 4) return false;
+  if (!cleaned.includes('.')) return false;
+  if (/^[\d.]+$/.test(cleaned)) return true; // IPv4 字面量极少见但合法
+  // 至少有一个字母段，且不是 ".com"/"a.b" 这种短到不能用的
+  if (!/[a-z]/.test(cleaned)) return false;
+  return true;
+}
 
 validLeads.forEach((lead) => {
   const hasContact = !!(lead.primary_email || lead.primary_phone);
   const isHot = lead.confidence_score >= 90 && hasContact;
+  const usableDomain = isUsableDomain(lead.domain);
   if (isHot && insertMain) {
     insertMain.run(
       lead.company_name,
@@ -271,9 +288,9 @@ validLeads.forEach((lead) => {
       lead.pillar,
       new Date().toISOString(),
     );
-  } else if (lead.domain && insertQueue) {
+  } else if (usableDomain && insertQueue) {
     insertQueue.run(lead.company_name, lead.domain, lead.country || '', lead.confidence_score);
-  } else if (lead.domain && SKIP_SQLITE && !hasContact) {
+  } else if (usableDomain && SKIP_SQLITE && !hasContact) {
     supabaseEnrichmentQueue.push({
       discovery_job_id: DISCOVERY_JOB_ID,
       company_name: lead.company_name,
@@ -281,8 +298,15 @@ validLeads.forEach((lead) => {
       country_iso: String(lead.country || '').slice(0, 2).toUpperCase() || null,
       payload_json: { confidence_score: lead.confidence_score, pillar: lead.pillar },
     });
+  } else if (!usableDomain && !hasContact) {
+    // domain 不可用 + 无联系方式 → 入 enrichment_queue 也是浪费下游 worker 一次空转
+    enqueueRejected += 1;
   }
 });
+
+if (enqueueRejected > 0) {
+  console.log(`[step5] enrichment_queue: skipped ${enqueueRejected} leads (no usable domain — inferred-only with garbage host)`);
+}
 
 // ── 种子库反哺写回 ───────────────────────────────────────────────────────────
 (function writeSeedFeedback() {
@@ -373,6 +397,7 @@ validLeads.forEach((lead) => {
         grade_stats: gradeStats,
         icp_stats: icpStats,
         enrichment_queued: supabaseEnrichmentQueue.length,
+        enrichment_queue_skipped: enqueueRejected,
       });
     }
   } else {
