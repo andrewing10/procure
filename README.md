@@ -40,8 +40,14 @@ on the other repo. See `zhimao/AGENTS.md` for the canonical agreement table.
 | 6-layer contact enricher | `v8_lib_contact_enricher.js` (CJS) | `apps/web/lib/skills/{htmlFetcher,contactExtractor,contactLlmExtract,pageScreenshot}.ts` |
 | Vision screenshot provider chain | `v8_lib_page_screenshot.cjs` | `apps/web/lib/skills/pageScreenshot.ts` |
 | **B2B buyer email quality** (NON_BUYER_HOSTS / placeholder / brand-match) | `v8_lib_email_quality.js` | `apps/web/lib/skills/emailQuality.ts` |
-| Quality gate REJECT_REASONS | `v8_quality_gate.js` (incl. new `PLACEHOLDER_EMAIL` / `AGGREGATOR_EMAIL` / `EMAIL_BRAND_MISMATCH`) | reason dict in `zhimao/AGENTS.md` |
+| Quality gate REJECT_REASONS | `v8_quality_gate.js` (incl. `PLACEHOLDER_EMAIL` / `AGGREGATOR_EMAIL` / `EMAIL_BRAND_MISMATCH`) | reason dict in `zhimao/AGENTS.md` |
+| **B2C biz-type blacklist groups + CATEGORY_B2C_WHITELIST** | `v8_quality_gate.js` (`BIZ_ANTI_GROUPS` 9 named groups + 12 whitelist rules + `isBizTypeBlacklisted(name, category)` + `evaluateLead(lead, { category })`) | `apps/web/lib/data-intel/quality.ts` (same shape + `computeQualityGrade({...category})`) |
 | Quality-grade predicates (`inferEntityType` / `isClosedBusiness` / `isJunkDomain` / `isAggregatorDomain`) | `v8_quality_gate.js` | `apps/web/lib/data-intel/quality.ts` |
+
+`DISCOVERY_CATEGORY` env is the canonical category source for `evaluateLead` —
+`v8_step5_routing_gateway.js` passes it via `{ category: TARGET_CATEGORY_FROM_ENV }` so that
+flour-task → bakery / cosmetic-raw-material → spa / hotel-supply → hotel are no longer
+killed by the B2C blacklist's one-size-fits-all rule.
 
 **Regression scripts (both must pass on every release):**
 
@@ -49,6 +55,7 @@ on the other repo. See `zhimao/AGENTS.md` for the canonical agreement table.
 |--------|------------------|
 | `node scripts/verify-contact-enricher.js` | 6-layer enrichment pipeline (mailto / deobf / BFS / Serper / LLM text / vision) |
 | `node scripts/verify-email-quality.js` | 42 cases — `isBuyerEmail` core, real-log 18 non-buyer emails, `evaluateLead` G-segment integration |
+| `node scripts/verify-biz-type-whitelist.js` | 46 cases — 9 biz-anti groups + 12 CATEGORY_B2C_WHITELIST rules + `evaluateLead`/`computeQualityGrade` end-to-end + backwards-compat (no category = old behavior) |
 | `npm run test:quality-smoke` | 14 cases — all `REJECT_REASONS` branches |
 
 ## Environment Variables

@@ -178,7 +178,10 @@ const validLeads = leads
       }
     }
 
-    const { qualified, grade } = evaluateLead(lead);
+    // 2026-05-23：传 category（DISCOVERY_CATEGORY）启用 CATEGORY_B2C_WHITELIST，
+    //   面粉→bakery / 化妆品→spa / 海鲜→restaurant 等真买家不再被一刀切；
+    //   见 v8_quality_gate.js BIZ_ANTI_GROUPS + CATEGORY_B2C_WHITELIST 双仓镜像段。
+    const { qualified, grade } = evaluateLead(lead, { category: TARGET_CATEGORY_FROM_ENV });
     const matchRaw = String(lead.industry_match || '').toLowerCase();
     const m = ['high', 'medium', 'low', 'none'].includes(matchRaw) ? matchRaw : 'unset';
     icpStats[m] += 1;

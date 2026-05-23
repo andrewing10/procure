@@ -320,26 +320,127 @@ function isJunkName(name) {
 }
 
 // ── 业态黑名单（C3 同步：解决餐厅/医院/政府机关误进 L1 问题） ────────────────
-const BIZ_ANTI_PATTERNS = [
-    /\b(mcdonald|kfc|starbucks|subway|burger.king|pizza.hut|domino|wendy|taco.bell)\b/i,
-    /\b(restaurant|cafe|coffee\s+shop|fast[_\s]food|food.chain|bistro|bakery|eatery|diner)\b/i,
-    /\b(hotel|motel|hostel|inn\b|resort|lodge|accommodation)\b/i,
-    /\b(hospital|clinic|dental|medical.center|pharmacy|dispensary|healthcare.provider)\b/i,
-    /\b(primary.school|secondary.school|university|college|academy\b|kindergarten|tuition)\b/i,
-    /\b(bank\b|insurance\s+company|financial\s+service|accounting\s+firm|law\s+firm)\b/i,
-    /\b(government|municipality|ministry|prefecture|public\s+sector|city.council|town.hall)\b/i,
-    /\b(charity|ngo\b|nonprofit|non-profit|foundation\b)\b/i,
-    /\b(salon|barbershop|spa\b|beauty.center|nail.studio|massage.parlor|gym\b|fitness.center)\b/i,
+// ── 业态黑名单（C3：解决麦当劳/包装厂/政府机关误进 L1 问题） ──────────────────
+//
+// 2026-05-23 升级：按 category 动态豁免（双仓镜像，见 zhimao AGENTS.md "CATEGORY_B2C_WHITELIST 双仓镜像"段）。
+// 旧实现一刀切 — 任何 lead 名字含 bakery / restaurant / salon 都被毙，但**面粉**类目下面包房恰恰是
+// 真买家、**化妆品原料**类目下美容沙龙是真买家、**酒店用品**类目下酒店是真买家。
+// 新实现把 9 组 B2C 业态命名分组，再用 CATEGORY_B2C_WHITELIST 把"类目 → 允许通过的 group 列表"
+// 显式登记；evaluateLead / computeQualityGrade 调用时透传 category（来自 DISCOVERY_CATEGORY env）。
+//
+// 单源 + 镜像：本文件 ↔ zhimao apps/web/lib/data-intel/quality.ts。任何分组 / 关键词变更两仓必须同步。
+
+const BIZ_ANTI_GROUPS = [
+    ['fastfood_chain', /\b(mcdonald|kfc|starbucks|subway|burger.king|pizza.hut|domino|wendy|taco.bell)\b/i],
+    ['food_service',   /\b(restaurant|cafe|coffee\s+shop|fast[_\s]food|food.chain|bistro|bakery|eatery|diner)\b/i],
+    ['hospitality',    /\b(hotel|motel|hostel|inn\b|resort|lodge|accommodation)\b/i],
+    ['healthcare',     /\b(hospital|clinic|dental|medical.center|pharmacy|dispensary|healthcare.provider)\b/i],
+    ['education',      /\b(primary.school|secondary.school|university|college|academy\b|kindergarten|tuition)\b/i],
+    ['finance_legal',  /\b(bank\b|insurance\s+company|financial\s+service|accounting\s+firm|law\s+firm)\b/i],
+    ['government',     /\b(government|municipality|ministry|prefecture|public\s+sector|city.council|town.hall)\b/i],
+    ['nonprofit',      /\b(charity|ngo\b|nonprofit|non-profit|foundation\b)\b/i],
+    ['beauty_fitness', /\b(salon|barbershop|spa\b|beauty.center|nail.studio|massage.parlor|gym\b|fitness.center)\b/i],
 ];
 
+const CATEGORY_B2C_WHITELIST = [
+    // 食材 / 烘焙原料 / 调料 → 餐饮全行业是真买家（含连锁餐饮）
+    {
+        match: /(\bflour\b|\bbread\b|\bpastry\b|\bbaking\b|bakery.ingredient|food.ingredient|\bspice\b|\bseasoning\b|\bsauce\b|\bcondiment\b|\bdairy\b|烘焙|面粉|面包|糕点|食材|食品配料|调料|乳制品)/i,
+        allow: ['food_service', 'fastfood_chain', 'hospitality'],
+        note: '面粉/调料 → 餐饮+酒店+连锁',
+    },
+    // 海鲜 / 肉类 / 农产品 → 餐饮 + 酒店 + 连锁
+    {
+        match: /(\bseafood\b|\bmeat\b|\bpoultry\b|\bbeef\b|\bpork\b|\bchicken\b|\bfish\b|\bvegetable\b|\bfruit\b|\bproduce\b|\bgrain\b|\brice\b|海鲜|肉类|蔬菜|水果|农产品|生鲜|大米|稻米)/i,
+        allow: ['food_service', 'fastfood_chain', 'hospitality'],
+        note: '肉类/海鲜/果蔬 → 餐饮+酒店+连锁',
+    },
+    // 咖啡豆 / 茶叶 / 饮品原料 → 餐饮 + 酒店 + 连锁
+    {
+        match: /(coffee.bean|coffee.roast|\btea\b|\bbeverage\b|\bdrink\b|\bjuice\b|\bwater\b|咖啡豆|茶叶|饮品|饮料|矿泉水)/i,
+        allow: ['food_service', 'fastfood_chain', 'hospitality'],
+        note: '饮品原料 → 餐饮+酒店+连锁',
+    },
+    // 化妆品 / 美容用品原料 → 美容沙龙是真买家
+    {
+        match: /(\bcosmetic\b|\bskincare\b|skin.care|beauty.product|\bhaircare\b|hair.care|nail.polish|essential.oil|\bperfume\b|\bfragrance\b|化妆品|美容|护肤|香精|精油|香水|彩妆|美甲)/i,
+        allow: ['beauty_fitness'],
+        note: '化妆品原料 → 美容/沙龙/spa',
+    },
+    // 医疗器械 / 药品 / 牙科耗材 → 医疗机构是真买家
+    {
+        match: /(medical.device|medical.equipment|medical.supply|medical.consumable|\bpharmaceutical\b|pharma.ingredient|api\b|\bdrug\b|dental.supply|dental.equipment|hospital.supply|surgical|医疗器械|医疗设备|医用耗材|药品|医药|牙科|手术|诊所设备)/i,
+        allow: ['healthcare'],
+        note: '医疗器械/药品/牙科 → 医院/诊所/药房',
+    },
+    // 教学设备 / 课桌椅 / 教材 → 学校是真买家
+    {
+        match: /(school.supply|\bclassroom\b|education.equipment|\btextbook\b|teaching.aid|教学设备|课桌|教材|文具|学习用品|学校设备|教学仪器)/i,
+        allow: ['education'],
+        note: '教学用品 → 学校/学院',
+    },
+    // 酒店用品 / 床上用品 / 客房一次性 → 酒店是真买家
+    {
+        match: /(hotel.supply|\bamenity\b|amenities|\btowel\b|\blinen\b|hospitality.supply|\bhousekeeping\b|\bmattress\b|guest.room|酒店用品|客房用品|布草|一次性用品|床品|客房备品|酒店家具)/i,
+        allow: ['hospitality'],
+        note: '酒店用品 → 酒店/民宿/度假村',
+    },
+    // 健身器材 → 健身房是真买家
+    {
+        match: /(gym.equipment|fitness.equipment|\btreadmill\b|\bdumbbell\b|\bbarbell\b|exercise.machine|sports.equipment|健身器材|运动器材|健身房设备)/i,
+        allow: ['beauty_fitness'],
+        note: '健身器材 → 健身房/spa',
+    },
+    // 办公用品 / 文具 / 通用耗材 → 律所/教育/政府/非盈利都是真买家
+    {
+        match: /(office.supply|\bstationery\b|\btoner\b|\bcartridge\b|copier.paper|file.cabinet|文具|办公用品|纸张|耗材|办公耗材|打印纸)/i,
+        allow: ['finance_legal', 'education', 'government', 'nonprofit'],
+        note: '通用办公耗材 → 律所/学校/政府/NGO 都买',
+    },
+    // 金融 / 法务 SaaS / 银行系统 → 银行 / 保险 / 律所是真买家
+    {
+        match: /(banking.software|\bfintech\b|accounting.software|legal.tech|律所软件|银行系统|金融科技|金融软件|法务系统)/i,
+        allow: ['finance_legal'],
+        note: '金融/法务系统 → 银行/保险/律所',
+    },
+    // 政府采购 / 公共项目用品 → 政府部门是真买家
+    {
+        match: /(government.procurement|public.tender|公共采购|政府采购|公务用品|政务系统)/i,
+        allow: ['government'],
+        note: '政府专项采购 → 政府部门',
+    },
+    // 公益 / NGO 物资 → 慈善 / NGO 是真买家
+    {
+        match: /(charity.supply|disaster.relief|humanitarian.aid|慈善物资|救灾物资|人道援助)/i,
+        allow: ['nonprofit'],
+        note: '公益物资 → 慈善/NGO',
+    },
+];
+
+/** 给定 category 返回应豁免的 B2C group 名集合。无 category 或无匹配 → 空集合（一刀切）。 */
+function resolveB2CWhitelistGroups(category) {
+    const allowed = new Set();
+    if (!category || typeof category !== 'string' || !category.trim()) return allowed;
+    const c = category.trim();
+    for (const rule of CATEGORY_B2C_WHITELIST) {
+        if (rule.match.test(c)) {
+            for (const g of rule.allow) allowed.add(g);
+        }
+    }
+    return allowed;
+}
+
 /**
- * 判断公司名/描述是否属于"非采购买家"业态（与 zhimao isBizTypeBlacklisted C3 完全对齐）
- * @param {string|null|undefined} nameOrDesc
+ * 判断公司名/描述是否属于"非采购买家"业态（与 zhimao isBizTypeBlacklisted 双仓镜像）
+ * @param {string|null|undefined} nameOrDesc — 公司名 / 业务描述
+ * @param {string|null|undefined} [category] — 任务 category（如 'flour' / '面粉'），用于豁免对应 B2C
  * @returns {boolean}
  */
-function isBizTypeBlacklisted(nameOrDesc) {
+function isBizTypeBlacklisted(nameOrDesc, category) {
     if (!nameOrDesc || !nameOrDesc.trim()) return false;
-    for (const re of BIZ_ANTI_PATTERNS) {
+    const allowed = resolveB2CWhitelistGroups(category);
+    for (const [group, re] of BIZ_ANTI_GROUPS) {
+        if (allowed.has(group)) continue;
         if (re.test(nameOrDesc)) return true;
     }
     return false;
@@ -359,6 +460,7 @@ function isBizTypeBlacklisted(nameOrDesc) {
  *   countryMatchLevel: string|null|undefined,
  *   bizDescription: string|null|undefined,
  *   procurementSignalCount: number,
+ *   category: string|null|undefined,
  * }} params
  * @returns {'premium'|'qualified'|'unqualified'}
  */
@@ -373,14 +475,16 @@ function computeQualityGrade({
     countryMatchLevel,
     bizDescription,
     procurementSignalCount = 0,
+    category,
 }) {
     // 第一关：公司名质量
     if (isJunkName(nameCanonical)) return 'unqualified';
     if (entityType && entityType !== 'company') return 'unqualified';
     if (countryMatchLevel === 'low') return 'unqualified';
 
-    // C3 第一关补充：业态黑名单（餐厅/医院/政府等不可能是采购买家）
-    if (isBizTypeBlacklisted(bizDescription != null ? bizDescription : nameCanonical)) return 'unqualified';
+    // C3 第一关补充：业态黑名单（餐厅/医院/政府 等不可能是采购买家）
+    // 2026-05-23：传 category 启用 CATEGORY_B2C_WHITELIST，面粉→bakery / 化妆品→spa 等真买家不再被一刀切
+    if (isBizTypeBlacklisted(bizDescription != null ? bizDescription : nameCanonical, category)) return 'unqualified';
 
     // 第二关：联系方式是否真实可用
     const domainIsJunk = isJunkDomain(domain);
@@ -501,7 +605,15 @@ const REJECT_REASONS = Object.freeze({
     NO_PROCUREMENT_ITEMS:  'no_procurement_items',
 });
 
-function evaluateLead(lead) {
+/**
+ * @param {object} lead — 完整 lead 行（含 company_name / domain / primary_email / ...）
+ * @param {{ category?: string|null }} [opts] — 上下文。category 来自 DISCOVERY_CATEGORY，
+ *   用于 B 段业态黑名单的 CATEGORY_B2C_WHITELIST 动态豁免（面粉→bakery / 化妆品→spa 真买家不再被一刀切）。
+ *   省略则保持旧行为（一刀切）。
+ */
+function evaluateLead(lead, opts) {
+    const category = opts && opts.category != null ? String(opts.category) : null;
+
     // ─── A 公司名级 ────────────────────────────────────────────────────
     if (!lead || !lead.company_name) {
         return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.NO_COMPANY_NAME };
@@ -518,7 +630,8 @@ function evaluateLead(lead) {
     ].filter(Boolean).join(' ');
 
     // ─── B 业态级 ──────────────────────────────────────────────────────
-    if (isBizTypeBlacklisted(lead.company_name)) {
+    // 2026-05-23：传 category 启用 CATEGORY_B2C_WHITELIST，面粉→bakery / 化妆品→spa 等真买家放过
+    if (isBizTypeBlacklisted(lead.company_name, category)) {
         return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.BIZ_TYPE_BLACKLISTED };
     }
 
@@ -622,6 +735,7 @@ function evaluateLead(lead) {
         countryMatchLevel:       countryMatch,
         bizDescription:          lead.company_name,
         procurementSignalCount:  procurementSignalCount,
+        category:                category,
     });
 
     // 兜底：computeQualityGrade 仍可能返回 unqualified（如 confidenceTier=low + hasProcurementItems=false 等
