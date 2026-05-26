@@ -147,6 +147,96 @@ function isAggregatorDomain(raw) {
 const NEWS_TEXT_RE = /\b(news|press|journal|报道|新闻|专访|记者|通讯社)\b/i;
 const SOCIAL_TEXT_RE = /\b(facebook|instagram|linkedin|x\.com|twitter|youtube|tiktok|social)\b/i;
 
+// ── 行业协会 / 会员组织检测（2026-05-26 双仓镜像：zhimao apps/web/lib/data-intel/quality.ts）───
+// 三档置信度，防止误杀普通公司名含 "institute" / "council" 的合法买家：
+//   HIGH   — 公司名含高置信协会词 → 直接判 aggregator
+//   SNIPPET — snippet 明确描述为协会/会员组织 → 判 aggregator
+//   MED    — 公司名含中置信协会词 + 辅助信号（.org 域 OR 协会邮箱前缀）才判 aggregator
+//
+// 故意不包含 council/institute/guild — 这些词可能在普通品牌名里出现（中置信处理）。
+const ASSOC_NAME_HIGH_RE =
+    /\b(association|associations|federation|federation\s+of|society|societies|chamber\s+of\s+commerce|board\s+of\s+trade|trade\s+body|industry\s+body|member(?:ship)?\s+organization|membership\s+org(?:anization)?)\b/i;
+
+// MEDIUM-confidence：公司名含这些词 → 需辅助信号才判定
+const ASSOC_NAME_MED_RE =
+    /\b(council|institute|guild|consortium|coalition|alliance|committee|bureau|authority|board\s+of\s+trade)\b/i;
+
+// SNIPPET-level：snippet 明确描述为协会/会员组织
+const ASSOC_SNIPPET_RE =
+    /\b(trade\s+association|industry\s+association|industry\s+group|trade\s+group|professional\s+association|membership\s+organization|member(?:ship)?\s+body|advocacy\s+group|industry\s+council|trade\s+council|non-?profit\s+trade\s+org|nonprofit\s+industry)\b/i;
+
+// 协会特征邮箱 local-part（用于辅助 MED 信号判定）
+const ASSOC_EMAIL_LOCAL_RE = /^(membership|member(?!\.support|\.services)|secretary|secretariat|exec(?:utive)?\.director|exec-director)$/i;
+
+// ── 卖方伪装检测（2026-05-26 双仓镜像：zhimao apps/web/lib/data-intel/quality.ts）───────────
+// 设计背景：从中国供应商视角，以下实体不是买家：
+//   ① 制造/生产同一品类的企业（本地自产，不向中国采购）
+//   ② 货运/物流公司（运货不买货）
+//   ③ 市场研究/咨询信息公司（分析不采购）
+//
+// 两档检测：
+//   HIGH  — snippet 第一人称明确声明自己制造/生产（误报率 <3%）
+//   MED   — 公司名含明确制造角色词 AND ≥2 个品类关键词共现（双重锁）
+//
+// ⚠ 不允许仅凭公司名含 "manufacturer" 就判卖方（"Medical Device Manufacturer Supplies" 可能是买家）
+// ⚠ "exporter" / "supplier" 不作为卖方信号（美国出口商往往从中国进口后再出口 = 买家）
+
+// HIGH: snippet 第一人称声明自己是制造/生产商
+const SELLER_SNIPPET_SELF_DECLARE_RE =
+    /\b(we\s+(?:manufacture|produce|fabricate)\b|we\s+are\s+(?:a\s+)?(?:leading\s+)?(?:manufacturer|producer|fabricator)\b|(?:established|founded)\s+(?:in\s+)?\d{4}[,\s]+(?:to\s+)?manufactur\w*|our\s+(?:manufacturing\s+plant|production\s+facility|production\s+line|production\s+base))\b/i;
+
+// MED 第一步：公司名含明确制造/生产角色词（故意排除 exporter/supplier/distributor）
+const SELLER_NAME_ROLE_RE =
+    /\b(manufacturer|manufacturers|manufacturing|factory|factories|producer|producers|fabricator|fabricators|mill\b|mills\b)\b/i;
+
+// 物流/货运公司检测（精确短语，避免误杀"logistics solutions buyer"）
+const LOGISTICS_SPECIFIC_RE =
+    /\b(freight\s+forwarder(?:ing)?|customs\s+broker(?:age)?|third.?party\s+logistics|3pl\b|cargo\s+agent|shipping\s+agent)\b/i;
+
+// 信息服务/咨询公司检测（精确短语，避免误杀"market consulting firm buying office products"）
+const INFO_SERVICE_SPECIFIC_RE =
+    /\b(market\s+research\s+(?:firm|company|group|agency)|industry\s+(?:analyst|analytics)\s+(?:firm|company)|market\s+intelligence\s+(?:firm|company|group))\b/i;
+
+/** 品类关键词提取的英文停用词 */
+const CAT_STOP_WORDS = new Set([
+    'and', 'the', 'of', 'for', 'in', 'at', 'to', 'a', 'an', 'with', 'by', 'from',
+    'or', 'its', 'etc', 'made', 'used', 'use', 'type', 'types', 'grade', 'grades',
+]);
+
+/**
+ * 从 category 字符串提取有意义的语义词。
+ * 支持中英文混合：中文取 2 字以上连续片段，英文取非停用词 + 长度≥3。
+ */
+function extractCategoryKeywords(category) {
+    const zh = (category.match(/[\u4e00-\u9fff]{2,}/g) || []).map(s => s.toLowerCase());
+    const en = category
+        .toLowerCase()
+        .split(/[\s,，、·/\\-]+/)
+        .filter(w => w.length >= 3 && !CAT_STOP_WORDS.has(w));
+    return [...new Set([...zh, ...en])];
+}
+
+/**
+ * 判断公司名是否同时包含【制造角色词】AND【≥threshold 个品类关键词】。
+ * 双重锁防误杀：光有制造词不够，还需品类词共现确认是同一品类的制造商。
+ *
+ * 例：
+ *   "American Stainless Tableware Manufacturer Inc" + "stainless steel tableware"
+ *     → 制造词✓ + stainless/tableware 共现 2 个 → 卖方
+ *   "JM Manufacturing Group" + "stainless steel tableware"
+ *     → 制造词✓ + 但公司名里无品类词 → 放过（可能是制造业设备买家）
+ */
+function hasSellerNameCategoryMatch(companyName, category) {
+    if (!SELLER_NAME_ROLE_RE.test(companyName)) return false;
+    if (!category || !category.trim()) return false;
+    const catWords = extractCategoryKeywords(category);
+    if (catWords.length === 0) return false;
+    const nameLow = companyName.toLowerCase();
+    const hits = catWords.filter(w => nameLow.includes(w)).length;
+    const threshold = Math.min(2, catWords.length);
+    return hits >= threshold;
+}
+
 // 国家识别（轻量版，避免引入重依赖）
 const COUNTRY_HINTS = {
     US: ['united states', 'usa', 'america', '美国'],
@@ -233,16 +323,61 @@ function getHost(raw) {
     }
 }
 
-function inferEntityType({ domain, snippet, companyName }) {
+/**
+ * @updated 2026-05-26 A：新增行业协会/会员组织检测（三档置信度）。
+ * @updated 2026-05-26 B：新增卖方伪装检测（制造商/物流/信息服务）。
+ * 双仓同步：zhimao 仓 apps/web/lib/data-intel/quality.ts inferEntityType（AGENTS.md 镜像约定）。
+ *
+ * @param {object} params
+ * @param {string} [params.domain]
+ * @param {string} [params.snippet]
+ * @param {string} [params.companyName]
+ * @param {string} [params.primaryEmail] — 可选：辅助 MED 协会判定（local-part 比对 ASSOC_EMAIL_LOCAL_RE）
+ * @param {string} [params.category]    — 可选：搜索品类，用于卖方 MED 档双重锁检测
+ */
+function inferEntityType({ domain, snippet, companyName, primaryEmail, category }) {
     const host = getHost(domain);
-    const text = `${snippet || ''} ${companyName || ''}`.toLowerCase();
+    const name = companyName || '';
+    const snip = snippet || '';
+    const text = `${snip} ${name}`.toLowerCase();
+
+    // 1. 社交媒体平台主页
     if (SOCIAL_DOMAIN_HOSTS.has(host) || SOCIAL_TEXT_RE.test(text)) return 'social';
-    // bug 修复：旧实现只查 AGGREGATOR_DOMAIN_HOSTS.has(host) 精确匹配，
-    // foo.bbb.org / free.globalimporter.net 这种子域全漏过——下游 isAggregatorDomain 又做了子域检查，
-    // 导致 entity_type='company' 通过但 premium 判定时 hasOwnedDomain=false。
-    // 现统一用 isAggregatorDomain，子域也算 aggregator。
+
+    // 2. 已知聚合/目录站域名（子域兜底）
     if (isAggregatorDomain(domain)) return 'aggregator';
+
+    // 3. 行业协会 / 会员组织检测（三档）
+    //    3a. HIGH: 公司名含高置信协会词 → 直接判 aggregator
+    if (ASSOC_NAME_HIGH_RE.test(name)) return 'aggregator';
+
+    //    3b. SNIPPET: snippet 明确说是行业协会 → 判 aggregator
+    if (ASSOC_SNIPPET_RE.test(snip)) return 'aggregator';
+
+    //    3c. MED: 公司名含中置信协会词 + 辅助信号（.org 域 OR 协会邮箱前缀）
+    if (ASSOC_NAME_MED_RE.test(name)) {
+        const hasOrgDomain = host.endsWith('.org');
+        const emailLocal = (primaryEmail || '').split('@')[0].toLowerCase();
+        const hasMembershipEmail = emailLocal.length > 0 && ASSOC_EMAIL_LOCAL_RE.test(emailLocal);
+        if (hasOrgDomain || hasMembershipEmail) return 'aggregator';
+    }
+
+    // 4. 卖方伪装检测（制造商、货运、信息服务）
+    //    4a. HIGH: snippet 第一人称声明自己是制造/生产商（不需要 category）
+    if (SELLER_SNIPPET_SELF_DECLARE_RE.test(snip)) return 'aggregator';
+
+    //    4b. MED: 公司名含制造角色词 + ≥2 个品类关键词共现（需 category 联动）
+    if (hasSellerNameCategoryMatch(name, category || null)) return 'aggregator';
+
+    //    4c. 精确物流商（"freight forwarder" / "customs broker" 等精确短语）
+    if (LOGISTICS_SPECIFIC_RE.test(name) || LOGISTICS_SPECIFIC_RE.test(snip)) return 'aggregator';
+
+    //    4d. 精确市场研究/信息服务公司
+    if (INFO_SERVICE_SPECIFIC_RE.test(name) || INFO_SERVICE_SPECIFIC_RE.test(snip)) return 'aggregator';
+
+    // 5. 新闻/媒体
     if (NEWS_TEXT_RE.test(text)) return 'media';
+
     return 'company';
 }
 
@@ -642,6 +777,8 @@ function evaluateLead(lead, opts) {
         domain: lead.domain,
         snippet: snippetText,
         companyName: lead.company_name,
+        primaryEmail: lead.primary_email || null,
+        category: category || null,
     });
     if (entityType === 'social') {
         return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.ENTITY_TYPE_SOCIAL };

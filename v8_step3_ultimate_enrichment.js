@@ -133,7 +133,26 @@ For EACH company, additionally output:
 
 ⚠ This is the most important field — it gates whether the lead is shown to the user.
 ⚠ "Service" entity_role companies almost always = none/low for physical-goods categories.
-⚠ Be conservative: if you cannot articulate a specific procurement use-case, output "low" or "none".`
+⚠ Be conservative: if you cannot articulate a specific procurement use-case, output "low" or "none".
+
+[ENTITY-ROLE DISAMBIGUATION — BUYER vs NON-BUYER]
+The following entity types are NEVER direct buyers regardless of industry relevance:
+1. Manufacturers/producers of the SAME category: If a company MAKES "${TARGET_CATEGORY}", it is the SELLER,
+   not the buyer. E.g. searching "stainless steel tableware" — a tableware manufacturer is the seller.
+   → Assign target_category_match: "none", target_category_reason: "no_pathway"
+2. Trade associations / federations / councils / membership organizations: The ASSOCIATION ITSELF does not
+   procure the category — only its member companies do. E.g. "International Foodservice Distributors
+   Association" represents distributors but does NOT buy tableware itself.
+   → Assign target_category_match: "none", target_category_reason: "no_pathway"
+3. Freight / logistics / customs broker companies: They transport goods, not purchase them.
+   → Assign target_category_match: "none" or "low", target_category_reason: "no_pathway"
+4. Market research / industry analytics firms: They produce reports, not physical goods.
+   → Assign target_category_match: "none", target_category_reason: "no_pathway"
+
+⚠ CRITICAL disambiguation: "entity ITSELF directly procures" = buyer (target_category_match: high/medium)
+   "its members / clients / served parties procure" ≠ that entity is a buyer (target_category_match: none)
+⚠ Verify entity_role field BEFORE assigning target_category_match — Manufacturer entities are sellers
+   for the same category they produce.`
             : '';
 
         const reverseVerifyJsonHint = TARGET_CATEGORY

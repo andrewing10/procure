@@ -127,12 +127,18 @@ const PLACEHOLDER_REGEX_LIST = [
   /\b(first|last).?(?:name|n)\b/i,
 ];
 
-/* ── press / PR / 投资者关系邮箱（warn 级；非完全 reject） ───────────────── */
+/* ── press / PR / 投资者关系 / 协会专属邮箱（warn 级；非完全 reject） ──────
+ * 2026-05-26 双仓同步（zhimao apps/web/lib/skills/emailQuality.ts）：
+ *   新增 membership / secretary / secretariat / exec.director — 协会特征前缀，
+ *   配合 v8_quality_gate.js ASSOC_EMAIL_LOCAL_RE 做 MED 协会辅助判定。
+ * ─────────────────────────────────────────────────────────────────────────── */
 const PR_INVESTOR_PREFIXES = new Set([
   "press", "media", "investor", "investorrelations", "investor-relations",
   "ir", "pressroom", "newsroom", "communications", "publicaffairs",
   "chairman", "ceo", "ceopanel", "sustainability", "esg", "csr",
   "compliance", "audit", "regulatory", "legal",
+  // 协会特征前缀（2026-05-26 新增）
+  "membership", "secretary", "secretariat", "exec.director", "exec-director",
 ]);
 
 /* ────────────────────────────────────────────────────────────────────────── */
