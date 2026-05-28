@@ -256,6 +256,7 @@ function inferDiscoveredVia(lead) {
   if (/Pillar 11 LinkedIn/i.test(pillar)) return 'linkedin_snippet';
   if (/Pillar YT About/i.test(pillar)) return 'youtube_about';
   if (/Pillar X Public/i.test(pillar)) return 'x_public';
+  if (/Pillar TG Public/i.test(pillar)) return 'telegram_public';
   if (/Pillar 0 Seed/i.test(pillar)) return 'seed';
   if (/Pillar 9 Lookalike/i.test(pillar)) return 'lookalike';
   if (pillar) return 'organic_search';
@@ -435,13 +436,28 @@ async function insertEdgesWithFallback(supabase, edgeBatch, errors) {
 /**
  * @param {import('@supabase/supabase-js').SupabaseClient} supabase
  * @param {object[]} leads — 已通过 Step5 isQualifiedLead 的列表
- * @param {{ discoveryJobId?: string|null }} opts
+ * @param {{
+ *   discoveryJobId?: string|null,
+ *   incrementalMode?: boolean,
+ *   incrementalParentJobId?: string|null,
+ *   incrementalBlacklistSet?: Set<string>,
+ * }} opts
+ *
+ * PR-DEDUP-CACHE L2-2 (2026-05-28)：
+ *   incrementalMode=true 时，命中 incrementalBlacklistSet 的 company_id
+ *   不写 discovery_job_leads 映射（即"已存在于 parent job 的公司"不计入本次"增量补抓"
+ *   的产出）。L1 公司主表照常 upsert，避免丢失新拿到的字段更新（如新发现的 email/phone）。
+ *   返回 result.incrementalSkipped 给 step5 输出日志。
  */
 async function directIngestQualifiedLeads(supabase, leads, opts = {}) {
   const discoveryJobId = opts.discoveryJobId || null;
+  const incrementalMode = Boolean(opts.incrementalMode);
+  const blacklistSet =
+    opts.incrementalBlacklistSet instanceof Set ? opts.incrementalBlacklistSet : new Set();
   const nowIso = new Date().toISOString();
   const errors = [];
   let edgesWritten = 0;
+  let incrementalSkipped = 0;
   /** 本批每条 lead 是否解析到 company id（含已存在自然键） */
   let resolvedLeads = 0;
 
@@ -496,14 +512,21 @@ async function directIngestQualifiedLeads(supabase, leads, opts = {}) {
       resolvedLeads += 1;
 
       if (discoveryJobId) {
-        const mapRes = await upsertJobLeadMapping(
-          supabase,
-          discoveryJobId,
-          companyId,
-          lead._quality_grade || 'qualified',
-        );
-        if (!mapRes.ok) {
-          errors.push(`discovery_job_leads: ${mapRes.error?.message || 'upsert_failed'}`);
+        // PR-DEDUP-CACHE L2-2：增量补抓模式下命中 blacklist 的公司跳过映射写入。
+        //   语义：这家公司在 parent job 已经被抓到过，不计入本次"增量补抓"的产出
+        //   （但 L1 公司主表上面已经 upsert 过 — 字段新发现的信息保留）。
+        if (incrementalMode && blacklistSet.has(String(companyId))) {
+          incrementalSkipped += 1;
+        } else {
+          const mapRes = await upsertJobLeadMapping(
+            supabase,
+            discoveryJobId,
+            companyId,
+            lead._quality_grade || 'qualified',
+          );
+          if (!mapRes.ok) {
+            errors.push(`discovery_job_leads: ${mapRes.error?.message || 'upsert_failed'}`);
+          }
         }
       }
 
@@ -524,6 +547,7 @@ async function directIngestQualifiedLeads(supabase, leads, opts = {}) {
     resolvedLeads,
     edgesWritten,
     errors,
+    incrementalSkipped,
   };
 }
 

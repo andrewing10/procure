@@ -16,6 +16,7 @@ const { directIngestQualifiedLeads } = require('./v8_direct_l1_ingest');
 const { evaluateLead } = require('./v8_quality_gate');
 const { appendFunnelStep } = require('./v8_lib_funnel');
 const { enqueueEnrichmentLeads } = require('./v8_lib_enrichment_supabase');
+const { readIncrementalBlacklist } = require('./v8_lib_pillar0');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 
@@ -365,9 +366,28 @@ if (enqueueRejected > 0) {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
+    // PR-DEDUP-CACHE L2-2 (2026-05-28)：增量补抓模式
+    //   zhimao submit route 在 action_type='incremental_search' 时注入
+    //   PILLAR0_PAYLOAD.incremental_mode + incremental_blacklist_company_ids，
+    //   此处解析后传入 ingest，命中黑名单的 company_id 不写映射（只更新 L1 主表）。
+    const incrementalCfg = readIncrementalBlacklist(null);
+    if (incrementalCfg.enabled) {
+      console.log(
+        `[step5] incremental mode: parent=${incrementalCfg.parentJobId || 'unknown'}, ` +
+          `blacklist=${incrementalCfg.blacklistSet.size}`,
+      );
+    }
     const result = await directIngestQualifiedLeads(supabase, validLeads, {
       discoveryJobId: DISCOVERY_JOB_ID,
+      incrementalMode: incrementalCfg.enabled,
+      incrementalParentJobId: incrementalCfg.parentJobId,
+      incrementalBlacklistSet: incrementalCfg.blacklistSet,
     });
+    if (incrementalCfg.enabled && (result.incrementalSkipped || 0) > 0) {
+      console.log(
+        `[step5] incremental: skipped ${result.incrementalSkipped} leads (already in parent job ${incrementalCfg.parentJobId})`,
+      );
+    }
     if (result.errors.length) {
       console.warn('[step5] ingest messages:', JSON.stringify(result.errors.slice(0, 20)));
       if (result.errors.length > 20) {
@@ -401,6 +421,10 @@ if (enqueueRejected > 0) {
         icp_stats: icpStats,
         enrichment_queued: supabaseEnrichmentQueue.length,
         enrichment_queue_skipped: enqueueRejected,
+        incremental_mode: incrementalCfg.enabled,
+        incremental_parent_job_id: incrementalCfg.parentJobId,
+        incremental_blacklist_size: incrementalCfg.blacklistSet.size,
+        incremental_skipped: result.incrementalSkipped || 0,
       });
     }
   } else {

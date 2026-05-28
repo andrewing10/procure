@@ -9,7 +9,8 @@
     "run": "node zhimao_v8_ultimate_master.js",
     "worker": "node v8_discovery_worker.js",
     "test:quality-smoke": "node smoke-quality-regression.js",
-    "smoke:step5": "node scripts/step5_smoke.js"
+    "smoke:step5": "node scripts/step5_smoke.js",
+    "test:incremental-blacklist": "node scripts/verify-incremental-blacklist.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.50.3",

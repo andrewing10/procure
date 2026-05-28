@@ -188,6 +188,42 @@ function collectProcurementQueries(step0Data, payload) {
   return out;
 }
 
+/**
+ * PR-DEDUP-CACHE L2-2 (2026-05-28): 读 incremental_search 黑名单
+ *
+ * zhimao 仓 submit route 在 action_type='incremental_search' 时注入：
+ *   - incremental_mode: true
+ *   - incremental_parent_job_id: <uuid>
+ *   - incremental_blacklist_company_ids: string[]
+ *
+ * v8_direct_l1_ingest.directIngestQualifiedLeads 据此跳过黑名单 company_id
+ * 的 discovery_job_leads 写入（不影响 L1 公司主表本身更新；只是不把这些
+ * 公司计入本次"增量补抓"的产出）。
+ *
+ * 性能：Set 查 O(1)；blacklist 上限 1000（submit route 端 slice 截断）。
+ *
+ * @param {Record<string, unknown>|null} payload
+ * @returns {{ enabled: boolean, parentJobId: string|null, blacklistSet: Set<string> }}
+ */
+function readIncrementalBlacklist(payload) {
+  const p = payload || readFullPillar0Payload();
+  const enabled = Boolean(p && p.incremental_mode === true);
+  if (!enabled) {
+    return { enabled: false, parentJobId: null, blacklistSet: new Set() };
+  }
+  const parentJobId =
+    typeof p.incremental_parent_job_id === 'string' ? p.incremental_parent_job_id.trim() : null;
+  const raw = Array.isArray(p.incremental_blacklist_company_ids)
+    ? p.incremental_blacklist_company_ids
+    : [];
+  const set = new Set();
+  for (const id of raw) {
+    const s = String(id || '').trim();
+    if (s) set.add(s);
+  }
+  return { enabled: true, parentJobId, blacklistSet: set };
+}
+
 module.exports = {
   readFullPillar0Payload,
   readInlineSeeds,
@@ -199,4 +235,5 @@ module.exports = {
   collectLocalBooleanQueries,
   collectProcurementQueries,
   sanitizeDiscoveryCategory,
+  readIncrementalBlacklist,
 };
