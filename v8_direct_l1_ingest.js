@@ -10,7 +10,7 @@
  */
 
 const { upsertJobLeadMapping } = require('./v8_zhimao_contract');
-const { inferProcurementSignalCount } = require('./v8_quality_gate');
+const { inferProcurementSignalCount, inferEntityType } = require('./v8_quality_gate');
 const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
 // ── buyer-commerce 内联（原 @zhimao/buyer-commerce/l1Commerce.cjs）──────────
 // 跨仓 file: 依赖在 Render 单仓部署时不存在，直接内联避免运行时 MODULE_NOT_FOUND。
@@ -78,10 +78,25 @@ const ICP_EVIDENCE_COLUMNS = ['industry_match', 'industry_evidence', 'category_k
 /** zhimao 迁移 20260626120000 + 20260626130000；未部署时 strip 后由 DB 触发器补写 */
 const COMMERCE_COLUMNS = ['contact_bundle', 'sellable_skus', 'data_archetype', 'contactability_score'];
 
+/** entity_type 列（读路径 dataIntelPublic 已依赖，正常必存在）；旧库缺列时 strip 兜底 */
+const ENTITY_TYPE_COLUMNS = ['entity_type'];
+
 function stripIcpEvidenceColumns(row) {
   const out = { ...row };
   for (const col of ICP_EVIDENCE_COLUMNS) delete out[col];
   return out;
+}
+
+function stripEntityTypeColumns(row) {
+  const out = { ...row };
+  for (const col of ENTITY_TYPE_COLUMNS) delete out[col];
+  return out;
+}
+
+function isMissingEntityTypeColumnError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  if (err?.code !== 'PGRST204' && !msg.includes('schema cache')) return false;
+  return ENTITY_TYPE_COLUMNS.some((col) => msg.includes(col));
 }
 
 function stripCommerceColumns(row) {
@@ -125,6 +140,14 @@ async function upsertL1Chunk(supabase, batchPayload) {
         'Deploy zhimao migrations 20260626120000_buyer_commerce_entity.sql + 20260626130000_l1_commerce_ingest_trigger.sql',
     );
     payload = payload.map(stripCommerceColumns);
+    res = await supabase
+      .from('data_intel_l1_companies')
+      .upsert(payload, { onConflict: 'name_canonical,country', ignoreDuplicates: true })
+      .select('company_id,name_canonical,country');
+  }
+  if (res.error && isMissingEntityTypeColumnError(res.error)) {
+    console.warn('[direct-l1] entity_type column missing; retrying without entity_type.');
+    payload = payload.map(stripEntityTypeColumns);
     res = await supabase
       .from('data_intel_l1_companies')
       .upsert(payload, { onConflict: 'name_canonical,country', ignoreDuplicates: true })
@@ -315,6 +338,16 @@ function buildL1Row(lead, nowIso) {
     // 原始 snippet 仍写入 .snippet 字段，供调试追溯，但前端展示层只取 address_line。
     address_line: (lead._gmaps_address || lead.formatted_address || null) || null,
     place_type: lead.entity_role || null,
+    // 入库即落 entity_type（根治 NULL 行被读路径 .neq 误杀的雷；zhimao 读路径仍保留
+    // NULL-safe 兜底做防御层）。Pillar 0 seed/HVC 跳过 evaluateLead，此处补判可挡住
+    // 漏网的 aggregator/social/media。与 zhimao quality.ts inferEntityType 同源。
+    entity_type: inferEntityType({
+      domain: lead.domain || null,
+      snippet: lead.snippet || null,
+      companyName: lead.company_name || name_canonical || null,
+      primaryEmail: lead.primary_email || null,
+      category: lead.category || lead.category_key || process.env.DISCOVERY_CATEGORY || null,
+    }) || null,
     snippet: lead.snippet ? String(lead.snippet).slice(0, 2000) : null,
     source: 'v8_pipeline',
     source_tags: ['v8_pipeline'],

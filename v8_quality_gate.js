@@ -891,6 +891,7 @@ module.exports = {
     computeQualityGrade,
     isClosedBusiness,
     inferProcurementSignalCount,
+    inferEntityType,
     evaluateLead,
     REJECT_REASONS,
 };
