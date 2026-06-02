@@ -38,7 +38,14 @@ const MAJOR_CITIES = {
   MO: ['Macau'],
 };
 
-/** 首波抓取矩阵支持的 6 个平台（Pillar 映射见 PLATFORM_PILLAR_MAP.md）。 */
+/** 抓取矩阵支持的平台（Pillar 映射见 zhimao 仓 PLATFORM_PILLAR_MAP.md）。
+ *
+ * 2026-05-26 加 telegram_public（Telegram 融入数据通道 · 批次 T-A 双仓同步）：
+ *   - 与 zhimao apps/web/lib/discovery/matrixDefaults.ts KNOWN_PLATFORMS 严格一致；
+ *   - 任一仓单独加 = 前端能选但 worker 跑空（假按钮）；
+ *   - pillar 实现见 v8_step1_omni_hub.js p_telegram_public；
+ *   - discovered_via 映射见 v8_direct_l1_ingest.js inferDiscoveredVia。
+ */
 const KNOWN_PLATFORMS = [
   'maps',
   'yellowpages',
@@ -46,6 +53,7 @@ const KNOWN_PLATFORMS = [
   'linkedin_snippet',
   'youtube_about',
   'x_public',
+  'telegram_public',
 ];
 
 /**

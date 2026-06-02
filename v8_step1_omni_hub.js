@@ -937,6 +937,24 @@ async function run() {
       }));
     })(),
 
+    // 2026-05-26 加 telegram_public（Telegram 融入数据通道 · 批次 T-A）：
+    // Telegram 公开频道 / 讨论组在采购领域常见"我们正在找 X 厂家"这种询价 snippet。
+    // 实现完全镜像 p_facebook_public：Serper site:t.me 搜 + 同款 OR 关键词组 +
+    // 前 3 城市作 OR clause；link=null + source_url=原始（避免被当公司 domain 写 L1）。
+    // 不强求 site 限定到 telegram.me — t.me 是官方主域，telegram.me 流量极少。
+    p_telegram_public: (async () => {
+      const cityClause = mapsCities.length > 0 ? ` ("${mapsCities.slice(0, 3).join('" OR "')}")` : '';
+      const subject = anchorPrimary ? `"${anchorPrimary}"` : `${OQ}`;
+      const q = `site:t.me ${subject} (buyer OR procurement OR sourcing OR wholesale OR importer) ${countryName}${cityClause}`;
+      const r = await searchOrganicMultiPage(q, cc, organicNum);
+      return r.map((o) => ({
+        title: o.title, link: null, snippet: o.snippet,
+        pillar: 'Pillar TG Public', intent_signal: 'TG_PUBLIC',
+        source_url: o.link,
+        social_profile_urls: extractSocialUrlsFromText(o.link, o.snippet),
+      }));
+    })(),
+
     // ── P9: Lookalike 裂变（种子反哺闭环核心）────────────────────────────────
     // 设计逻辑：
     //   Pillar0 把种子激活为 lead → Step5 把高置信 lead 写回 seed JSON
@@ -1013,6 +1031,7 @@ async function run() {
     if (!isPlatformEnabled(matrix, 'linkedin_snippet')) delete pillarPromises.p11_linkedin_decision;
     if (!isPlatformEnabled(matrix, 'youtube_about'))    delete pillarPromises.p_youtube_about;
     if (!isPlatformEnabled(matrix, 'x_public'))         delete pillarPromises.p_x_public;
+    if (!isPlatformEnabled(matrix, 'telegram_public'))  delete pillarPromises.p_telegram_public;
     console.log(`[step1] matrix.platforms whitelist applied: kept=${Object.keys(pillarPromises).filter(k => /^(p1_maps|p_|p11_)/.test(k)).join('|')}`);
   }
 
