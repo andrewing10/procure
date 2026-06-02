@@ -64,6 +64,14 @@ const PIPELINE_MAX_MS = Math.max(Number(process.env.DISCOVERY_PIPELINE_MAX_MS ||
 const PIPELINE_KILL_GRACE_MS = Math.max(Number(process.env.DISCOVERY_PIPELINE_KILL_GRACE_MS || 90_000), 10_000);
 const PIPELINE_HEARTBEAT_MS = Math.max(Number(process.env.DISCOVERY_PIPELINE_HEARTBEAT_MS || 45_000), 10_000);
 
+// 并发车道数：一次最多同时认领并跑几个 job。claim_next_discovery_job 用 FOR UPDATE SKIP
+// LOCKED，多车道并发认领互不抢占（各拿一单）。默认 2，env 可调，封顶 6（防 Render 实例
+// 内存/外部 API 速率被多个 Playwright + Gemini pipeline 同时打爆）。
+const PIPELINE_CONCURRENCY = Math.min(
+  Math.max(Number(process.env.DISCOVERY_PIPELINE_CONCURRENCY || 2), 1),
+  6,
+);
+
 const ACTIVE_JOB_STATUSES = ['pending', 'running', 'claimed', 'fetching', 'parsing', 'scoring', 'persisting'];
 
 /**
@@ -427,16 +435,125 @@ async function writeHeartbeat() {
   }
 }
 
-async function main() {
-  console.log('[worker] discovery worker started');
-  // Write initial heartbeat on startup so admin can see the worker came online.
-  await writeHeartbeat();
+/**
+ * 认领并跑完一个 job（一个并发车道的一次迭代）。
+ * 返回 true = 确实认领并处理了一个 job；false = 队列暂时没活，调用方应 sleep 后再试。
+ * 多车道并发调用安全：claim 用 FOR UPDATE SKIP LOCKED，各车道各拿一单。
+ */
+async function claimAndProcessOne(workerId) {
+  const claim = await claimNextDiscoveryJob(supabase, workerId);
+  if (!claim.ok || !claim.job || !claim.job.job_id) return false;
 
+  const job = await readClaimedJob(claim.job.job_id);
+  if (!job) return false;
+
+  try {
+    await recordStage(supabase, job.id, 'fetching');
+
+    // 读取该 job 的历史 sweep 次数，传入流水线做深分页
+    const { data: jobMeta } = await supabase
+      .from('discovery_jobs')
+      .select('sweep_count')
+      .eq('id', job.id)
+      .maybeSingle();
+    const sweepCount = Number(jobMeta?.sweep_count ?? 0) + 1;
+
+    const reweightPolicies = await readReweightPolicies(job);
+    console.log(`[worker] [${workerId}] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`);
+    const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount, job, reweightPolicies);
+
+    // CANCELLED 退出码 或 DB 仍显示 cancelled → 均跳过 finalize，不计为失败
+    // 例外：退出码 4（GRACEFUL_CANCEL_WITH_DATA）= master 已完成 step4/5，有数据入库 → 正常 finalize
+    if (exitCode === PIPELINE_EXIT.CANCELLED || await isJobCancelled(supabase, job.id)) {
+      if (exitCode === PIPELINE_EXIT.GRACEFUL_CANCEL_WITH_DATA) {
+        console.log(`[worker] job ${job.id} cancelled but master persisted data (exit 4) — running finalize`);
+        // 继续往下走，正常 markDone
+      } else {
+        console.log(`[worker] job ${job.id} cancelled — skip finalize`);
+        return true;
+      }
+    }
+
+    if (exitCode === PIPELINE_EXIT.CRASH) {
+      await markFailed(job.id, 'pipeline_exit_non_zero');
+      return true;
+    }
+
+    // 看门狗硬超时：pipeline 卡死被强杀，无优雅落库 → markFailed，让用户拿到明确失败可重试。
+    if (exitCode === PIPELINE_EXIT.TIMEOUT) {
+      console.warn(`[worker] job ${job.id} aborted by pipeline watchdog (timeout) — marking failed`);
+      await markFailed(job.id, 'pipeline_timeout');
+      return true;
+    }
+
+    // exit(2) = no new data this sweep — mark done 但 completion_reason=completed_empty
+    let completionReason = 'success';
+    if (exitCode === PIPELINE_EXIT.NO_DATA) {
+      completionReason = 'completed_empty';
+      console.log(`[worker] job ${job.id} sweep=${sweepCount}: no new data (graceful stop).`);
+    }
+
+    const funnelDoc = readFunnelDoc(job.id);
+    if (funnelDoc) {
+      // 与心跳一致：写数组形态，前端 useDiscoveryJobRunner 才认（Array.isArray 判定）。
+      const funnelArr = funnelDocToArray(funnelDoc) ?? funnelDoc;
+      await supabase
+        .from('discovery_jobs')
+        .update({ funnel_json: funnelArr })
+        .eq('id', job.id);
+      deleteFunnelFile(job.id);
+    }
+
+    // 补报中间 stage：流水线（step1-5）以黑盒子进程运行，这里在 markDone 前
+    // 补上 parsing / scoring，让 UI 进度条不出现 fetching→persisting 长空白。
+    await recordStage(supabase, job.id, 'parsing',  { phase: 'step1_step3_complete' });
+    await recordStage(supabase, job.id, 'scoring',  { phase: 'step4_step5_complete', sweep: sweepCount });
+
+    // 更新 sweep_count 方便下轮深分页
+    await supabase
+      .from('discovery_jobs')
+      .update({
+        sweep_count: sweepCount,
+        completion_reason: completionReason,
+      })
+      .eq('id', job.id);
+
+    await markDone(job);
+    const count = await readMappingCount(job.id);
+    console.log(`[worker] [${workerId}] job done ${job.id}, mapping_count=${count}, sweep=${sweepCount}`);
+  } catch (e) {
+    console.error(`[worker] [${workerId}] job ${job.id} error:`, e instanceof Error ? e.message : e);
+    // 兜底：异常落地为 failed，避免任务永远卡在 in-flight（stale 释放兜底也会补）。
+    try { await markFailed(job.id, 'worker_loop_error'); } catch (_) { /* ignore */ }
+  }
+  return true;
+}
+
+/**
+ * 一个并发车道：不停认领 + 处理 job；没活时 sleep(POLL_MS)，有活时只 sleep 一小段再抢下一单。
+ */
+async function lane(laneId) {
+  const workerId = `${process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || 'procure-worker'}#lane${laneId}`;
+  while (true) {
+    let processed = false;
+    try {
+      processed = await claimAndProcessOne(workerId);
+    } catch (e) {
+      console.error(`[worker] [${workerId}] lane error:`, e instanceof Error ? e.message : e);
+    }
+    await sleep(processed ? 1000 : POLL_MS);
+  }
+}
+
+/**
+ * 单例后台维护循环：心跳 + 释放 stale 认领 + enrichment_queue。
+ * 这些是全局性工作，只跑一份，不随并发车道数翻倍。
+ */
+async function housekeeping() {
   while (true) {
     try {
-      // Heartbeat every loop so admin panel shows last-seen time.
+      // Heartbeat so admin panel shows last-seen time.
       await writeHeartbeat();
-
       await releaseStaleClaims(supabase, 900);
       try {
         const eq = await processEnrichmentBatch(supabase, 5);
@@ -446,103 +563,24 @@ async function main() {
       } catch (e) {
         console.warn('[worker] enrichment_queue tick failed:', e?.message || e);
       }
-      const claim = await claimNextDiscoveryJob(supabase);
-      if (!claim.ok) {
-        await sleep(POLL_MS);
-        continue;
-      }
-      if (!claim.job || !claim.job.job_id) {
-        await sleep(POLL_MS);
-        continue;
-      }
-
-      const job = await readClaimedJob(claim.job.job_id);
-      if (!job) {
-        await sleep(POLL_MS);
-        continue;
-      }
-
-      await recordStage(supabase, job.id, 'fetching');
-
-      // 读取该 job 的历史 sweep 次数，传入流水线做深分页
-      const { data: jobMeta } = await supabase
-        .from('discovery_jobs')
-        .select('sweep_count')
-        .eq('id', job.id)
-        .maybeSingle();
-      const sweepCount = Number(jobMeta?.sweep_count ?? 0) + 1;
-
-      const reweightPolicies = await readReweightPolicies(job);
-      console.log(`[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`);
-      const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount, job, reweightPolicies);
-
-      // CANCELLED 退出码 或 DB 仍显示 cancelled → 均跳过 finalize，不计为失败
-      // 例外：退出码 4（GRACEFUL_CANCEL_WITH_DATA）= master 已完成 step4/5，有数据入库 → 正常 finalize
-      if (exitCode === PIPELINE_EXIT.CANCELLED || await isJobCancelled(supabase, job.id)) {
-        if (exitCode === PIPELINE_EXIT.GRACEFUL_CANCEL_WITH_DATA) {
-          console.log(`[worker] job ${job.id} cancelled but master persisted data (exit 4) — running finalize`);
-          // 继续往下走，正常 markDone
-        } else {
-          console.log(`[worker] job ${job.id} cancelled — skip finalize`);
-          await sleep(1000);
-          continue;
-        }
-      }
-
-      if (exitCode === PIPELINE_EXIT.CRASH) {
-        await markFailed(job.id, 'pipeline_exit_non_zero');
-        await sleep(1000);
-        continue;
-      }
-
-      // 看门狗硬超时：pipeline 卡死被强杀，无优雅落库 → markFailed，让用户拿到明确失败可重试。
-      if (exitCode === PIPELINE_EXIT.TIMEOUT) {
-        console.warn(`[worker] job ${job.id} aborted by pipeline watchdog (timeout) — marking failed`);
-        await markFailed(job.id, 'pipeline_timeout');
-        await sleep(1000);
-        continue;
-      }
-
-      // exit(2) = no new data this sweep — mark done 但 completion_reason=completed_empty
-      let completionReason = 'success';
-      if (exitCode === PIPELINE_EXIT.NO_DATA) {
-        completionReason = 'completed_empty';
-        console.log(`[worker] job ${job.id} sweep=${sweepCount}: no new data (graceful stop).`);
-      }
-
-      const funnelDoc = readFunnelDoc(job.id);
-      if (funnelDoc) {
-        // 与心跳一致：写数组形态，前端 useDiscoveryJobRunner 才认（Array.isArray 判定）。
-        const funnelArr = funnelDocToArray(funnelDoc) ?? funnelDoc;
-        await supabase
-          .from('discovery_jobs')
-          .update({ funnel_json: funnelArr })
-          .eq('id', job.id);
-        deleteFunnelFile(job.id);
-      }
-
-      // 补报中间 stage：流水线（step1-5）以黑盒子进程运行，这里在 markDone 前
-      // 补上 parsing / scoring，让 UI 进度条不出现 fetching→persisting 长空白。
-      await recordStage(supabase, job.id, 'parsing',  { phase: 'step1_step3_complete' });
-      await recordStage(supabase, job.id, 'scoring',  { phase: 'step4_step5_complete', sweep: sweepCount });
-
-      // 更新 sweep_count 方便下轮深分页
-      await supabase
-        .from('discovery_jobs')
-        .update({
-          sweep_count: sweepCount,
-          completion_reason: completionReason,
-        })
-        .eq('id', job.id);
-
-      await markDone(job);
-      const count = await readMappingCount(job.id);
-      console.log(`[worker] job done ${job.id}, mapping_count=${count}, sweep=${sweepCount}`);
     } catch (e) {
-      console.error('[worker] loop error:', e instanceof Error ? e.message : e);
+      console.error('[worker] housekeeping error:', e instanceof Error ? e.message : e);
     }
     await sleep(POLL_MS);
   }
+}
+
+async function main() {
+  console.log(`[worker] discovery worker started (concurrency=${PIPELINE_CONCURRENCY})`);
+  // Write initial heartbeat on startup so admin can see the worker came online.
+  await writeHeartbeat();
+
+  const lanes = [];
+  for (let i = 1; i <= PIPELINE_CONCURRENCY; i++) {
+    lanes.push(lane(i));
+  }
+  // housekeeping 与所有车道并行常驻；任一意外退出都不应让进程整体退出（各自 while(true) 内已兜底）。
+  await Promise.all([housekeeping(), ...lanes]);
 }
 
 main().catch((e) => {

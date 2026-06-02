@@ -13,7 +13,10 @@ if (args.length < 2) {
 
 const countryCode = args[0];
 const category = args.slice(1).join(' ');
-const sessionId = `v8_ultimate_${countryCode}_${Date.now()}`;
+// 并发安全：worker 可同时跑多个 pipeline。session 目录除了时间戳，还拼上 DISCOVERY_JOB_ID
+// 的短哈希，确保两个同国家任务在同一毫秒启动时也不会共用目录、互相覆盖中间文件。
+const jobTag = String(process.env.DISCOVERY_JOB_ID || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
+const sessionId = `v8_ultimate_${countryCode}_${Date.now()}${jobTag ? `_${jobTag}` : ''}`;
 fs.mkdirSync(sessionId, { recursive: true });
 
 /**
