@@ -30,6 +30,12 @@ process.on('SIGTERM', () => {
     }
 });
 
+// 单个 step 的硬超时：防止某一步（step1 采集 / step3 富化）卡死把整条 pipeline 拖死。
+// 与 v8_cron_worker.js / v8_enrichment_queue_worker.js 的 execSync timeout 同款思路。
+// 默认 10min，env 可调；命中后 execSync 抛错 → 写 crash 文件 → exit 1 → worker markFailed。
+// 注意：worker 侧另有 DISCOVERY_PIPELINE_MAX_MS 总看门狗（默认 18min）作为整体兜底。
+const STEP_TIMEOUT_MS = Math.max(Number(process.env.DISCOVERY_STEP_TIMEOUT_MS || 10 * 60 * 1000), 30_000);
+
 function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs = "") {
     // ── Graceful cancel：跳过耗时的富化步骤，但不跳过去重和持久化 ──────────────
     // step4 = "4. Global Dedupe", step5 = "5. Routing & Persistence"
@@ -61,8 +67,20 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
     console.log(`-> Executing: ${cmd}`);
 
     try {
-        execSync(cmd, { stdio: 'inherit' });
+        execSync(cmd, { stdio: 'inherit', timeout: STEP_TIMEOUT_MS, killSignal: 'SIGKILL' });
     } catch (e) {
+        // execSync 超时：e.killed === true 且 e.signal/e.code 反映被杀；按崩溃处理并标注超时步骤。
+        if (!gracefulCancel && e && e.killed) {
+            console.error(`[HALT] Step "${stepName}" exceeded ${STEP_TIMEOUT_MS}ms — killed (likely a stuck upstream). Treating as crash.`);
+            const jobId = process.env.DISCOVERY_JOB_ID || 'unknown';
+            try {
+                fs.writeFileSync(
+                    `crash_${jobId}.json`,
+                    JSON.stringify({ step: stepName, script: scriptFile, error: `step_timeout_${STEP_TIMEOUT_MS}ms` })
+                );
+            } catch (_) { /* ignore */ }
+            process.exit(1);
+        }
         if (gracefulCancel) {
             // step 被 cancel 中断（execSync 异常），检查输出是否有部分数据
             if (fs.existsSync(outputFile)) {

@@ -46,13 +46,51 @@ function sleep(ms) {
 //   2 → 本轮无新数据（graceful stop）→ markDone 但标记 result_count 来自 bulk 侧
 //   3 → 子进程被 cancel SIGTERM 终止（无数据持久化），语义上不是"失败"
 //   4 → graceful cancel with data：SIGTERM 到达后 master 仍完成了 step4/5 持久化
+//   5 → 看门狗硬超时：pipeline 超过 DISCOVERY_PIPELINE_MAX_MS 仍未结束，被强杀（markFailed）
 const PIPELINE_EXIT = {
   SUCCESS: 0,
   CRASH: 1,
   NO_DATA: 2,
   CANCELLED: 3,
   GRACEFUL_CANCEL_WITH_DATA: 4,
+  TIMEOUT: 5,
 };
+
+// 看门狗参数（env 可调）：
+//   DISCOVERY_PIPELINE_MAX_MS  → 单个 job pipeline 软上限，到点先 SIGTERM master 走 graceful cancel
+//   DISCOVERY_PIPELINE_KILL_GRACE_MS → SIGTERM 后等多久还没退就 SIGKILL 整个进程组
+//   DISCOVERY_PIPELINE_HEARTBEAT_MS  → 运行期间多久回写一次 stage_heartbeat_at + funnel_json
+const PIPELINE_MAX_MS = Math.max(Number(process.env.DISCOVERY_PIPELINE_MAX_MS || 18 * 60 * 1000), 60_000);
+const PIPELINE_KILL_GRACE_MS = Math.max(Number(process.env.DISCOVERY_PIPELINE_KILL_GRACE_MS || 90_000), 10_000);
+const PIPELINE_HEARTBEAT_MS = Math.max(Number(process.env.DISCOVERY_PIPELINE_HEARTBEAT_MS || 45_000), 10_000);
+
+const ACTIVE_JOB_STATUSES = ['pending', 'running', 'claimed', 'fetching', 'parsing', 'scoring', 'persisting'];
+
+/**
+ * 把 funnel_<jobId>.json 的 { steps: { step1: {...} } } 物理结构转成前端
+ * useDiscoveryJobRunner 期望的数组形态 [{ step:'step1', signals, accepted, pillars... }]。
+ * 旧实现直接把对象塞进 funnel_json，前端 `Array.isArray()` 判否后丢弃 → 真实进度数字一直不显示。
+ */
+function funnelDocToArray(doc) {
+  if (!doc || !doc.steps || typeof doc.steps !== 'object') return null;
+  const order = ['step0', 'step1', 'step2', 'step3', 'step4', 'step5'];
+  const keys = Object.keys(doc.steps).sort((a, b) => {
+    const ia = order.indexOf(a); const ib = order.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  const arr = keys.map((k) => ({ step: k, ...doc.steps[k] }));
+  return arr.length ? arr : null;
+}
+
+/** 由 funnel 文件里最新出现的 step 粗映射到 discovery_jobs.current_stage。 */
+function funnelLatestStage(doc) {
+  if (!doc || !doc.steps) return null;
+  if (doc.steps.step5) return 'persisting';
+  if (doc.steps.step4) return 'scoring';
+  if (doc.steps.step3 || doc.steps.step2) return 'parsing';
+  if (doc.steps.step1) return 'fetching';
+  return null;
+}
 
 async function readReweightPolicies(job) {
   const country = String(job.country_iso || '').trim().toUpperCase();
@@ -96,6 +134,7 @@ async function readReweightPolicies(job) {
 function makeCancelWatcher(jobId) {
   let resolveCancel;
   let cancelled = false;
+  let realtimeDisabled = false;
   const promise = new Promise((resolve) => { resolveCancel = resolve; });
 
   function triggerCancel() {
@@ -119,11 +158,18 @@ function makeCancelWatcher(jobId) {
     )
     .subscribe((status, err) => {
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-        console.warn(`[worker] cancel realtime channel ${status} for job ${jobId}, relying on poll fallback`);
+        if (realtimeDisabled) return;
+        realtimeDisabled = true;
+        const detail = err?.message ? `: ${err.message}` : '';
+        console.warn(`[worker] cancel realtime channel ${status} for job ${jobId}${detail}, relying on poll fallback`);
+        supabase.removeChannel(channel).catch(() => { /* ignore */ });
       }
     });
 
   // 兜底路径：每 30s 轮询一次（仅在 Realtime 掉线时作为安全网）
+  isJobCancelled(supabase, jobId).then((isCancelled) => {
+    if (isCancelled) triggerCancel();
+  }).catch(() => { /* ignore */ });
   const fallbackPoll = setInterval(async () => {
     if (cancelled) return;
     if (await isJobCancelled(supabase, jobId)) triggerCancel();
@@ -163,6 +209,10 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
       ['zhimao_v8_ultimate_master.js', countryIso, category],
       {
         stdio: 'inherit',
+        // 自成进程组：看门狗需要时可 process.kill(-pid) 连同 master 用 execSync spawn 的
+        // 孙进程（卡死的 step1/3）一起杀掉。master 阻塞在同步 execSync 时，单发 SIGTERM 给
+        // master 是无效的（信号处理函数排在被阻塞的事件循环后面），必须组级 SIGKILL 兜底。
+        detached: true,
         env: {
           ...process.env,
           DISCOVERY_JOB_ID: String(jobId),
@@ -192,14 +242,76 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
       },
     );
 
+    // 组级杀进程：优先 process.kill(-pid) 命中整个进程组，失败再退化为只杀 master。
+    const killTree = (sig) => {
+      try {
+        if (child.pid) process.kill(-child.pid, sig);
+      } catch (_) {
+        try { child.kill(sig); } catch (__) { /* ignore */ }
+      }
+    };
+
     // 双路取消监听：Realtime（快）+ 30s 轮询（兜底）
     const watcher = makeCancelWatcher(jobId);
     watcher.promise.then(() => {
       try { child.kill('SIGTERM'); } catch (_) { /* ignore */ }
     });
 
-    child.on('close', (code) => {
+    // ── A 看门狗：pipeline 硬上限，避免单个 job 卡死后无终态（用户等满 60min 才自愈）──
+    //   软触发：SIGTERM master → master 在 step 之间会进入 graceful cancel，跑完 step4+5
+    //          落库已采集数据并 exit 4；用户随后能看到"部分结果 + 完成"。
+    //   硬触发：宽限期后仍未退出（多半卡死在某个 step 的同步 execSync 里）→ 组级 SIGKILL，
+    //          回报 TIMEOUT → markFailed('pipeline_timeout')，让用户拿到明确失败可重试。
+    let watchdogState = 'armed'; // armed | soft | hard
+    let killTimer = null;
+    const softTimer = setTimeout(() => {
+      watchdogState = 'soft';
+      console.warn(`[worker] pipeline watchdog: job ${jobId} exceeded ${PIPELINE_MAX_MS}ms — SIGTERM master (graceful cancel, will try to persist partial data)`);
+      try { child.kill('SIGTERM'); } catch (_) { /* ignore */ }
+      killTimer = setTimeout(() => {
+        watchdogState = 'hard';
+        console.warn(`[worker] pipeline watchdog: job ${jobId} still alive ${PIPELINE_KILL_GRACE_MS}ms after SIGTERM — SIGKILL process group`);
+        killTree('SIGKILL');
+      }, PIPELINE_KILL_GRACE_MS);
+    }, PIPELINE_MAX_MS);
+
+    // ── C 运行期心跳 + 真实进度回写 ──────────────────────────────────────────
+    //   pipeline 是黑盒子进程，期间不回写 DB 会让 current_stage 冻在 fetching、
+    //   stage_heartbeat_at 不动、funnel 数字到结束才出现。这里每 N 秒：
+    //     1) 读 funnel 文件 → 以数组形态写 funnel_json（前端真实进度数字立刻可见）
+    //     2) 按最新 step 粗推 current_stage + bump stage_heartbeat_at
+    //   只更新仍处于活态的行（.in 守卫），绝不覆盖已 cancelled/done/failed 的终态。
+    const heartbeat = setInterval(async () => {
+      try {
+        const doc = readFunnelDoc(jobId);
+        const arr = funnelDocToArray(doc);
+        const stage = funnelLatestStage(doc);
+        const patch = { stage_heartbeat_at: new Date().toISOString() };
+        if (arr) patch.funnel_json = arr;
+        if (stage) patch.current_stage = stage;
+        await supabase
+          .from('discovery_jobs')
+          .update(patch)
+          .eq('id', jobId)
+          .in('status', ACTIVE_JOB_STATUSES);
+      } catch (_) { /* 非致命 */ }
+    }, PIPELINE_HEARTBEAT_MS);
+
+    const cleanupTimers = () => {
+      clearTimeout(softTimer);
+      if (killTimer) clearTimeout(killTimer);
+      clearInterval(heartbeat);
+    };
+
+    child.on('close', (code, signal) => {
+      cleanupTimers();
       watcher.cleanup();
+      // 看门狗硬杀：无优雅落库 → 回报 TIMEOUT，由主循环 markFailed。
+      if (watchdogState === 'hard') {
+        console.warn(`[worker] job ${jobId} hard-killed by watchdog (code=${code}, signal=${signal})`);
+        resolve(PIPELINE_EXIT.TIMEOUT);
+        return;
+      }
       if (watcher.triggered) {
         // cancel 信号已发送。
         // exit 4 = master 完成了 graceful cancel with data，应 finalize
@@ -211,9 +323,11 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
         }
         return;
       }
+      // 看门狗软触发后 master 优雅退出（exit 4 = 已落库部分数据）由下面的 code 透传处理。
       resolve(code ?? 1);
     });
     child.on('error', () => {
+      cleanupTimers();
       watcher.cleanup();
       resolve(PIPELINE_EXIT.CRASH);
     });
@@ -381,6 +495,14 @@ async function main() {
         continue;
       }
 
+      // 看门狗硬超时：pipeline 卡死被强杀，无优雅落库 → markFailed，让用户拿到明确失败可重试。
+      if (exitCode === PIPELINE_EXIT.TIMEOUT) {
+        console.warn(`[worker] job ${job.id} aborted by pipeline watchdog (timeout) — marking failed`);
+        await markFailed(job.id, 'pipeline_timeout');
+        await sleep(1000);
+        continue;
+      }
+
       // exit(2) = no new data this sweep — mark done 但 completion_reason=completed_empty
       let completionReason = 'success';
       if (exitCode === PIPELINE_EXIT.NO_DATA) {
@@ -390,9 +512,11 @@ async function main() {
 
       const funnelDoc = readFunnelDoc(job.id);
       if (funnelDoc) {
+        // 与心跳一致：写数组形态，前端 useDiscoveryJobRunner 才认（Array.isArray 判定）。
+        const funnelArr = funnelDocToArray(funnelDoc) ?? funnelDoc;
         await supabase
           .from('discovery_jobs')
-          .update({ funnel_json: funnelDoc })
+          .update({ funnel_json: funnelArr })
           .eq('id', job.id);
         deleteFunnelFile(job.id);
       }
