@@ -12,6 +12,10 @@
 const { upsertJobLeadMapping } = require('./v8_zhimao_contract');
 const { inferProcurementSignalCount, inferEntityType } = require('./v8_quality_gate');
 const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
+const { readIcpContext } = require('./v8_lib_pillar0');
+// P6b：直写 L1 路径不经 zhimao bulk HTTP 路由，故在此处镜像 find_suppliers 的
+// trade_role/biz_type 强化（bulk/route.ts 已对 HTTP 路径做同样覆盖）。
+const IS_SUPPLIER_MODE = readIcpContext().direction === 'find_suppliers';
 // ── buyer-commerce 内联（原 @zhimao/buyer-commerce/l1Commerce.cjs）──────────
 // 跨仓 file: 依赖在 Render 单仓部署时不存在，直接内联避免运行时 MODULE_NOT_FOUND。
 const PILLAR_DEBUG_RE = /^pillar\s*\d/i;
@@ -282,6 +286,12 @@ function inferDiscoveredVia(lead) {
   if (/Pillar TG Public/i.test(pillar)) return 'telegram_public';
   if (/Pillar 0 Seed/i.test(pillar)) return 'seed';
   if (/Pillar 9 Lookalike/i.test(pillar)) return 'lookalike';
+  // P6b 供应商目录 / 工厂直采 pillar 标签（与 zhimao matrixDefaults SUPPLIER_PLATFORMS 对齐）
+  if (/Pillar S MadeInChina/i.test(pillar)) return 'made_in_china';
+  if (/Pillar S GlobalSources/i.test(pillar)) return 'global_sources';
+  if (/Pillar S ThomasNet/i.test(pillar)) return 'thomasnet';
+  if (/Pillar S Alibaba/i.test(pillar)) return 'alibaba_intl';
+  if (/Pillar S Factory|Pillar S Exporter/i.test(pillar)) return 'supplier_direct';
   if (pillar) return 'organic_search';
   return null;
 }
@@ -415,6 +425,13 @@ function buildL1Row(lead, nowIso) {
       return sigs;
     })(),
   };
+
+  // P6b：供应商方向强化（镜像 bulk/route.ts）。直写路径无 inferTradeRole，
+  // 供应商 pillar 命中的公司本就是供应商：trade_role=supplier，biz_type 兜底 manufacturer。
+  if (IS_SUPPLIER_MODE) {
+    if (!row.biz_type || row.biz_type === 'unknown') row.biz_type = 'manufacturer';
+    row.trade_role = 'supplier';
+  }
 
   const commerceInput = {
     ...row,
@@ -589,4 +606,5 @@ module.exports = {
   normalizeNameCanonical,
   normalizeCategoryToKey,
   buildL1Row,
+  inferDiscoveredVia,
 };

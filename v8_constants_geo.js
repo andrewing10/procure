@@ -56,6 +56,28 @@ const KNOWN_PLATFORMS = [
   'telegram_public',
 ];
 
+/** P6b 供应商方向平台白名单（find_suppliers）。
+ *  与 zhimao apps/web/lib/discovery/matrixDefaults.ts SUPPLIER_PLATFORMS 严格一致。
+ *  step1 供应商模式 pillar 实现见 v8_step1_omni_hub.js（Pillar S *），
+ *  discovered_via 映射见 v8_direct_l1_ingest.js inferDiscoveredVia。 */
+const SUPPLIER_PLATFORMS = [
+  'made_in_china',
+  'global_sources',
+  'thomasnet',
+  'kompass',
+  'alibaba_intl',
+  '1688',
+  'tmall',
+  'gov_registry',
+  'industry_association',
+  'jd_b2b',
+  'serper',
+  'customs',
+];
+
+/** 买家 + 供应商平台白名单联合（matrix.platforms 校验用）。 */
+const ALL_PLATFORMS = [...KNOWN_PLATFORMS, ...SUPPLIER_PLATFORMS];
+
 /**
  * 从 PILLAR0_PAYLOAD（worker 注入的 action_payload 整体）解析出 matrix。
  * 返回的形状与 zhimao sanitizeMatrix() 相同；任何字段缺失都给安全默认。
@@ -73,7 +95,7 @@ function readMatrixFromEnv() {
     ? m.cities.map((c) => (typeof c === 'string' ? c.trim() : '')).filter(Boolean).slice(0, 10)
     : [];
   const platforms = Array.isArray(m.platforms)
-    ? m.platforms.map((p) => String(p || '').toLowerCase()).filter((p) => KNOWN_PLATFORMS.includes(p))
+    ? m.platforms.map((p) => String(p || '').toLowerCase()).filter((p) => ALL_PLATFORMS.includes(p))
     : [];
   const deepAll = m.deep_search_all_cities !== false;
   const maxPages = Math.min(5, Math.max(1, parseInt(m.max_pages_per_pillar, 10) || 2));
@@ -286,6 +308,8 @@ function readConvoControlsFromEnv() {
 module.exports = {
   MAJOR_CITIES,
   KNOWN_PLATFORMS,
+  SUPPLIER_PLATFORMS,
+  ALL_PLATFORMS,
   readMatrixFromEnv,
   resolveCitiesForRun,
   isPlatformEnabled,

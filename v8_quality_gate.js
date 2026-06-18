@@ -883,6 +883,73 @@ function evaluateLead(lead, opts) {
     return { qualified: true, grade };
 }
 
+/**
+ * P6 方向感知评分 — 供应商模式。
+ *
+ * 在 find_suppliers 方向下：
+ *   - "aggregator" 实体中，制造商/出口商/工厂域名 NOT unqualified（它们就是目标供应商）
+ *   - "aggregator" 中，行业协会/B2B 目录 仍然 unqualified
+ *   - 卖方自我声明关键词（manufacturer / exporter / factory / 制造 / 工厂）被视为 positive signal
+ *
+ * 此函数是 evaluateLead 的前置钩子，供 step5 直接调用。
+ * 不修改 evaluateLead 主函数，保持 find_buyers 路径不变。
+ *
+ * @param {object} lead       - 与 evaluateLead 入参格式一致
+ * @param {string} category   - 品类词
+ * @param {string[]} [negativeKeywords] - ICP 负向关键词列表（已小写）
+ * @returns {{ qualified: boolean, grade: string, reason: string }}
+ */
+function evaluateLeadSupplier(lead, category, negativeKeywords) {
+    // ── 负向关键词拦截（买家/供应商方向通用） ─────────────────────────────────
+    if (negativeKeywords && negativeKeywords.length > 0) {
+        const hay = `${String(lead.company_name || '')} ${String(lead.description || lead.snippet || '')}`.toLowerCase();
+        const hit = negativeKeywords.find((kw) => kw && hay.includes(kw));
+        if (hit) {
+            return { qualified: false, grade: 'unqualified', reason: `negative_keyword:${hit}` };
+        }
+    }
+
+    const name = String(lead.company_name || '').toLowerCase();
+    const snippet = String(lead.snippet || lead.description || '').toLowerCase();
+    const text = `${name} ${snippet}`;
+
+    // ── 供应商正向信号 ─────────────────────────────────────────────────────────
+    const SUPPLIER_POSITIVE_RE = /\b(manufacturer|manufactur|factory|factories|exporter|producer|supplier|fabricat|oem|odm|制造|工厂|出口商|生产商|供应商)\b/i;
+    const isSupplierSignal = SUPPLIER_POSITIVE_RE.test(text);
+
+    // ── 纯目录/协会（供应商模式下仍排除）────────────────────────────────────────
+    const domainEntityType = inferEntityType({ domain: lead.domain, snippet: lead.snippet, companyName: lead.company_name, category });
+    const isDirectory = domainEntityType === 'aggregator' && !isSupplierSignal;
+
+    if (isDirectory) {
+        return { qualified: false, grade: 'unqualified', reason: 'aggregator_no_supplier_signal' };
+    }
+
+    // ── 委托买家评分函数处理其余字段（联系方式/域名/垃圾检测等） ────────────────
+    const base = evaluateLead(lead, category);
+    if (!base.qualified) return base;
+
+    // 有供应商信号 → 升级 qualified → premium（等同于「高置信目标」）
+    if (isSupplierSignal && base.grade === 'qualified') {
+        return { qualified: true, grade: 'premium', reason: 'supplier_signal_upgrade' };
+    }
+    return base;
+}
+
+/**
+ * P6 ICP 负向关键词评分钩子（买家/供应商通用）。
+ * 在 step5 写入前调用，命中 → 强制 unqualified（不写入 data_intel_l1_companies）。
+ *
+ * @param {string} name         公司名称
+ * @param {string} [description] 描述/snippet
+ * @param {string[]} negatives  负向关键词列表（已小写）
+ */
+function isNegativeKeywordHit(name, description, negatives) {
+    if (!negatives || negatives.length === 0) return false;
+    const hay = `${String(name || '')} ${String(description || '')}`.toLowerCase();
+    return negatives.some((kw) => kw && hay.includes(kw));
+}
+
 module.exports = {
     isJunkDomain,
     isAggregatorDomain,
@@ -893,5 +960,7 @@ module.exports = {
     inferProcurementSignalCount,
     inferEntityType,
     evaluateLead,
+    evaluateLeadSupplier,
+    isNegativeKeywordHit,
     REJECT_REASONS,
 };

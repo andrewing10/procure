@@ -6,9 +6,13 @@ const { pMap, callGeminiJson } = require('./v8_lib_concurrency');
 const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
 const { extractSocialUrls } = require('./v8_lib_social_extract');
 const { enrichContactsForLead } = require('./v8_lib_contact_enricher');
+const { readIcpContext } = require('./v8_lib_pillar0');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 const SKIP_L3_INFERENCE = process.env.SKIP_L3_INFERENCE === 'true';
+// P6b：供应商模式下，买家"反向验证"会把制造商/出口商判成 seller=none 而误杀目标，
+// 因此跳过 REVERSE-VERIFICATION GATE（step5 同步跳过买家闸门）。
+const IS_SUPPLIER_MODE = readIcpContext().direction === 'find_suppliers';
 
 /**
  * 买家抓取矩阵：matrix.include_social_profiles 控制社媒 URL 富化。
@@ -115,7 +119,8 @@ async function inferL3SupplyChain(leads) {
         // 的 industry_en 搜到候选公司（不带 category）。这里 L3 必须反向验证"该公司是否真的采购 ${category}"，
         // 否则会把"电子厂"全收进来，但很多电子厂其实不买纸箱（PCB 厂 vs 整机组装厂）。
         const TARGET_CATEGORY = String(process.env.DISCOVERY_CATEGORY || '').trim().slice(0, 80);
-        const reverseVerifyBlock = TARGET_CATEGORY
+        // 供应商模式：不注入买家反向验证（否则 LLM 把目标供应商判 none）。
+        const reverseVerifyBlock = (TARGET_CATEGORY && !IS_SUPPLIER_MODE)
             ? `
 
 [REVERSE-VERIFICATION GATE — INDUSTRY PERSONA TREE]
@@ -155,7 +160,7 @@ The following entity types are NEVER direct buyers regardless of industry releva
    for the same category they produce.`
             : '';
 
-        const reverseVerifyJsonHint = TARGET_CATEGORY
+        const reverseVerifyJsonHint = (TARGET_CATEGORY && !IS_SUPPLIER_MODE)
             ? `,"target_category_match":"...","target_category_evidence":"...","target_category_reason":"..."`
             : '';
 

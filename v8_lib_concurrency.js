@@ -427,8 +427,13 @@ function loadDomainBlacklistFromEnv() {
     }
 }
 
-function preFilterRawLeads(rawItems) {
+// P6b 供应商模式：找供应商时不能把"中国制造商/出口商/工厂"当污染丢掉——它们正是目标。
+// 同理 thomasnet/globalsources/made-in-china 等供应商目录站不再当 platform 噪声整条丢
+// （step1 供应商目录 pillar 已把 link=null + source_url，本函数不会因 link 命中 PLATFORM_HOSTS 丢，
+//  但 factory-direct organic 仍可能命中 cn_supplier，这里据 supplierMode 放行）。
+function preFilterRawLeads(rawItems, opts) {
     if (!Array.isArray(rawItems)) return { kept: [], dropped: 0, reasons: {} };
+    const supplierMode = !!(opts && opts.supplierMode);
     const kept = [];
     const domainBlacklist = loadDomainBlacklistFromEnv();
     const blacklistSet = new Set(domainBlacklist);
@@ -448,14 +453,17 @@ function preFilterRawLeads(rawItems) {
 
         if (!title && !snippet) { reasons.no_signal += 1; continue; }
         if (LISTICLE_RE.test(title) || LISTICLE_RE.test(snippet)) { reasons.listicle += 1; continue; }
-        if (PLATFORM_HOSTS.some(h => link.includes(h))) { reasons.platform += 1; continue; }
+        // 供应商模式：保留带 link 的供应商目录站结果（step1 已对目录 pillar 置 link=null，
+        // 此处仅 factory-direct organic 带 link，故 supplierMode 下不按 PLATFORM_HOSTS 一刀切）。
+        if (!supplierMode && PLATFORM_HOSTS.some(h => link.includes(h))) { reasons.platform += 1; continue; }
         // 新闻媒体：域名黑名单 + 标题特征
         if (isNewsDomain(link) || NEWS_TITLE_RE.test(title)) { reasons.news_media += 1; continue; }
         // 已结业商家：snippet/title 含关闭特征词
         if (CLOSED_BIZ_RE.test(combined)) { reasons.closed_biz += 1; continue; }
         // CN-supplier hint must be in the snippet+title combo and not contradicted
         // by a non-CN country mention. Coarse but cheap.
-        if (CN_HINT_RE.test(combined) && /\b(supplier|exporter|manufacturer|factory)\b/i.test(snippet)) {
+        // 供应商模式：中国制造商/出口商正是目标，不丢。
+        if (!supplierMode && CN_HINT_RE.test(combined) && /\b(supplier|exporter|manufacturer|factory)\b/i.test(snippet)) {
             reasons.cn_supplier += 1; continue;
         }
         kept.push(r);

@@ -5,6 +5,10 @@ const { appendFunnelStep } = require('./v8_lib_funnel');
 const { isJunkName } = require('./v8_quality_gate');
 const { readIndustryHintFromEnv } = require('./v8_constants_geo');
 const { getIndustryHint: deriveIndustryHint } = require('./v8_icp_taxonomy');
+const { readIcpContext } = require('./v8_lib_pillar0');
+
+// P6b：找供应商时，整套买家口径要翻面（不再把中国制造商/出口商/目录站当污染）。
+const IS_SUPPLIER_MODE = readIcpContext().direction === 'find_suppliers';
 
 const [inputFile, outputFile] = process.argv.slice(2);
 
@@ -77,8 +81,21 @@ function inferEntityType({ title, snippet, link }) {
 }
 
 function buildPrompt(batch, triggerBlock, industryHint) {
+    // P6b 供应商模式：industry_match 语义翻面——high = 该公司"生产/出口"该品类（卖家），
+    // 而不是"采购"。否则买家口径会把目标供应商全部判 low/none 丢光。
     const icpBlock = industryHint && industryHint.hit
-        ? `\n[ICP GATE]
+        ? (IS_SUPPLIER_MODE
+            ? `\n[ICP GATE — SUPPLIER MODE]
+- Target category_key="${industryHint.category_key}"${industryHint.industry_key ? `, industry_key="${industryHint.industry_key}"` : ''}.
+- We are sourcing SUPPLIERS (manufacturers / factories / exporters) of this category. For EACH item ALSO return:
+    "industry_match": "high" | "medium" | "low" | "none"
+      high   = company MANUFACTURES / EXPORTS / wholesales "${industryHint.category_key}" (a real supplier)
+      medium = trading company / OEM-ODM / general exporter that PLAUSIBLY supplies "${industryHint.category_key}"
+      low    = adjacent supplier (raw-material / component / packaging) only loosely related
+      none   = clearly not a supplier of it (end-buyer-only / finance / law / IT / unrelated mfg)
+    "industry_evidence": "≤80 chars English single-sentence reason"
+- If "industry_match" is "low" or "none", you may still extract company_name (kept for audit), but it will be soft-rejected.`
+            : `\n[ICP GATE]
 - Target category_key="${industryHint.category_key}"${industryHint.industry_key ? `, industry_key="${industryHint.industry_key}"` : ''}.
 - For EACH item ALSO return:
     "industry_match": "high" | "medium" | "low" | "none"
@@ -87,18 +104,26 @@ function buildPrompt(batch, triggerBlock, industryHint) {
       low    = adjacent industry (logistics / packaging / consultancy / marketing) that occasionally touches it
       none   = clearly unrelated (finance / law / accounting / insurance / real estate / IT services / unrelated mfg)
     "industry_evidence": "≤80 chars English single-sentence reason"
-- If "industry_match" is "low" or "none", you may still extract company_name (we keep it for audit), but the worker will mark it as soft-rejected.`
+- If "industry_match" is "low" or "none", you may still extract company_name (we keep it for audit), but the worker will mark it as soft-rejected.`)
         : '';
     const fmt = industryHint && industryHint.hit
         ? `Format: {"results": [{"company_name": "Exact Name or null", "industry_match": "high|medium|low|none", "industry_evidence": "..."}]}`
         : `Format: {"results": [{"company_name": "Exact Name or null"}]}`;
-    return `Extract exact formal Company Name from each item.
-[CRITICAL RULES]
-1. ANTI-POLLUTION: If the snippet indicates the company is based in China, or is a Chinese exporter/supplier selling abroad, YOU MUST return null.
+    // 供应商模式：放行制造商/出口商与供应商目录条目；仅保留通用反污染（博客/定义/参考文档）。
+    const criticalRules = IS_SUPPLIER_MODE
+        ? `1. TARGET: We WANT manufacturers, factories, exporters and trading companies (including Chinese suppliers). Extract their company names.
+2. ANTI-BLOG: If the title/snippet is a listicle, article, review, or guide (e.g. "Top 10 ...", "Best ... for ...", "How to ...", "Guide to ...", "Review:", "vs."), YOU MUST return null.
+3. DIRECTORY LISTINGS OK: If the item is a supplier-directory listing (Made-in-China / GlobalSources / Thomasnet / Alibaba), extract the listed SUPPLIER company name (not the platform name); if no concrete supplier name is present, return null.
+4. ANTI-DEFINITION: If the snippet is a legal clause, dictionary entry, technical definition, or academic description, YOU MUST return null.
+5. ANTI-REFERENCE-DOC: If the snippet is clearly from a document index, shipping manifest, or invoice template rather than a company webpage, return null.`
+        : `1. ANTI-POLLUTION: If the snippet indicates the company is based in China, or is a Chinese exporter/supplier selling abroad, YOU MUST return null.
 2. ANTI-BLOG: If the title/snippet is a listicle, article, review, or guide (e.g. "Top 10 ...", "Best ... for ...", "How to ...", "Guide to ...", "X things you should ...", "Review:", "vs."), YOU MUST return null -- we only want real buyer company entities.
 3. ANTI-PLATFORM: If the result is a known marketplace, directory platform, or aggregator (Alibaba, Amazon, Thomasnet, etc.) rather than an end-buyer company, return null.
 4. ANTI-DEFINITION: If the snippet is a legal clause, dictionary entry, technical definition, or academic description (e.g. "A clause inserted in...", "In law, ...", "Definition of ...", "refers to the practice of..."), YOU MUST return null -- these are not company profiles.
-5. ANTI-REFERENCE-DOC: If the snippet is clearly from a document index, shipping manifest, bill of lading reference, or invoice template rather than a company webpage, return null.${triggerBlock}${icpBlock}
+5. ANTI-REFERENCE-DOC: If the snippet is clearly from a document index, shipping manifest, bill of lading reference, or invoice template rather than a company webpage, return null.`;
+    return `Extract exact formal Company Name from each item.
+[CRITICAL RULES]
+${criticalRules}${triggerBlock}${icpBlock}
 ${fmt}
 Input: ${JSON.stringify(batch.map(r => ({ t: r.title, s: r.snippet })))}`;
 }
@@ -163,7 +188,8 @@ async function run() {
     if (raw.length === 0) { fs.writeFileSync(outputFile, '[]'); return; }
 
     // ── Pre-filter: drop obvious noise BEFORE we spend Gemini quota ──
-    const { kept: filtered, dropped, reasons } = preFilterRawLeads(raw);
+    const { kept: filtered, dropped, reasons } = preFilterRawLeads(raw, { supplierMode: IS_SUPPLIER_MODE });
+    if (IS_SUPPLIER_MODE) console.log('[step2] SUPPLIER MODE: anti-pollution/anti-platform/cn_supplier relaxed; industry_match flipped to supplier semantics.');
     if (dropped > 0) {
         console.log(`[step2] pre-filter dropped ${dropped}/${raw.length} (listicle=${reasons.listicle}, platform=${reasons.platform}, cn_supplier=${reasons.cn_supplier}, no_signal=${reasons.no_signal})`);
     }

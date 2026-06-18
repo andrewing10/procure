@@ -24,6 +24,7 @@ const {
   collectLocalBooleanQueries,
   collectProcurementQueries,
   sanitizeDiscoveryCategory,
+  readIcpContext,
 } = require('./v8_lib_pillar0');
 const { appendFunnelStep } = require('./v8_lib_funnel');
 const { extractSocialUrlsFromText } = require('./v8_lib_social_extract');
@@ -367,6 +368,8 @@ async function run() {
   const year = new Date().getFullYear();
   const controls = loadReweightControls();
   const convo = readConvoControlsFromEnv();
+  // P6b：找供应商方向 → 启用供应商目录 / 工厂直采 pillar，撤掉买家专属 organic/maps pillar。
+  const IS_SUPPLIER_MODE = readIcpContext(pillar0Payload).direction === 'find_suppliers';
   const allKeywordSuppress = [...new Set([
     ...controls.keywordSuppress,
     ...(convo.negativeKeywords || []),
@@ -1033,6 +1036,40 @@ async function run() {
     if (!isPlatformEnabled(matrix, 'x_public'))         delete pillarPromises.p_x_public;
     if (!isPlatformEnabled(matrix, 'telegram_public'))  delete pillarPromises.p_telegram_public;
     console.log(`[step1] matrix.platforms whitelist applied: kept=${Object.keys(pillarPromises).filter(k => /^(p1_maps|p_|p11_)/.test(k)).join('|')}`);
+  }
+
+  // ── P6b 供应商模式：撤掉买家专属 pillar，注入供应商目录 / 工厂直采 pillar ────────
+  // 保留 p0_seed（业务员喂入种子）与 p_pillar0_boolean（zhimao 已按 direction 生成 boolean），
+  // 其余买家 organic/maps/customs/linkedin pillar 全撤；改抓 made-in-china / globalsources /
+  // thomasnet / alibaba 目录（listing 页 link=null + source_url，snippet 带供应商名）+ 工厂直采官网。
+  if (IS_SUPPLIER_MODE) {
+    const buyerOnlyKeys = Object.keys(pillarPromises).filter(
+      (k) => k !== 'p0_seed' && k !== 'p_pillar0_boolean',
+    );
+    buyerOnlyKeys.forEach((k) => { delete pillarPromises[k]; });
+    // 供应商目录：listing 页 link=null + source_url（与 fromOrganic 信号源处理一致）
+    const fromSupplierDir = (results, pillar, intent) => (results || []).map((o) => ({
+      title: o.title, link: null, snippet: o.snippet, pillar, intent_signal: intent, source_url: o.link,
+    }));
+    const supDir = (host) => `${OQ} (manufacturer OR factory OR supplier OR exporter) site:${host}`;
+    Object.assign(pillarPromises, {
+      s_made_in_china: searchOrganicMultiPage(supDir('made-in-china.com'), cc, organicNum)
+        .then((r) => fromSupplierDir(r, 'Pillar S MadeInChina', 'SUPPLIER_DIRECTORY')).catch(() => []),
+      s_global_sources: searchOrganicMultiPage(supDir('globalsources.com'), cc, organicNum)
+        .then((r) => fromSupplierDir(r, 'Pillar S GlobalSources', 'SUPPLIER_DIRECTORY')).catch(() => []),
+      s_thomasnet: searchOrganicMultiPage(supDir('thomasnet.com'), cc, organicNum)
+        .then((r) => fromSupplierDir(r, 'Pillar S ThomasNet', 'SUPPLIER_DIRECTORY')).catch(() => []),
+      s_alibaba: searchOrganicMultiPage(`${OQ} (manufacturer OR factory) site:alibaba.com`, cc, organicNum)
+        .then((r) => fromSupplierDir(r, 'Pillar S Alibaba', 'SUPPLIER_DIRECTORY')).catch(() => []),
+      // 工厂 / 出口商直采官网（保留 link，真实供应商主页）
+      s_factory_direct: searchOrganicMultiPage(
+        `${OQ} (manufacturer OR factory OR "OEM" OR "ODM" OR exporter) official website`, cc, organicNum,
+      ).then((r) => fromOrganic(r, 'Pillar S Factory', 'SUPPLIER_DIRECT')).catch(() => []),
+      s_exporter: searchOrganicMultiPage(
+        `${OQ} (exporter OR "export company" OR "trading company") ${countryName}`, cc, organicNum,
+      ).then((r) => fromOrganic(r, 'Pillar S Exporter', 'SUPPLIER_DIRECT')).catch(() => []),
+    });
+    console.log(`[step1] SUPPLIER MODE: removed ${buyerOnlyKeys.length} buyer pillars, injected 6 supplier-directory/factory pillars`);
   }
 
   // ── 全并行执行（等最慢的那一路） ──────────────────────────────────────────

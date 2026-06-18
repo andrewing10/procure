@@ -13,12 +13,17 @@ const fs = require('fs');
 const Database = require('better-sqlite3');
 const { createClient } = require('@supabase/supabase-js');
 const { directIngestQualifiedLeads } = require('./v8_direct_l1_ingest');
-const { evaluateLead } = require('./v8_quality_gate');
+const { evaluateLead, evaluateLeadSupplier, isNegativeKeywordHit } = require('./v8_quality_gate');
 const { appendFunnelStep } = require('./v8_lib_funnel');
 const { enqueueEnrichmentLeads } = require('./v8_lib_enrichment_supabase');
-const { readIncrementalBlacklist } = require('./v8_lib_pillar0');
+const { readIncrementalBlacklist, readIcpContext } = require('./v8_lib_pillar0');
 
 const [inputFile, outputFile] = process.argv.slice(2);
+
+// P6 ICP context（从 PILLAR0_PAYLOAD.icp_context 读取，submit/route.ts P5 注入）
+const ICP_CTX = readIcpContext();
+const IS_SUPPLIER_MODE = ICP_CTX.direction === 'find_suppliers';
+const NEGATIVE_KEYWORDS = ICP_CTX.negativeKeywords; // string[]（已小写）
 
 const DISCOVERY_JOB_ID = process.env.DISCOVERY_JOB_ID || null;
 const SKIP_SQLITE = process.env.SKIP_SQLITE === 'true';
@@ -179,10 +184,22 @@ const validLeads = leads
       }
     }
 
+    // P6 负向关键词前置拦截（ICP grounding，优先于其他质量判断）
+    if (isNegativeKeywordHit(lead.company_name, lead.description || lead.snippet, NEGATIVE_KEYWORDS)) {
+      lead._quality_grade = 'unqualified';
+      lead.reject_codes = Array.isArray(lead.reject_codes)
+        ? [...lead.reject_codes, 'NEGATIVE_KEYWORD_HIT']
+        : ['NEGATIVE_KEYWORD_HIT'];
+      gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
+      return false;
+    }
+
+    // P6 方向感知评分：供应商模式用 evaluateLeadSupplier，买家模式沿用 evaluateLead。
     // 2026-05-23：传 category（DISCOVERY_CATEGORY）启用 CATEGORY_B2C_WHITELIST，
     //   面粉→bakery / 化妆品→spa / 海鲜→restaurant 等真买家不再被一刀切；
     //   见 v8_quality_gate.js BIZ_ANTI_GROUPS + CATEGORY_B2C_WHITELIST 双仓镜像段。
-    const { qualified, grade } = evaluateLead(lead, { category: TARGET_CATEGORY_FROM_ENV });
+    const evalFn = IS_SUPPLIER_MODE ? evaluateLeadSupplier : evaluateLead;
+    const { qualified, grade } = evalFn(lead, TARGET_CATEGORY_FROM_ENV, NEGATIVE_KEYWORDS);
     const matchRaw = String(lead.industry_match || '').toLowerCase();
     const m = ['high', 'medium', 'low', 'none'].includes(matchRaw) ? matchRaw : 'unset';
     icpStats[m] += 1;
@@ -207,9 +224,11 @@ const validLeads = leads
     // 例外：seed/HVC 来源（pillar 0）跳过反向验证（已是种子库已验证企业）。
     const isSeedSource =
       String(lead.pillar || '').match(/Pillar 0|Seed/i) || lead.verified_source_id;
+    // P6b 供应商模式：反向验证是"该公司是否买家"的买家闸门，对供应商无意义且会误杀，跳过。
     if (
       TARGET_CATEGORY_FROM_ENV &&
       REVERSE_VERIFY_MODE !== 'off' &&
+      !IS_SUPPLIER_MODE &&
       !isSeedSource &&
       lead.inference_breakdown &&
       typeof lead.inference_breakdown === 'object'
@@ -233,7 +252,7 @@ const validLeads = leads
         lead.target_category_evidence = lead.inference_breakdown.target_category_evidence;
       }
       if (rm === 'medium' || rm === 'low') lead.needs_human_review = true;
-    } else if (TARGET_CATEGORY_FROM_ENV && !isSeedSource) {
+    } else if (TARGET_CATEGORY_FROM_ENV && !isSeedSource && !IS_SUPPLIER_MODE) {
       // L3 没填反向验证（SKIP_L3_INFERENCE 或 LLM 失败）→ 计入 unset，不拦截
       reverseStats.unset += 1;
     }

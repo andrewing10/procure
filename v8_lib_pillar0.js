@@ -224,6 +224,45 @@ function readIncrementalBlacklist(payload) {
   return { enabled: true, parentJobId, blacklistSet: set };
 }
 
+/**
+ * P6 ICP context 读取：从 PILLAR0_PAYLOAD.icp_context 提取方向感知字段。
+ * 与 zhimao submit/route.ts 的 icp_context 格式一致（P5 注入）。
+ *
+ * @returns {{
+ *   direction: "find_buyers"|"find_suppliers",
+ *   negativeKeywords: string[],
+ *   persona: string|null,
+ *   agentRunId: string|null
+ * }}
+ */
+function readIcpContext(payload) {
+  const p = payload || readFullPillar0Payload();
+  const ctx = (p.icp_context && typeof p.icp_context === 'object') ? p.icp_context : {};
+  const direction =
+    ctx.direction === 'find_suppliers' ? 'find_suppliers' : 'find_buyers';
+  const rawNeg = Array.isArray(ctx.negative_keywords) ? ctx.negative_keywords : [];
+  const negativeKeywords = rawNeg
+    .filter((s) => typeof s === 'string' && s.trim().length > 0)
+    .map((s) => s.trim().toLowerCase());
+  const persona = typeof ctx.persona === 'string' ? ctx.persona.trim() : null;
+  const agentRunId = typeof ctx.agent_run_id === 'string' ? ctx.agent_run_id : null;
+  return { direction, negativeKeywords, persona, agentRunId };
+}
+
+/**
+ * P6 负向关键词命中检测：公司名称或 snippet 含任意负向词返回 true。
+ * 供 step2/step5 快速拦截，不消耗 LLM token。
+ *
+ * @param {string} name       公司名称
+ * @param {string} [snippet]  搜索结果 snippet
+ * @param {string[]} negatives 负向关键词列表（已小写）
+ */
+function hitNegativeKeyword(name, snippet, negatives) {
+  if (!negatives || negatives.length === 0) return false;
+  const haystack = `${String(name || '')} ${String(snippet || '')}`.toLowerCase();
+  return negatives.some((kw) => kw && haystack.includes(kw));
+}
+
 module.exports = {
   readFullPillar0Payload,
   readInlineSeeds,
@@ -236,4 +275,7 @@ module.exports = {
   collectProcurementQueries,
   sanitizeDiscoveryCategory,
   readIncrementalBlacklist,
+  // P6 新增
+  readIcpContext,
+  hitNegativeKeyword,
 };
