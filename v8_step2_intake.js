@@ -165,6 +165,11 @@ async function processBatch(batch, batchIndex, batchTotal, triggerBlock, industr
         accepted.push({
             company_name: name,
             domain:        normalizeLinkToDomain(r.link),
+            // 证据出处溯源（行业级修复点）：保留 source_url（信号源站 / LinkedIn / 海关聚合站 /
+            // 社媒公开主页等真实证据页，link=null 时唯一锚点）与原始 link（organic 精确命中页）。
+            // 旧白名单把这两个字段丢了 → buildL1Row 只剩 domain → 信号无逐条出处。
+            source_url:    r.source_url || null,
+            link:          r.link || null,
             snippet:       r.snippet,
             phone:         r.phone,
             pillar:        r.pillar,

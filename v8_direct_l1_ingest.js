@@ -226,6 +226,68 @@ function extractDomain(input) {
   }
 }
 
+/**
+ * 证据出处 URL 规范化：保留完整可点击 http(s) 链接（区别于 extractDomain 只取域名）。
+ * 用于 procurement_signals[].source_url，让 zhimao 命中卡的信号 chip 能 ↗ 跳到证据页。
+ * 仅接受 http/https、补全裸域名为 https://、截断 ≤500（与 social_profile_urls 列宽对齐）。
+ */
+function normalizeEvidenceUrl(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+  if (!s || s.length > 2000) return null;
+  try {
+    const u = new URL(s.startsWith('http') ? s : `https://${s}`);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    const out = u.toString();
+    return out.length <= 500 ? out : out.slice(0, 500);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 证据出处 URL 分级解析（行业级单源）。一条 lead 不同来源档的可用锚点不同，
+ * 按「精确证据页 > 地图深链 > 社媒主页 > 公司主页 > 地图按名搜索」优先级取首个可用：
+ *   1. source_url —— 信号源站 / LinkedIn / 海关聚合站 / 社媒公开主页等真实证据页（link=null 时唯一锚点）
+ *   2. link       —— organic 精确命中页（公司页本身即 snippet 出处）
+ *   3. maps_url   —— Google Maps 深链（LBS 命中买家的天然出处，cid/place_id 派生）
+ *   4. place_id   —— 退化构造 Maps place 深链
+ *   5. social_profile_urls[0] —— 社媒公开主页（FB/YT/X/TG pillar）
+ *   6. https://{domain} —— 退化到公司主页（organic 仅剩 domain 时的诚实出处）
+ *   7. Maps 按名搜索 —— 仅地图档 lead 的最后兜底：name+country 生成 Google Maps 搜索深链，
+ *                       让用户能定位该商家（明确是"地图查找"而非精确证据页，不虚标为来源页）。
+ * 返回 { url, kind } 或 null。kind 用于读侧区分 ↗(来源页) / 📍(地图查找)。
+ */
+function resolveEvidenceUrl(lead) {
+  const direct = normalizeEvidenceUrl(lead.source_url || lead.link || null);
+  if (direct) return { url: direct, kind: 'source_page' };
+  const maps = normalizeEvidenceUrl(lead.maps_url || null);
+  if (maps) return { url: maps, kind: 'maps_place' };
+  const pid = lead.place_id ? String(lead.place_id).trim() : '';
+  if (pid) return { url: `https://www.google.com/maps/place/?q=place_id:${encodeURIComponent(pid)}`, kind: 'maps_place' };
+  if (Array.isArray(lead.social_profile_urls)) {
+    for (const u of lead.social_profile_urls) {
+      const s = normalizeEvidenceUrl(u);
+      if (s) return { url: s, kind: 'social_profile' };
+    }
+  }
+  const dom = extractDomain(lead.domain);
+  if (dom) return { url: `https://${dom}`, kind: 'company_home' };
+  // 地图档（LBS）最后兜底：仅剩 name+country 时给 Maps 按名搜索深链。
+  const sigType = String(lead.intent_signal || '').toUpperCase();
+  const isMapsLead = /MAP_|TRADING_COMPANY|PERSONA_VERIFIED|MAP_VERIFIED/.test(sigType)
+    || /Pillar 1 LBS/i.test(String(lead.pillar || ''));
+  if (isMapsLead) {
+    const name = String(lead.company_name || '').trim();
+    const cc = String(lead.country || '').trim();
+    if (name) {
+      const q = encodeURIComponent(cc ? `${name} ${cc}` : name);
+      return { url: `https://www.google.com/maps/search/?api=1&query=${q}`, kind: 'maps_lookup' };
+    }
+  }
+  return null;
+}
+
 /** 对齐 bulk 文档：normalizeCategoryToKey 的极简版（小写、非字母数字→_、trim、≤32、排除 other）。 */
 function normalizeCategoryToKey(cat) {
   const raw = String(cat || '')
@@ -391,35 +453,41 @@ function buildL1Row(lead, nowIso) {
     })(),
     procurement_signals: (() => {
       const sigs = [];
+      // 证据出处（zhimao 命中卡「信号 chip 挂 source_url ↗/📍」+ 证据卡数据源）：
+      // 用分级解析器按来源档取首个可用锚点（见 resolveEvidenceUrl）。source_kind 让读侧
+      // 区分「来源页 ↗」与「地图查找 📍」，避免把 Maps 按名搜索误标成精确证据页。
+      const evidence = resolveEvidenceUrl(lead);
+      const withUrl = (sig) =>
+        evidence ? { ...sig, source_url: evidence.url, source_kind: evidence.kind } : sig;
       const sigType = String(lead.intent_signal || '').toUpperCase();
       if (sigType === 'BOL_SIGNAL' || sigType === 'CUSTOMS_SIGNAL' || sigType === 'IMPORT_RECORD') {
-        sigs.push({ type: 'customs_import', source: 'v8_pipeline', confidence: 0.85, date: nowIso });
+        sigs.push(withUrl({ type: 'customs_import', source: 'v8_pipeline', confidence: 0.85, date: nowIso }));
       }
       if (sigType === 'PROCUREMENT_DECISION_MAKER') {
-        sigs.push({ type: 'social', source: 'v8_pipeline', confidence: 0.7, date: nowIso });
+        sigs.push(withUrl({ type: 'social', source: 'v8_pipeline', confidence: 0.7, date: nowIso }));
       }
       if (lead.tax_verified) {
-        sigs.push({ type: 'customs_import', source: 'v8_tax_verifier', confidence: 0.9, date: nowIso });
+        sigs.push(withUrl({ type: 'customs_import', source: 'v8_tax_verifier', confidence: 0.9, date: nowIso }));
       }
       if (lead.verified_source_id) {
-        sigs.push({ type: 'website_change', source: 'v8_verified_source', confidence: 0.75, date: nowIso });
+        sigs.push(withUrl({ type: 'website_change', source: 'v8_verified_source', confidence: 0.75, date: nowIso }));
       }
       const items = ib && Array.isArray(ib.procurement_items) ? ib.procurement_items : [];
       for (const it of items) {
         if (typeof it === 'string' && it.trim()) {
-          sigs.push({ type: 'procurement_item', source: 'v8-l3', detail: it.trim(), date: nowIso });
+          sigs.push(withUrl({ type: 'procurement_item', source: 'v8-l3', detail: it.trim(), date: nowIso }));
         } else if (it && typeof it === 'object') {
           const detail = String(it.item || it.name || it.category || '').trim();
-          if (detail) sigs.push({ type: 'procurement_item', source: 'v8-l3', detail, date: nowIso });
+          if (detail) sigs.push(withUrl({ type: 'procurement_item', source: 'v8-l3', detail, date: nowIso }));
         }
       }
       if (ib && ib.intent_summary) {
-        sigs.push({
+        sigs.push(withUrl({
           type: 'intent_summary',
           source: 'v8-l3',
           detail: String(ib.intent_summary).slice(0, 500),
           date: nowIso,
-        });
+        }));
       }
       // 禁止 null：显式 null 会绕过 DB DEFAULT 并触发 NOT NULL 约束
       return sigs;

@@ -245,8 +245,19 @@ async function fetchPlacesWithFallback(query, gl, placeTypeBlacklist, mapTypesPr
       _source: 'google_places_native',
     }));
   }
-  // Serper 兜底（无 place_id；maps_url 留空给前端按需生成）
-  return fetchPlaces(query, gl).then(arr => arr.map((p) => ({ ...p, place_id: p.place_id || null, maps_url: p.maps_url || null })));
+  // Serper 兜底：Serper /places 返回 cid / placeId（驼峰），不返回 place_id（蛇形）。
+  // 旧实现只读 p.place_id → 永远 null → maps 线索无任何出处锚点（行业级修复点）。
+  // 现在统一从 placeId / cid 派生 Google Maps 深链：
+  //   placeId → maps/place/?q=place_id:{id}；cid → maps?cid={cid}（两者皆官方稳定深链）
+  return fetchPlaces(query, gl).then(arr => arr.map((p) => {
+    const placeId = p.place_id || p.placeId || null;
+    const cid = p.cid != null ? String(p.cid) : null;
+    const maps_url =
+      p.maps_url ||
+      (placeId ? `https://www.google.com/maps/place/?q=place_id:${placeId}` : null) ||
+      (cid ? `https://www.google.com/maps?cid=${cid}` : null);
+    return { ...p, place_id: placeId, maps_url };
+  }));
 }
 
 function searchOrganic(query, gl, num = 20, page = SEARCH_PAGE) {
