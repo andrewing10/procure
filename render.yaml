@@ -2,6 +2,7 @@ services:
   - type: worker
     name: zhimao-v8-discovery-worker
     runtime: node
+    numInstances: 3
     buildCommand: npm install
     startCommand: node v8_discovery_worker.js
     envVars:
@@ -48,29 +49,80 @@ services:
       - key: CRM_WATCH_EMIT_ON_FAILURE
         value: "false"
       # ── 运行模式 ────────────────────────────────────────────────────
-      # SKIP_SQLITE=true：Render 默认用 ephemeral 文件系统，SQLite 重启后清零。
-      # 因此 enrichment_queue / main_db 在生产环境无持久化价值。
-      # 若要启用本地 SQLite（挂载持久卷场景），改为 false 并挂载 /data 卷，
-      # 同时把 v8_enrichment_queue_worker.js 注册为独立 worker 服务。
       - key: SKIP_SQLITE
         value: "true"
       - key: PLAYWRIGHT_TIMEOUT
         value: "12000"
       - key: STEP3_PAGE_CONCURRENCY
-        value: "8"
-      # ── enrichment_queue 配置（仅在 SKIP_SQLITE=false 时生效）────────────
+        value: "12"
+      - key: STEP1_TIERED
+        value: "1"
+      - key: STEP1_ENOUGH_HITS
+        value: "80"
+      - key: STEP3_DEFER_CONTACT
+        value: "1"
+      # P2-A：enrich 由独立 worker 消费；discovery worker 空闲不再抢队列
+      - key: ENRICH_IDLE_IN_DISCOVERY_WORKER
+        value: "0"
+      # P2-B：Step2 intake 瘦身
+      - key: INTAKE_FAST_PATH
+        value: "1"
+      - key: INTAKE_BATCH_SIZE
+        value: "15"
+      - key: INTAKE_CONCURRENCY
+        value: "6"
       - key: ENRICH_QUEUE_BATCH_SIZE
-        value: "30"
+        value: "20"
+      - key: ENRICH_QUEUE_MAX_PER_JOB
+        value: "150"
       - key: ENRICH_QUEUE_MAX_RETRIES
         value: "5"
       - key: ENRICH_PROMOTE_SCORE
         value: "70"
-      # ── 税号/工商注册反向验证（关闭=仅读注册表做置信度加权，开启=主动 HTTP 验证）──
-      # 开启后 Step3.5 会对拉美/非洲公司逐一查询 CNPJ/RUC/NIT 等官方数据库
-      # 注意：税务系统查询有频率限制，CONCURRENCY 不宜超过 3
+      # ── P1-D：原子领单 + cancel LISTEN ──
+      - key: DATABASE_URL
+        sync: false
+      - key: STALE_CLAIM_SECONDS
+        value: "900"
+      - key: CANCEL_POLL_MS
+        value: "3000"
+      # ── 税号/工商注册反向验证 ──
       - key: TAX_VERIFY_ENABLED
         value: "false"
       - key: TAX_VERIFY_CONCURRENCY
         value: "3"
       - key: TAX_VERIFY_TIMEOUT_MS
         value: "5000"
+
+  # P2-A：Dedicated Playwright contact 补全（不依赖 discovery job 空闲）
+  - type: worker
+    name: zhimao-v8-enrichment-worker
+    runtime: node
+    numInstances: 2
+    buildCommand: npm install
+    startCommand: node v8_discovery_enrichment_worker.js
+    envVars:
+      - key: ENRICH_WORKER_DEDICATED
+        value: "1"
+      - key: ENRICH_POLL_MS
+        value: "4000"
+      - key: ENRICH_QUEUE_BATCH_SIZE
+        value: "20"
+      - key: ENRICH_QUEUE_MAX_RETRIES
+        value: "5"
+      - key: PLAYWRIGHT_TIMEOUT
+        value: "12000"
+      - key: STEP3_PAGE_CONCURRENCY
+        value: "12"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: USE_PROXY
+        value: "true"
+      - key: BRD_USER
+        sync: false
+      - key: BRD_PASS
+        sync: false
+      - key: BRD_PROXY
+        value: "http://brd.superproxy.io:33335"

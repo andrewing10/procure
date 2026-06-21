@@ -54,8 +54,8 @@ if (!GEMINI_KEY) { console.error('[step2] GEMINI_KEY env var is required'); proc
 
 // 调小默认 batch（20）：减少单批 token 占用 → 降低 429 风险；提高语义解析准确率。
 const BATCH_SIZE   = Math.max(1, parseInt(process.env.INTAKE_BATCH_SIZE   || '20', 10));
-// 并发批数：经验上 Gemini 1.5 Pro 个人配额下 3 较安全；可通过 env 调到 4-6。
-const CONCURRENCY  = Math.max(1, parseInt(process.env.INTAKE_CONCURRENCY  || '3',  10));
+// P0-C：默认并发 5（原 3）；可通过 INTAKE_CONCURRENCY 覆盖
+const CONCURRENCY  = Math.max(1, parseInt(process.env.INTAKE_CONCURRENCY  || '5',  10));
 const TIMEOUT_MS   = Math.max(5_000, parseInt(process.env.INTAKE_TIMEOUT_MS || '25000', 10));
 const MAX_RETRIES  = Math.max(0, parseInt(process.env.INTAKE_MAX_RETRIES  || '3',  10));
 
@@ -71,6 +71,32 @@ function inferEntityType({ title, snippet, link }) {
     if (AGGREGATOR_HOST_RE.test(String(link || ''))) return 'aggregator';
     if (MEDIA_TEXT_RE.test(t)) return 'media';
     return 'company';
+}
+
+/** P2-B：规则快路径 — 标题已是清晰公司名时跳过 Gemini batch */
+const FAST_PATH_ENABLED = process.env.INTAKE_FAST_PATH !== '0';
+const FAST_TITLE_BAD_RE = /^(what|how|why|where|when|top\s+\d+|best\s+\d+|\d+\s+(best|top|ways))/i;
+
+function tryFastExtractLead(r) {
+    if (!FAST_PATH_ENABLED) return null;
+    const title = String(r.title || '').trim();
+    if (!title || title.length < 4 || title.length > 100) return null;
+    if (FAST_TITLE_BAD_RE.test(title)) return null;
+    if (isJunkName(title)) return null;
+    const entityType = inferEntityType({ title: r.title, snippet: r.snippet, link: r.link });
+    if (entityType !== 'company') return null;
+    const wordCount = title.split(/\s+/).filter(Boolean).length;
+    const hasCorpSuffix = /\b(inc|ltd|llc|gmbh|corp|co\.|s\.?a\.?|srl|pty|limited|group|company|industries|international)\b/i.test(title);
+    if (wordCount < 2 && !hasCorpSuffix) return null;
+    return {
+        company_name: title,
+        domain:        normalizeLinkToDomain(r.link),
+        snippet:       r.snippet,
+        phone:         r.phone,
+        pillar:        r.pillar,
+        intent_signal: r.intent_signal,
+        entity_type:   entityType,
+    };
 }
 
 function buildPrompt(batch, triggerBlock) {
@@ -149,22 +175,35 @@ async function run() {
         : '';
     if (industryCtx) console.log(`[step2] Industry context injected: ${industryCtx.name}`);
 
+    const fastAccepted = [];
+    const needsLlm = [];
+    for (const r of filtered) {
+        const fast = tryFastExtractLead(r);
+        if (fast) fastAccepted.push(fast);
+        else needsLlm.push(r);
+    }
+    if (fastAccepted.length > 0) {
+        console.log(`[step2] P2-B fast-path: ${fastAccepted.length}/${filtered.length} skipped LLM`);
+    }
+
     // ── Build batches ──
     const batches = [];
-    for (let i = 0; i < filtered.length; i += BATCH_SIZE) {
-        batches.push(filtered.slice(i, i + BATCH_SIZE));
+    for (let i = 0; i < needsLlm.length; i += BATCH_SIZE) {
+        batches.push(needsLlm.slice(i, i + BATCH_SIZE));
     }
-    console.log(`[step2] Gemini extraction -- ${filtered.length} items in ${batches.length} batch(es) of ${BATCH_SIZE}, concurrency=${CONCURRENCY}, timeout=${TIMEOUT_MS}ms, retries=${MAX_RETRIES}`);
+    console.log(`[step2] Gemini extraction -- ${needsLlm.length} items in ${batches.length} batch(es) of ${BATCH_SIZE}, concurrency=${CONCURRENCY}, timeout=${TIMEOUT_MS}ms, retries=${MAX_RETRIES}`);
 
     // ── Run batches in parallel, bounded concurrency ──
     const overallStart = Date.now();
-    const results = await pMap(
-        batches,
-        (batch, idx) => processBatch(batch, idx + 1, batches.length, triggerBlock),
-        { concurrency: CONCURRENCY },
-    );
+    const results = batches.length > 0
+        ? await pMap(
+            batches,
+            (batch, idx) => processBatch(batch, idx + 1, batches.length, triggerBlock),
+            { concurrency: CONCURRENCY },
+        )
+        : [];
 
-    const accepted = [];
+    const accepted = [...fastAccepted];
     let failedBatches = 0;
     for (const r of results) {
         if (r instanceof Error) { failedBatches += 1; continue; }
@@ -174,6 +213,18 @@ async function run() {
 
     fs.writeFileSync(outputFile, JSON.stringify(accepted, null, 2));
     console.log(`[step2] Done -- ${accepted.length} valid entities (failed batches: ${failedBatches}/${batches.length}, wall=${Date.now() - overallStart}ms) -> ${outputFile}`);
+
+    const { patchFunnelStep } = require('./v8_discovery_funnel');
+    await patchFunnelStep('step2', {
+      label: 'Strict Entity Intake',
+      accepted: accepted.length,
+      input_raw: raw.length,
+      prefilter_kept: filtered.length,
+      fast_path: fastAccepted.length,
+      llm_items: needsLlm.length,
+      failed_batches: failedBatches,
+      wall_ms: Date.now() - overallStart,
+    });
 }
 
 run().catch(e => { console.error('[step2] fatal:', e); process.exit(1); });

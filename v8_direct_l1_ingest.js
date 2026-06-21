@@ -4,7 +4,8 @@
  * - L1：自然键 (name_canonical, country)，upsert + ignoreDuplicates（冲突不更新已有行）
  * - 主键列：company_id（PostgREST select 使用 company_id，不用 id）
  * - 边：PURCHASES，to_id = 品类 key（≤32，非 other），from_id = company_id 小写字符串
- * - 可选：discovery_jobs.result_count（与 v8_discovery_worker 读表逻辑一致）
+ * - discovery_job_leads mapping（P1 流式写入 + 增量 result_count）
+ * - discovery_job_finalize 由 worker 统一收尾 result_count（不再在此写终态）
  *
  * 表列名需与线上 data_intel_l1_companies / data_intel_graph_edges 一致；若迁移有差异，请改 buildL1Row。
  */
@@ -118,6 +119,46 @@ function collectEdgeRows(lead, companyId) {
   return edges;
 }
 
+function normalizeQualityGrade(lead) {
+  const g = String(lead._quality_grade || 'qualified').toLowerCase();
+  if (g === 'premium' || g === 'qualified' || g === 'unqualified') return g;
+  return 'qualified';
+}
+
+async function upsertJobLeadsMapping(supabase, discoveryJobId, mappings, errors) {
+  if (!discoveryJobId || mappings.length === 0) return 0;
+  const rows = mappings.map(({ companyId, grade }) => ({
+    discovery_job_id: discoveryJobId,
+    company_id: companyId,
+    quality_grade: grade,
+  }));
+  const { error } = await supabase
+    .from('discovery_job_leads')
+    .upsert(rows, { onConflict: 'discovery_job_id,company_id' });
+  if (error) {
+    errors.push(`discovery_job_leads: ${error.message}`);
+    return 0;
+  }
+  return rows.filter((r) => r.quality_grade !== 'unqualified').length;
+}
+
+async function refreshJobResultCount(supabase, discoveryJobId, errors) {
+  const { count, error } = await supabase
+    .from('discovery_job_leads')
+    .select('company_id', { count: 'exact', head: true })
+    .eq('discovery_job_id', discoveryJobId)
+    .neq('quality_grade', 'unqualified');
+  if (error) {
+    errors.push(`result_count refresh: ${error.message}`);
+    return;
+  }
+  const { error: jobErr } = await supabase
+    .from('discovery_jobs')
+    .update({ result_count: count ?? 0 })
+    .eq('id', discoveryJobId);
+  if (jobErr) errors.push(`discovery_jobs.result_count: ${jobErr.message}`);
+}
+
 async function insertEdgesWithFallback(supabase, edgeBatch, errors) {
   if (!edgeBatch.length) return 0;
   const { error } = await supabase.from('data_intel_graph_edges').insert(edgeBatch);
@@ -145,6 +186,9 @@ async function directIngestQualifiedLeads(supabase, leads, opts = {}) {
   let edgesWritten = 0;
   /** 本批每条 lead 是否解析到 company id（含已存在自然键） */
   let resolvedLeads = 0;
+  let mappedLeads = 0;
+  /** @type {Array<{ companyId: string, lead: object }>} */
+  const resolvedPairs = [];
 
   for (let i = 0; i < leads.length; i += CHUNK_L1) {
     const chunk = leads.slice(i, i + CHUNK_L1);
@@ -160,6 +204,7 @@ async function directIngestQualifiedLeads(supabase, leads, opts = {}) {
 
     if (rows.length === 0) continue;
 
+    const chunkMappings = [];
     const batchPayload = rows.map((x) => x.row);
     const { data: inserted, error: upErr } = await supabase
       .from('data_intel_l1_companies')
@@ -198,19 +243,18 @@ async function directIngestQualifiedLeads(supabase, leads, opts = {}) {
       }
       idByKey.set(k, companyId);
       resolvedLeads += 1;
+      resolvedPairs.push({ companyId, lead });
+      chunkMappings.push({ companyId, grade: normalizeQualityGrade(lead) });
 
       const edgeBatch = collectEdgeRows(lead, companyId);
       if (edgeBatch.length === 0) continue;
       edgesWritten += await insertEdgesWithFallback(supabase, edgeBatch, errors);
     }
-  }
 
-  if (discoveryJobId) {
-    const { error: jobErr } = await supabase
-      .from('discovery_jobs')
-      .update({ result_count: resolvedLeads })
-      .eq('id', discoveryJobId);
-    if (jobErr) errors.push(`discovery_jobs.result_count: ${jobErr.message}`);
+    if (discoveryJobId && chunkMappings.length > 0) {
+      mappedLeads += await upsertJobLeadsMapping(supabase, discoveryJobId, chunkMappings, errors);
+      await refreshJobResultCount(supabase, discoveryJobId, errors);
+    }
   }
 
   const fatalUpsert = errors.some((e) => String(e).startsWith('L1 upsert:'));
@@ -219,7 +263,9 @@ async function directIngestQualifiedLeads(supabase, leads, opts = {}) {
   return {
     ok,
     resolvedLeads,
+    mappedLeads,
     edgesWritten,
+    resolvedPairs,
     errors,
   };
 }

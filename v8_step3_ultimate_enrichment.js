@@ -33,13 +33,17 @@ const PLAYWRIGHT_TIMEOUT  = parseInt(process.env.PLAYWRIGHT_TIMEOUT || '10000', 
 //   STEP3_PAGE_CONCURRENCY           → Playwright contact extraction parallelism
 // batch size 减小到 5（默认）：更短 prompt = Gemini 响应更快，减少超时率
 // 如需高吞吐可在 .env 中设 BOM_BATCH_SIZE=10（需稳定的 Gemini Pro 配额）
-const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '5',  10));
-const L3_CONCURRENCY        = Math.max(1, parseInt(process.env.L3_CONCURRENCY || '3',  10));
+const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '8',  10));
+const L3_CONCURRENCY        = Math.max(1, parseInt(process.env.L3_CONCURRENCY || '6',  10));
 // L3 timeout 提升到 60s：gemini-2.5-flash 通常 10-20s，但高负载时可达 50s+
 const L3_TIMEOUT_MS         = Math.max(5_000, parseInt(process.env.L3_TIMEOUT_MS || '60000', 10));
 const L3_MAX_RETRIES        = Math.max(0, parseInt(process.env.L3_MAX_RETRIES || '3', 10));
 // 并发数提升：4 → 8（在有代理或高带宽环境下可进一步调高至 12）
-const PAGE_CONCURRENCY      = Math.max(1, parseInt(process.env.STEP3_PAGE_CONCURRENCY || '8', 10));
+const PAGE_CONCURRENCY      = Math.max(1, parseInt(process.env.STEP3_PAGE_CONCURRENCY || '12', 10));
+/** P0-B：L3 推理与 Playwright 联系方式抓取默认并行（各写独立 lead 副本，最后 merge）。 */
+const STEP3_L3_CONTACT_PARALLEL = process.env.STEP3_L3_CONTACT_PARALLEL !== '0';
+/** P1-C：主路径跳过 Playwright，缺 contact 的 lead 入 Supabase 异步队列（默认开）。 */
+const STEP3_DEFER_CONTACT = process.env.STEP3_DEFER_CONTACT !== '0';
 
 // ── 域名抓取缓存（本地文件，跳过 30 天内已爬取的域名）─────────────────────────
 // 避免 cron 每次重跑都对同一家公司 Playwright，既浪费时间又增加被封风险
@@ -254,13 +258,24 @@ const extractFromHTML = (html, emails, phones) => {
     }
 };
 
-async function extractContactForLead(lead, contexts) {
+/**
+ * 快速 contact 解析：step1 字段 + 域名缓存，不启动 Playwright。
+ * @returns {{ lead: object, needsBrowser: boolean }}
+ */
+function resolveContactFast(lead) {
     let score = lead.confidence_score || 50;
     lead.primary_email = lead.primary_email || lead.email || null;
     lead.primary_phone = lead.primary_phone || lead.phone || null;
 
-    // ── 缓存命中：跳过 Playwright，直接使用已缓存的联系方式 ──────────────────
-    if (lead.domain && lead.domain.startsWith('http')) {
+    if (lead.primary_email && lead.primary_phone) {
+        score += 30;
+        if (lead.pillar?.includes('LBS')) score += 15;
+        lead.confidence_score = Math.min(score, 100);
+        return { lead, needsBrowser: false };
+    }
+
+    const domainStr = String(lead.domain || '');
+    if (domainStr.startsWith('http')) {
         const cached = getCachedContact(lead.domain);
         if (cached) {
             if (cached.primary_email && !lead.primary_email) lead.primary_email = cached.primary_email;
@@ -272,10 +287,26 @@ async function extractContactForLead(lead, contexts) {
                 score = Math.min(score, 85);
             }
             lead.confidence_score = Math.min(score, 100);
-            return lead; // 命中缓存，跳过 Playwright
+            const stillNeed = !(lead.primary_email && lead.primary_phone);
+            return { lead, needsBrowser: stillNeed };
         }
     }
 
+    if (domainStr.startsWith('http') && !lead.primary_email && !lead.primary_phone) {
+        lead.confidence_score = Math.min(score, 85);
+        return { lead, needsBrowser: true };
+    }
+
+    lead.confidence_score = Math.min(score, 100);
+    return { lead, needsBrowser: false };
+}
+
+async function extractContactForLead(lead, contexts) {
+    const { lead: fastLead, needsBrowser } = resolveContactFast({ ...lead });
+    Object.assign(lead, fastLead);
+    if (!needsBrowser) return lead;
+
+    let score = lead.confidence_score || 50;
     if (lead.domain && lead.domain.startsWith('http')) {
         const isFb = lead.domain.includes('facebook.com');
         const ctx  = isFb ? contexts.mobile : contexts.desktop;
@@ -316,7 +347,6 @@ async function extractContactForLead(lead, contexts) {
         const cleanPhones = Array.from(phones).filter(p => p.length < 20);
         if (cleanPhones.length > 0) lead.primary_phone = cleanPhones[0];
 
-        // 写入缓存（无论是否找到联系方式，避免下次重复爬取）
         setCachedContact(lead.domain, lead.primary_email, lead.primary_phone);
 
         if (lead.primary_email || lead.primary_phone) console.log(`[step3] Enriched: ${lead.company_name} | ${lead.primary_email || ''}`);
@@ -332,25 +362,34 @@ async function extractContactForLead(lead, contexts) {
     return lead;
 }
 
-async function run() {
-    let leads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
-    if (SKIP_L3_INFERENCE) {
-        console.log('[step3] SKIP_L3_INFERENCE=true, skipping L3 inference and only extracting contacts.');
-    } else {
-        leads = await inferL3SupplyChain(leads);
-    }
+/** P0-B：L3 与 contact 并行后按 index 合并（两路写不同字段，无竞态）。 */
+function mergeL3AndContact(original, l3Leads, contactLeads) {
+    return original.map((orig, i) => {
+        const l3 = l3Leads[i] || orig;
+        const contact = contactLeads[i] || orig;
+        return {
+            ...orig,
+            entity_role: l3.entity_role ?? orig.entity_role,
+            inferred_bom: l3.inferred_bom ?? orig.inferred_bom,
+            inference_breakdown: l3.inference_breakdown ?? orig.inference_breakdown,
+            confidence_score: contact.confidence_score ?? l3.confidence_score ?? orig.confidence_score,
+            primary_email: contact.primary_email ?? orig.primary_email,
+            primary_phone: contact.primary_phone ?? orig.primary_phone,
+        };
+    });
+}
 
+async function launchStep3Browser() {
     let browser;
     if (USE_BRD_SB) {
         if (!BRD_SB_WSS) { console.error('[step3] USE_BRD_SB=true but BRD_SB_WSS not set'); process.exit(1); }
         console.log('[step3] Using BrightData Scraping Browser via CDP (反检测最强模式)');
         browser = await chromium.connectOverCDP(BRD_SB_WSS);
     } else {
-        // ── 启动参数：隐藏自动化特征，绕过 Cloudflare / Akamai 基础检测 ─────────
         const launchOptions = {
             headless: true,
             args: [
-                '--disable-blink-features=AutomationControlled',  // 最关键：隐藏自动化标识
+                '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
@@ -362,7 +401,7 @@ async function run() {
                 '--disable-infobars',
                 '--disable-extensions',
             ],
-            ignoreDefaultArgs: ['--enable-automation'],           // 移除 Playwright 默认的自动化标志
+            ignoreDefaultArgs: ['--enable-automation'],
         };
         if (USE_PROXY) {
             if (!BRD_USER || !BRD_PASS) { console.error('[step3] USE_PROXY=true but BRD_USER/BRD_PASS not set'); process.exit(1); }
@@ -370,7 +409,6 @@ async function run() {
             launchOptions.proxy = { server: BRD_PROXY, username: BRD_USER, password: BRD_PASS };
         } else {
             console.warn('[step3] ⚠️  USE_PROXY=false：使用本机IP。欧美大企业站点可能被 Cloudflare 拦截。');
-            console.warn('[step3] ⚠️  建议：设置 USE_PROXY=true + BRD_USER/BRD_PASS 以启用住宅IP代理。');
         }
         try {
             browser = await chromium.launch(launchOptions);
@@ -381,15 +419,17 @@ async function run() {
                     'node ' + require('path').join(__dirname, 'node_modules', '.bin', 'playwright') + ' install chromium',
                     { stdio: 'inherit' }
                 );
-                console.log("[step3] Chromium install complete — retrying launch...");
                 browser = await chromium.launch(launchOptions);
             } else {
                 throw launchErr;
             }
         }
     }
+    return browser;
+}
 
-    // ── 反检测 Context 配置：随机 UA + 视口 + 语言头 + stealth 脚本注入 ─────────
+async function runContactExtraction(leads) {
+    const browser = await launchStep3Browser();
     const desktopUA = pick(UA_POOL_DESKTOP);
     const mobileUA  = pick(UA_POOL_MOBILE);
     const viewport  = pick(VIEWPORT_POOL);
@@ -419,11 +459,8 @@ async function run() {
         },
     });
 
-    // ── stealth 脚本：在每个页面加载前注入，覆盖 Playwright 暴露的机器人标识 ────
     await desktopCtx.addInitScript(STEALTH_INIT_SCRIPT);
     await mobileCtx.addInitScript(STEALTH_INIT_SCRIPT);
-
-    console.log(`[step3] Browser ready. UA=${desktopUA.slice(0, 60)}...`);
 
     console.log(`[step3] Contact extraction over ${leads.length} leads, page concurrency=${PAGE_CONCURRENCY}, page timeout=${PLAYWRIGHT_TIMEOUT}ms`);
     const overallStart = Date.now();
@@ -434,14 +471,92 @@ async function run() {
     );
 
     await browser.close();
-    flushDomainCache(); // 持久化本次抓取结果到缓存文件
+    flushDomainCache();
 
-    // pMap may return Error instances if any worker threw — keep success rows only.
     const finalLeads = enriched.filter(x => x && !(x instanceof Error));
     const contactHit = finalLeads.filter(l => l.primary_email || l.primary_phone).length;
-
-    fs.writeFileSync(outputFile, JSON.stringify(finalLeads, null, 2));
-    console.log(`[step3] Done — ${finalLeads.length} enriched leads (contact_hit=${contactHit}, hit_rate=${Math.round(contactHit/finalLeads.length*100)}%) in ${Date.now() - overallStart}ms → ${outputFile}`);
+    console.log(`[step3] Contact track done — hit=${contactHit}/${finalLeads.length} in ${Date.now() - overallStart}ms`);
+    return finalLeads;
 }
 
-run().catch(e => { console.error('[step3] fatal:', e); process.exit(1); });
+async function runDeferredContactPath(rawLeads) {
+    const wallStart = Date.now();
+    const l3Out = await inferL3SupplyChain(JSON.parse(JSON.stringify(rawLeads)));
+    const deferred = [];
+    const finalLeads = l3Out.map((l) => {
+        const { lead, needsBrowser } = resolveContactFast({ ...l });
+        if (needsBrowser) deferred.push(lead);
+        return lead;
+    });
+
+    let enqueued = 0;
+    if (deferred.length > 0) {
+        const { getSupabase, enqueueDeferredContacts } = require('./v8_supabase_enrichment_queue');
+        const supabase = getSupabase();
+        if (supabase) {
+            const res = await enqueueDeferredContacts(
+                supabase,
+                deferred,
+                process.env.DISCOVERY_JOB_ID || null,
+            );
+            enqueued = res.enqueued || 0;
+            console.log(`[step3] P1-C: deferred ${enqueued}/${deferred.length} leads to discovery_enrichment_queue`);
+        } else {
+            console.warn('[step3] P1-C: supabase env missing, cannot enqueue deferred contacts');
+        }
+    }
+
+    const contactHit = finalLeads.filter(l => l.primary_email || l.primary_phone).length;
+    const { patchFunnelStep } = require('./v8_discovery_funnel');
+    await patchFunnelStep('step3', {
+        label: 'L3 + deferred contact',
+        input: rawLeads.length,
+        contact_hit: contactHit,
+        deferred_contact: enqueued,
+        wall_ms: Date.now() - wallStart,
+    });
+
+    return finalLeads;
+}
+
+async function run() {
+    const rawLeads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
+    let finalLeads;
+
+    if (SKIP_L3_INFERENCE) {
+        console.log('[step3] SKIP_L3_INFERENCE=true, skipping L3 inference and only extracting contacts.');
+        finalLeads = await runContactExtraction(rawLeads);
+    } else if (STEP3_DEFER_CONTACT) {
+        console.log('[step3] P1-C: L3 only + fast contact; Playwright deferred to discovery_enrichment_queue');
+        finalLeads = await runDeferredContactPath(rawLeads);
+    } else if (STEP3_L3_CONTACT_PARALLEL) {
+        const leadsForL3 = JSON.parse(JSON.stringify(rawLeads));
+        const leadsForContact = JSON.parse(JSON.stringify(rawLeads));
+        const wallStart = Date.now();
+        console.log('[step3] P0-B: L3 supply-chain inference ∥ Playwright contact extraction (parallel)');
+        const [l3Out, contactOut] = await Promise.all([
+            inferL3SupplyChain(leadsForL3),
+            runContactExtraction(leadsForContact),
+        ]);
+        finalLeads = mergeL3AndContact(rawLeads, l3Out, contactOut);
+        console.log(`[step3] Parallel merge wall=${Date.now() - wallStart}ms`);
+    } else {
+        const l3Out = await inferL3SupplyChain(rawLeads);
+        finalLeads = await runContactExtraction(l3Out);
+    }
+
+    const contactHit = finalLeads.filter(l => l.primary_email || l.primary_phone).length;
+    fs.writeFileSync(outputFile, JSON.stringify(finalLeads, null, 2));
+    console.log(`[step3] Done — ${finalLeads.length} enriched leads (contact_hit=${contactHit}, hit_rate=${Math.round(contactHit / Math.max(finalLeads.length, 1) * 100)}%) → ${outputFile}`);
+}
+
+if (require.main === module) {
+    run().catch(e => { console.error('[step3] fatal:', e); process.exit(1); });
+}
+
+module.exports = {
+    inferL3SupplyChain,
+    runContactExtraction,
+    resolveContactFast,
+    mergeL3AndContact,
+};

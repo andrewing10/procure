@@ -377,9 +377,47 @@ async function run() {
     console.log('[step1] Lookalike pillar DISABLED by reweight policy (generic delta=' + controls.generic.toFixed(3) + ')');
   }
 
-  // ── 全并行执行（等最慢的那一路） ──────────────────────────────────────────
+  // ── P1-B：分层 pillar + enough-hits 早停（默认开，STEP1_TIERED=0 回退全并行）──
+  const STEP1_TIERED = process.env.STEP1_TIERED !== '0';
+  const ENOUGH_HITS = Math.max(Number(process.env.STEP1_ENOUGH_HITS || 80), 20);
+
+  const TIER1_KEYS = [
+    'p0_seed', 'p1_maps_dist', 'p1_maps_trading',
+    'p2_direct_importer', 'p2_sourcing_intent',
+  ];
+  const TIER2_KEYS = [
+    'p3_jobs_procurement', 'p3_jobs_buyer', 'p4_rfq', 'p4_sourcing_post',
+    'p5_tenders', 'p6_buyer_assoc', 'p6_trade_show_buyer',
+    'p8_b2b_buyer', 'p8_ecommerce_import',
+  ];
+  const TIER3_KEYS = [
+    'p7_customs_direct', 'p7_bol_signal', 'p10_verified_sources',
+    'p11_linkedin_decision', 'p9_lookalike',
+  ];
+
+  async function collectPillarResults(keys) {
+    const subset = {};
+    for (const k of keys) {
+      if (pillarPromises[k]) subset[k] = pillarPromises[k];
+    }
+    const labels = Object.keys(subset);
+    if (labels.length === 0) return [];
+    const results = await Promise.allSettled(Object.values(subset));
+    const batch = [];
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+        console.log(`[step1] ${labels[i]}: ${r.value.length} signals`);
+        batch.push(...r.value);
+      } else if (r.status === 'rejected') {
+        console.warn(`[step1] ${labels[i]} failed (non-fatal): ${r.reason?.message || r.reason}`);
+      }
+    });
+    return batch;
+  }
+
   const depthLabel = SEARCH_PAGE === 1 ? '浅层(p1)' : `深水区(p${SEARCH_PAGE} ≈ 第${(SEARCH_PAGE-1)*20+1}-${SEARCH_PAGE*20}条)`;
-  console.log(`[step1] Launching ${Object.keys(pillarPromises).length} pillars in parallel for "${category}" in ${countryName} [${depthLabel}]...`);
+  const pillarCount = Object.keys(pillarPromises).length;
+  console.log(`[step1] Launching ${pillarCount} pillars for "${category}" in ${countryName} [${depthLabel}]${STEP1_TIERED ? ' (tiered)' : ' (all-parallel)'}...`);
   if (controls._policyCount > 0) {
     console.log(`[step1] Active policies: ${controls._policyCount}, weights:`, JSON.stringify(controls.weights));
   }
@@ -388,18 +426,23 @@ async function run() {
   }
   const startedAt = Date.now();
 
-  const results = await Promise.allSettled(Object.values(pillarPromises));
-  const labels  = Object.keys(pillarPromises);
-
-  const allLeads = [];
-  results.forEach((r, i) => {
-    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
-      console.log(`[step1] ${labels[i]}: ${r.value.length} signals`);
-      allLeads.push(...r.value);
-    } else if (r.status === 'rejected') {
-      console.warn(`[step1] ${labels[i]} failed (non-fatal): ${r.reason?.message || r.reason}`);
+  let allLeads = [];
+  if (STEP1_TIERED) {
+    allLeads.push(...await collectPillarResults(TIER1_KEYS));
+    console.log(`[step1] tier1 raw signals: ${allLeads.length}`);
+    if (allLeads.length < ENOUGH_HITS) {
+      allLeads.push(...await collectPillarResults(TIER2_KEYS));
+      console.log(`[step1] tier1+tier2 raw signals: ${allLeads.length}`);
+    } else {
+      console.log(`[step1] P1-B early-stop: tier1 >= ${ENOUGH_HITS}, skipping tier2/3`);
     }
-  });
+    if (allLeads.length < ENOUGH_HITS) {
+      allLeads.push(...await collectPillarResults(TIER3_KEYS));
+      console.log(`[step1] all tiers raw signals: ${allLeads.length}`);
+    }
+  } else {
+    allLeads.push(...await collectPillarResults(Object.keys(pillarPromises)));
+  }
 
   // 注入时间戳
   const nowIso = new Date().toISOString();
@@ -454,6 +497,16 @@ async function run() {
 
   console.log(`[step1] Done in ${Date.now() - startedAt}ms. Total=${filteredLeads.length} (junk_filtered=${junkCount})`);
   console.log(`[step1] Pillar distribution:`, JSON.stringify(pillarStats, null, 2));
+
+  const { patchFunnelStep } = require('./v8_discovery_funnel');
+  await patchFunnelStep('step1', {
+    label: 'Omni-Pillar Collection',
+    signals: filteredLeads.length,
+    raw_before_filter: beforeFilter,
+    junk_filtered: junkCount,
+    pillars: pillarStats,
+    wall_ms: Date.now() - startedAt,
+  });
 
   fs.writeFileSync(outputFile, JSON.stringify(filteredLeads, null, 2));
 }

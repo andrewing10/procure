@@ -13,6 +13,7 @@ const fs = require('fs');
 const Database = require('better-sqlite3');
 const { createClient } = require('@supabase/supabase-js');
 const { directIngestQualifiedLeads } = require('./v8_direct_l1_ingest');
+const { mirrorBuyerPersonsFromLeads } = require('./v8_buyer_persons_mirror');
 const { evaluateLead } = require('./v8_quality_gate');
 
 const [inputFile, outputFile] = process.argv.slice(2);
@@ -211,36 +212,55 @@ validLeads.forEach((lead) => {
 })();
 
 (async () => {
+  let ingestResult = null;
   if (validLeads.length > 0) {
     console.log(`[step5] Supabase L1 ingest: ${validLeads.length} leads...`);
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
-    const result = await directIngestQualifiedLeads(supabase, validLeads, {
+    ingestResult = await directIngestQualifiedLeads(supabase, validLeads, {
       discoveryJobId: DISCOVERY_JOB_ID,
     });
-    if (result.errors.length) {
-      console.warn('[step5] ingest messages:', JSON.stringify(result.errors.slice(0, 20)));
-      if (result.errors.length > 20) {
-        console.warn(`[step5] ... and ${result.errors.length - 20} more`);
+    if (ingestResult.errors.length) {
+      console.warn('[step5] ingest messages:', JSON.stringify(ingestResult.errors.slice(0, 20)));
+      if (ingestResult.errors.length > 20) {
+        console.warn(`[step5] ... and ${ingestResult.errors.length - 20} more`);
       }
     }
-    if (!result.ok) {
+    if (!ingestResult.ok) {
       console.error('[step5] Supabase L1 ingest failed (see L1 upsert errors above).');
       writeFallbackInbox(validLeads, 'supabase_l1_ingest_failed');
       process.exit(1);
     }
-    if (result.resolvedLeads < validLeads.length) {
+    if (ingestResult.resolvedLeads < validLeads.length) {
       console.warn(
-        `[step5] resolved ${result.resolvedLeads}/${validLeads.length} leads (some rows skipped or id lookup failed).`,
+        `[step5] resolved ${ingestResult.resolvedLeads}/${validLeads.length} leads (some rows skipped or id lookup failed).`,
       );
     }
     console.log(
-      `[step5] ingest ok: resolvedLeads=${result.resolvedLeads}, edgesWritten=${result.edgesWritten}`,
+      `[step5] ingest ok: resolvedLeads=${ingestResult.resolvedLeads}, mappedLeads=${ingestResult.mappedLeads ?? ingestResult.resolvedLeads}, edgesWritten=${ingestResult.edgesWritten}`,
     );
+
+    const persons = await mirrorBuyerPersonsFromLeads(
+      supabase,
+      ingestResult.resolvedPairs || [],
+    );
+    ingestResult.personsMirrored = persons.mirrored;
   } else {
     console.log('[step5] No valid leads to persist.');
   }
+
+  const { patchFunnelStep } = require('./v8_discovery_funnel');
+  await patchFunnelStep('step5', {
+    label: 'Routing & Persistence',
+    input_total: totalLeads,
+    qualified: validLeads.length,
+    premium: gradeStats.premium,
+    l1_written: ingestResult?.resolvedLeads ?? 0,
+    mapped: ingestResult?.mappedLeads ?? ingestResult?.resolvedLeads ?? 0,
+    buyer_persons_mirrored: ingestResult?.personsMirrored ?? 0,
+  });
+
   fs.writeFileSync(outputFile, JSON.stringify({ status: 'success', db_injected: validLeads.length }, null, 2));
   console.log(`[step5] Done → ${outputFile}`);
 })();

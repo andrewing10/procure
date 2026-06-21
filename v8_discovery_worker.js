@@ -7,9 +7,6 @@ const {
   discoveryCompletionNotifyMode,
 } = require('./v8_crm_watch_emit');
 
-// Self-heal: ensure Playwright Chromium binary is present before the first job runs.
-// Render's build and runtime filesystems are separate; the browser cache from buildCommand
-// does not persist into the worker process. This runs once at startup (~30s on cold start).
 try {
   console.log('[worker] ensuring playwright chromium is installed...');
   execSync('npx playwright install chromium', { stdio: 'inherit' });
@@ -25,21 +22,30 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   process.exit(1);
 }
 
+const { reportDiscoveryStage } = require('./v8_discovery_stage');
+const { processEnrichmentQueueBatch } = require('./v8_discovery_enrichment_worker');
+const { DiscoveryCancelListener } = require('./v8_discovery_cancel_listener');
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 
+const cancelListener = new DiscoveryCancelListener();
+
+const WORKER_ID =
+  process.env.RENDER_INSTANCE_ID ||
+  process.env.WORKER_ID ||
+  `v8-discovery-worker-${process.pid}`;
+
 const POLL_MS = Math.max(Number(process.env.DISCOVERY_POLL_MS || 15000), 3000);
+const CANCEL_POLL_MS = Math.max(Number(process.env.CANCEL_POLL_MS || 3000), 1000);
+const STALE_CLAIM_SECONDS = Math.max(Number(process.env.STALE_CLAIM_SECONDS || 900), 120);
+
+const PIPELINE_EXIT = { SUCCESS: 0, CRASH: 1, NO_DATA: 2 };
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-// exit code 约定（master 与 worker 共同维护）：
-//   0 → 全量写入成功
-//   1 → 脚本崩溃 / 配置错误 → markFailed
-//   2 → 本轮无新数据（graceful stop）→ markDone 但标记 result_count 来自 bulk 侧
-const PIPELINE_EXIT = { SUCCESS: 0, CRASH: 1, NO_DATA: 2 };
 
 async function readReweightPolicies(job) {
   const country = String(job.country_iso || '').trim().toUpperCase();
@@ -52,7 +58,7 @@ async function readReweightPolicies(job) {
     q = countryScoped ? q.eq('country_iso', country) : q.is('country_iso', null);
     q = categoryScoped ? q.eq('category_key', category) : q.is('category_key', null);
     const { data } = await q.limit(50);
-    for (const row of (data || [])) {
+    for (const row of data || []) {
       const key = String(row.source_kind || 'generic');
       const prev = merged.get(key) || { source_kind: key, weight_delta: 0, sample_count: 0 };
       prev.weight_delta += Number(row.weight_delta || 0);
@@ -71,75 +77,111 @@ async function readReweightPolicies(job) {
   return Array.from(merged.values());
 }
 
+/**
+ * P1-D：spawn 流水线 + cancel 轮询（LISTEN 命中或 DB status=cancelled → SIGTERM）。
+ */
 function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, reweightPolicies = []) {
   return new Promise((resolve) => {
-    const child = spawn(
-      'node',
-      ['zhimao_v8_ultimate_master.js', countryIso, category],
-      {
-        stdio: 'inherit',
-        env: {
-          ...process.env,
-          DISCOVERY_JOB_ID: String(jobId),
-          SWEEP_COUNT:       String(sweepCount),
-          DISCOVERY_SESSION_ID: meta.session_id ? String(meta.session_id) : '',
-          DISCOVERY_PARENT_JOB_ID: meta.parent_job_id ? String(meta.parent_job_id) : '',
-          DISCOVERY_ACTION_TYPE: meta.action_type ? String(meta.action_type) : 'new_search',
-          DISCOVERY_REWEIGHT_JSON: JSON.stringify(Array.isArray(reweightPolicies) ? reweightPolicies : []),
-        },
+    let settled = false;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(checkInterval);
+      resolve(code ?? PIPELINE_EXIT.CRASH);
+    };
+
+    const child = spawn('node', ['zhimao_v8_ultimate_master.js', countryIso, category], {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        DISCOVERY_JOB_ID: String(jobId),
+        SWEEP_COUNT: String(sweepCount),
+        DISCOVERY_SESSION_ID: meta.session_id ? String(meta.session_id) : '',
+        DISCOVERY_PARENT_JOB_ID: meta.parent_job_id ? String(meta.parent_job_id) : '',
+        DISCOVERY_ACTION_TYPE: meta.action_type ? String(meta.action_type) : 'new_search',
+        DISCOVERY_REWEIGHT_JSON: JSON.stringify(Array.isArray(reweightPolicies) ? reweightPolicies : []),
       },
-    );
-    child.on('close', (code) => resolve(code ?? 1));
-    child.on('error', () => resolve(PIPELINE_EXIT.CRASH));
+    });
+
+    const checkInterval = setInterval(() => {
+      void (async () => {
+        if (await cancelListener.isCancelled(jobId)) {
+          console.log(`[worker] cancel detected for job ${jobId}, terminating pipeline`);
+          child.kill('SIGTERM');
+          setTimeout(() => {
+            try {
+              child.kill('SIGKILL');
+            } catch (_) {
+              /* already dead */
+            }
+          }, 8000);
+        }
+      })();
+    }, CANCEL_POLL_MS);
+
+    child.on('close', (code) => finish(code));
+    child.on('error', () => finish(PIPELINE_EXIT.CRASH));
   });
 }
 
-async function pickPendingJob() {
-  const { data, error } = await supabase
-    .from('discovery_jobs')
-    .select('id,category,country_iso,requested_by,session_id,parent_job_id,action_type')
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true })
-    .limit(1)
-    .maybeSingle();
+async function releaseStaleClaims() {
+  const { data, error } = await supabase.rpc('release_stale_discovery_claims', {
+    p_stale_seconds: STALE_CLAIM_SECONDS,
+  });
   if (error) {
-    // PostgREST schema cache 刚 migration 后短暂失效，"schema cache" 关键字代表可自愈错误
-    // 额外等 30s 让 PostgREST 完成 cache reload，避免每 15s 刷屏
+    console.warn('[worker] release_stale_discovery_claims failed:', error.message);
+    return 0;
+  }
+  const n = Number(data ?? 0);
+  if (n > 0) console.log(`[worker] released ${n} stale in-flight claim(s)`);
+  return n;
+}
+
+/** P1-D：原子领单（优先级 + SKIP LOCKED）。 */
+async function claimNextJob() {
+  await releaseStaleClaims();
+
+  const { data: claim, error } = await supabase.rpc('claim_next_discovery_job', {
+    p_worker_id: WORKER_ID,
+  });
+
+  if (error) {
     if (error.message && error.message.toLowerCase().includes('schema cache')) {
-      console.warn('[worker] select pending job error (schema cache refreshing, waiting 30s):', error.message);
+      console.warn('[worker] claim RPC error (schema cache refreshing, waiting 30s):', error.message);
       await sleep(30_000);
     } else {
-      console.error('[worker] select pending job error:', error.message);
+      console.error('[worker] claim_next_discovery_job error:', error.message);
     }
     return null;
   }
-  return data || null;
-}
 
-async function markRunning(jobId) {
-  // Guard: only update if still pending — prevents double-pickup in multi-worker setups
-  const { data, error } = await supabase
+  if (!claim?.ok || !claim.job_id) {
+    return null;
+  }
+
+  const { data: job, error: jobErr } = await supabase
     .from('discovery_jobs')
-    .update({ status: 'running', started_at: new Date().toISOString(), error_message: null })
-    .eq('id', jobId)
-    .eq('status', 'pending')
-    .select('id')
+    .select('id,category,country_iso,requested_by,session_id,parent_job_id,action_type,sweep_count,status')
+    .eq('id', claim.job_id)
     .maybeSingle();
-  if (error) {
-    console.error('[worker] mark running error:', error.message);
-    return false;
+
+  if (jobErr || !job) {
+    console.error('[worker] load claimed job failed:', jobErr?.message || claim.job_id);
+    return null;
   }
-  if (!data) {
-    console.warn(`[worker] job ${jobId} was already picked up by another worker, skipping`);
-    return false;
+
+  if (job.status === 'cancelled') {
+    console.log(`[worker] claimed job ${job.id} already cancelled, skipping`);
+    return null;
   }
-  return true;
+
+  console.log(
+    `[worker] claimed job ${job.id} (${job.category}/${job.country_iso}, action=${job.action_type || 'new_search'})`,
+  );
+  return job;
 }
 
 async function readResultCountFromBulk(jobId) {
-  // Step 5 (Supabase direct L1 ingest) sets discovery_jobs.result_count when DISCOVERY_JOB_ID is set.
-  // The worker reads that value here — it must not overwrite with a country-wide count,
-  // otherwise unrelated prior runs leak into this job's reported number.
   const { data, error } = await supabase
     .from('discovery_jobs')
     .select('result_count,status')
@@ -152,16 +194,58 @@ async function readResultCountFromBulk(jobId) {
   return Number(data?.result_count ?? 0);
 }
 
-async function markDone(job, count) {
-  const nowIso = new Date().toISOString();
-  // Only update status/completed_at. result_count was already written by Step 5 direct ingest
-  // (resolved lead count for this job) and must not be overridden here.
-  const { error: updateErr } = await supabase
+async function writeCompletionReason(jobId, reason) {
+  const { error } = await supabase
     .from('discovery_jobs')
-    .update({ status: 'done', completed_at: nowIso, error_message: null })
-    .eq('id', job.id);
-  if (updateErr) {
-    console.error('[worker] mark done error:', updateErr.message);
+    .update({ completion_reason: reason })
+    .eq('id', jobId)
+    .eq('status', 'done');
+  if (error) {
+    console.warn('[worker] completion_reason update failed:', error.message);
+  }
+}
+
+async function markDone(job, count, pipelineExit) {
+  if (await cancelListener.isCancelled(job.id)) {
+    console.log(`[worker] markDone skipped — job ${job.id} is cancelled`);
+    return;
+  }
+
+  const completionReason =
+    pipelineExit === PIPELINE_EXIT.NO_DATA || count === 0 ? 'completed_empty' : 'success';
+
+  const pipelineVersion = process.env.PIPELINE_VERSION || 'v8';
+  const { data, error } = await supabase.rpc('discovery_job_finalize', {
+    p_job_id: job.id,
+    p_pipeline_version: pipelineVersion,
+    p_error_summary: null,
+  });
+
+  if (error) {
+    console.error('[worker] finalize RPC failed:', error.message);
+    const nowIso = new Date().toISOString();
+    const { error: updateErr } = await supabase
+      .from('discovery_jobs')
+      .update({
+        status: 'done',
+        completed_at: nowIso,
+        error_message: null,
+        current_stage: 'done',
+        completion_reason: completionReason,
+      })
+      .eq('id', job.id)
+      .in('status', ['claimed', 'fetching', 'parsing', 'scoring', 'persisting', 'running', 'pending']);
+    if (updateErr) {
+      console.error('[worker] mark done fallback error:', updateErr.message);
+    }
+  } else if (data?.no_op) {
+    console.log(`[worker] finalize no-op: ${data.reason || 'locked'}`);
+    return;
+  } else {
+    console.log(
+      `[worker] finalize ok: result_count=${data?.result_count ?? count}, completion_reason=${completionReason}`,
+    );
+    await writeCompletionReason(job.id, completionReason);
   }
 
   const notifyMode = discoveryCompletionNotifyMode();
@@ -199,17 +283,35 @@ async function markDone(job, count) {
 }
 
 async function markFailed(job, msg) {
+  if (await cancelListener.isCancelled(job.id)) {
+    console.log(`[worker] markFailed skipped — job ${job.id} is cancelled`);
+    return;
+  }
+
   const jobId = job.id;
-  const { error } = await supabase
-    .from('discovery_jobs')
-    .update({
-      status: 'failed',
-      completed_at: new Date().toISOString(),
-      error_message: String(msg || 'pipeline_failed').slice(0, 1000),
-    })
-    .eq('id', jobId);
-  if (error) {
-    console.error('[worker] mark failed error:', error.message);
+  const errText = String(msg || 'pipeline_failed').slice(0, 1000);
+
+  const { error: stageErr } = await supabase.rpc('discovery_job_record_stage', {
+    p_job_id: jobId,
+    p_stage: 'failed',
+    p_claimed_by: WORKER_ID,
+    p_payload: { error_message: errText },
+  });
+  if (stageErr) {
+    console.error('[worker] record_stage failed:', stageErr.message);
+    const { error } = await supabase
+      .from('discovery_jobs')
+      .update({
+        status: 'failed',
+        current_stage: 'failed',
+        completed_at: new Date().toISOString(),
+        error_message: errText,
+      })
+      .eq('id', jobId)
+      .in('status', ['claimed', 'fetching', 'parsing', 'scoring', 'persisting', 'running', 'pending']);
+    if (error) {
+      console.error('[worker] mark failed fallback error:', error.message);
+    }
   }
 
   if (process.env.CRM_WATCH_EMIT_ON_FAILURE === 'true') {
@@ -226,12 +328,6 @@ async function markFailed(job, msg) {
   }
 }
 
-/**
- * Write a heartbeat timestamp to platform_runtime_settings so that the zhimao
- * admin panel can detect whether this worker is alive.
- * Key: procure_worker_heartbeat  Value: ISO timestamp
- * Non-fatal: if the upsert fails we just log and continue.
- */
 async function writeHeartbeat() {
   const { error } = await supabase
     .from('platform_runtime_settings')
@@ -249,40 +345,56 @@ async function writeHeartbeat() {
 }
 
 async function main() {
-  console.log('[worker] discovery worker started');
-  // Write initial heartbeat on startup so admin can see the worker came online.
+  console.log(`[worker] discovery worker started (id=${WORKER_ID})`);
+  await cancelListener.start(supabase);
   await writeHeartbeat();
 
   while (true) {
     try {
-      // Heartbeat every loop so admin panel shows last-seen time.
       await writeHeartbeat();
 
-      const job = await pickPendingJob();
+      const job = await claimNextJob();
       if (!job) {
+        if (process.env.ENRICH_IDLE_IN_DISCOVERY_WORKER !== '0') {
+          try {
+            const promoted = await processEnrichmentQueueBatch(supabase);
+            if (promoted > 0) {
+              console.log(`[worker] idle enrichment batch promoted=${promoted}`);
+            }
+          } catch (e) {
+            console.warn('[worker] idle enrichment error:', e?.message || e);
+          }
+        }
         await sleep(POLL_MS);
         continue;
       }
 
-      const runningOk = await markRunning(job.id);
-      if (!runningOk) {
-        await sleep(POLL_MS);
+      if (await cancelListener.isCancelled(job.id)) {
+        console.log(`[worker] job ${job.id} cancelled before pipeline start`);
+        await sleep(1000);
         continue;
       }
 
-      // 读取该 job 的历史 sweep 次数，传入流水线做深分页
-      const { data: jobMeta } = await supabase
-        .from('discovery_jobs')
-        .select('sweep_count')
-        .eq('id', job.id)
-        .maybeSingle();
-      const sweepCount = Number(jobMeta?.sweep_count ?? 0) + 1;
-
+      const sweepCount = Number(job.sweep_count ?? 0) + 1;
       const reweightPolicies = await readReweightPolicies(job);
       console.log(
         `[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`,
       );
-      const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount, job, reweightPolicies);
+
+      const exitCode = await runPipeline(
+        job.country_iso,
+        job.category,
+        job.id,
+        sweepCount,
+        job,
+        reweightPolicies,
+      );
+
+      if (await cancelListener.isCancelled(job.id)) {
+        console.log(`[worker] job ${job.id} cancelled — pipeline stopped, no finalize`);
+        await sleep(1000);
+        continue;
+      }
 
       if (exitCode === PIPELINE_EXIT.CRASH) {
         await markFailed(job, 'pipeline_exit_non_zero');
@@ -290,20 +402,15 @@ async function main() {
         continue;
       }
 
-      // exit(2) = no new data this sweep — still mark done, update sweep_count
       if (exitCode === PIPELINE_EXIT.NO_DATA) {
         console.log(`[worker] job ${job.id} sweep=${sweepCount}: no new data (graceful stop).`);
       }
 
-      // 更新 sweep_count 方便下轮深分页
-      await supabase
-        .from('discovery_jobs')
-        .update({ sweep_count: sweepCount })
-        .eq('id', job.id);
+      await supabase.from('discovery_jobs').update({ sweep_count: sweepCount }).eq('id', job.id);
 
       const count = await readResultCountFromBulk(job.id);
-      await markDone(job, count);
-      console.log(`[worker] job done ${job.id}, count=${count}, sweep=${sweepCount}`);
+      await markDone(job, count, exitCode);
+      console.log(`[worker] job done ${job.id}, count=${count}, sweep=${sweepCount}, exit=${exitCode}`);
     } catch (e) {
       console.error('[worker] loop error:', e instanceof Error ? e.message : e);
     }
