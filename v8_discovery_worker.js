@@ -1,12 +1,20 @@
-require('./load-env');
+require('dotenv').config();
 const { spawn, execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 const {
-  emitDiscoveryJobCompleted,
-  emitDiscoveryJobFailed,
-  discoveryCompletionNotifyMode,
-} = require('./v8_crm_watch_emit');
+  recordStage,
+  finalizeJob,
+  failJob,
+  isJobCancelled,
+  releaseStaleClaims,
+  claimNextDiscoveryJob,
+} = require('./v8_zhimao_contract');
+const { readFunnelDoc, deleteFunnelFile } = require('./v8_lib_funnel');
+const { processEnrichmentBatch } = require('./v8_lib_enrichment_supabase');
 
+// Self-heal: ensure Playwright Chromium binary is present before the first job runs.
+// Render's build and runtime filesystems are separate; the browser cache from buildCommand
+// does not persist into the worker process. This runs once at startup (~30s on cold start).
 try {
   console.log('[worker] ensuring playwright chromium is installed...');
   execSync('npx playwright install chromium', { stdio: 'inherit' });
@@ -22,29 +30,74 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   process.exit(1);
 }
 
-const { reportDiscoveryStage } = require('./v8_discovery_stage');
-const { processEnrichmentQueueBatch } = require('./v8_discovery_enrichment_worker');
-const { DiscoveryCancelListener } = require('./v8_discovery_cancel_listener');
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 
-const cancelListener = new DiscoveryCancelListener();
-
-const WORKER_ID =
-  process.env.RENDER_INSTANCE_ID ||
-  process.env.WORKER_ID ||
-  `v8-discovery-worker-${process.pid}`;
-
 const POLL_MS = Math.max(Number(process.env.DISCOVERY_POLL_MS || 15000), 3000);
-const CANCEL_POLL_MS = Math.max(Number(process.env.CANCEL_POLL_MS || 3000), 1000);
-const STALE_CLAIM_SECONDS = Math.max(Number(process.env.STALE_CLAIM_SECONDS || 900), 120);
-
-const PIPELINE_EXIT = { SUCCESS: 0, CRASH: 1, NO_DATA: 2 };
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// exit code 约定（master 与 worker 共同维护）：
+//   0 → 全量写入成功
+//   1 → 脚本崩溃 / 配置错误 → markFailed
+//   2 → 本轮无新数据（graceful stop）→ markDone 但标记 result_count 来自 bulk 侧
+//   3 → 子进程被 cancel SIGTERM 终止（无数据持久化），语义上不是"失败"
+//   4 → graceful cancel with data：SIGTERM 到达后 master 仍完成了 step4/5 持久化
+//   5 → 看门狗硬超时：pipeline 超过 DISCOVERY_PIPELINE_MAX_MS 仍未结束，被强杀（markFailed）
+const PIPELINE_EXIT = {
+  SUCCESS: 0,
+  CRASH: 1,
+  NO_DATA: 2,
+  CANCELLED: 3,
+  GRACEFUL_CANCEL_WITH_DATA: 4,
+  TIMEOUT: 5,
+};
+
+// 看门狗参数（env 可调）：
+//   DISCOVERY_PIPELINE_MAX_MS  → 单个 job pipeline 软上限，到点先 SIGTERM master 走 graceful cancel
+//   DISCOVERY_PIPELINE_KILL_GRACE_MS → SIGTERM 后等多久还没退就 SIGKILL 整个进程组
+//   DISCOVERY_PIPELINE_HEARTBEAT_MS  → 运行期间多久回写一次 stage_heartbeat_at + funnel_json
+const PIPELINE_MAX_MS = Math.max(Number(process.env.DISCOVERY_PIPELINE_MAX_MS || 18 * 60 * 1000), 60_000);
+const PIPELINE_KILL_GRACE_MS = Math.max(Number(process.env.DISCOVERY_PIPELINE_KILL_GRACE_MS || 90_000), 10_000);
+const PIPELINE_HEARTBEAT_MS = Math.max(Number(process.env.DISCOVERY_PIPELINE_HEARTBEAT_MS || 45_000), 10_000);
+
+// 并发车道数：一次最多同时认领并跑几个 job。claim_next_discovery_job 用 FOR UPDATE SKIP
+// LOCKED，多车道并发认领互不抢占（各拿一单）。默认 2，env 可调，封顶 6（防 Render 实例
+// 内存/外部 API 速率被多个 Playwright + Gemini pipeline 同时打爆）。
+const PIPELINE_CONCURRENCY = Math.min(
+  Math.max(Number(process.env.DISCOVERY_PIPELINE_CONCURRENCY || 2), 1),
+  6,
+);
+
+const ACTIVE_JOB_STATUSES = ['pending', 'running', 'claimed', 'fetching', 'parsing', 'scoring', 'persisting'];
+
+/**
+ * 把 funnel_<jobId>.json 的 { steps: { step1: {...} } } 物理结构转成前端
+ * useDiscoveryJobRunner 期望的数组形态 [{ step:'step1', signals, accepted, pillars... }]。
+ * 旧实现直接把对象塞进 funnel_json，前端 `Array.isArray()` 判否后丢弃 → 真实进度数字一直不显示。
+ */
+function funnelDocToArray(doc) {
+  if (!doc || !doc.steps || typeof doc.steps !== 'object') return null;
+  const order = ['step0', 'step1', 'step2', 'step3', 'step4', 'step5'];
+  const keys = Object.keys(doc.steps).sort((a, b) => {
+    const ia = order.indexOf(a); const ib = order.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  const arr = keys.map((k) => ({ step: k, ...doc.steps[k] }));
+  return arr.length ? arr : null;
+}
+
+/** 由 funnel 文件里最新出现的 step 粗映射到 discovery_jobs.current_stage。 */
+function funnelLatestStage(doc) {
+  if (!doc || !doc.steps) return null;
+  if (doc.steps.step5) return 'persisting';
+  if (doc.steps.step4) return 'scoring';
+  if (doc.steps.step3 || doc.steps.step2) return 'parsing';
+  if (doc.steps.step1) return 'fetching';
+  return null;
 }
 
 async function readReweightPolicies(job) {
@@ -58,7 +111,7 @@ async function readReweightPolicies(job) {
     q = countryScoped ? q.eq('country_iso', country) : q.is('country_iso', null);
     q = categoryScoped ? q.eq('category_key', category) : q.is('category_key', null);
     const { data } = await q.limit(50);
-    for (const row of data || []) {
+    for (const row of (data || [])) {
       const key = String(row.source_kind || 'generic');
       const prev = merged.get(key) || { source_kind: key, weight_delta: 0, sample_count: 0 };
       prev.weight_delta += Number(row.weight_delta || 0);
@@ -78,179 +131,257 @@ async function readReweightPolicies(job) {
 }
 
 /**
- * P1-D：spawn 流水线 + cancel 轮询（LISTEN 命中或 DB status=cancelled → SIGTERM）。
+ * 监听 discovery_jobs 的取消信号，双路并行：
+ *   - 快路径：Supabase Realtime postgres_changes（毫秒级响应，与 DB trigger pg_notify 同效）
+ *   - 兜底路径：30s 轮询 isJobCancelled（WebSocket 断线或首次订阅延迟时的安全网）
+ *
+ * 返回一个 { promise, cleanup } 对象：
+ *   promise   → 当 job 被取消时 resolve（void）
+ *   cleanup   → 必须在 pipeline 结束后调用，关闭 realtime channel + clearInterval
  */
-function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, reweightPolicies = []) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (code) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(checkInterval);
-      resolve(code ?? PIPELINE_EXIT.CRASH);
-    };
+function makeCancelWatcher(jobId) {
+  let resolveCancel;
+  let cancelled = false;
+  let realtimeDisabled = false;
+  const promise = new Promise((resolve) => { resolveCancel = resolve; });
 
-    const child = spawn('node', ['zhimao_v8_ultimate_master.js', countryIso, category], {
-      stdio: 'inherit',
-      env: {
-        ...process.env,
-        DISCOVERY_JOB_ID: String(jobId),
-        SWEEP_COUNT: String(sweepCount),
-        DISCOVERY_SESSION_ID: meta.session_id ? String(meta.session_id) : '',
-        DISCOVERY_PARENT_JOB_ID: meta.parent_job_id ? String(meta.parent_job_id) : '',
-        DISCOVERY_ACTION_TYPE: meta.action_type ? String(meta.action_type) : 'new_search',
-        DISCOVERY_REWEIGHT_JSON: JSON.stringify(Array.isArray(reweightPolicies) ? reweightPolicies : []),
+  function triggerCancel() {
+    if (cancelled) return;
+    cancelled = true;
+    console.warn(`[worker] job ${jobId} cancel signal received — terminating pipeline child`);
+    resolveCancel();
+  }
+
+  // 快路径：Supabase Realtime 实时订阅
+  // 依赖 discovery_jobs 表的 realtime 在 Supabase dashboard 已启用（默认开启）
+  const channel = supabase
+    .channel(`job-cancel-${jobId}`)
+    .on(
+      'postgres_changes',
+      { event: 'UPDATE', schema: 'public', table: 'discovery_jobs', filter: `id=eq.${jobId}` },
+      (payload) => {
+        const newStatus = payload.new && payload.new.status;
+        if (newStatus === 'cancelled') triggerCancel();
       },
+    )
+    .subscribe((status, err) => {
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        if (realtimeDisabled) return;
+        realtimeDisabled = true;
+        const detail = err?.message ? `: ${err.message}` : '';
+        console.warn(`[worker] cancel realtime channel ${status} for job ${jobId}${detail}, relying on poll fallback`);
+        supabase.removeChannel(channel).catch(() => { /* ignore */ });
+      }
     });
 
-    const checkInterval = setInterval(() => {
-      void (async () => {
-        if (await cancelListener.isCancelled(jobId)) {
-          console.log(`[worker] cancel detected for job ${jobId}, terminating pipeline`);
-          child.kill('SIGTERM');
-          setTimeout(() => {
-            try {
-              child.kill('SIGKILL');
-            } catch (_) {
-              /* already dead */
-            }
-          }, 8000);
-        }
-      })();
-    }, CANCEL_POLL_MS);
+  // 兜底路径：每 30s 轮询一次（仅在 Realtime 掉线时作为安全网）
+  isJobCancelled(supabase, jobId).then((isCancelled) => {
+    if (isCancelled) triggerCancel();
+  }).catch(() => { /* ignore */ });
+  const fallbackPoll = setInterval(async () => {
+    if (cancelled) return;
+    if (await isJobCancelled(supabase, jobId)) triggerCancel();
+  }, 30_000);
 
-    child.on('close', (code) => finish(code));
-    child.on('error', () => finish(PIPELINE_EXIT.CRASH));
-  });
-}
-
-async function releaseStaleClaims() {
-  const { data, error } = await supabase.rpc('release_stale_discovery_claims', {
-    p_stale_seconds: STALE_CLAIM_SECONDS,
-  });
-  if (error) {
-    console.warn('[worker] release_stale_discovery_claims failed:', error.message);
-    return 0;
+  function cleanup() {
+    clearInterval(fallbackPoll);
+    supabase.removeChannel(channel).catch(() => { /* ignore */ });
   }
-  const n = Number(data ?? 0);
-  if (n > 0) console.log(`[worker] released ${n} stale in-flight claim(s)`);
-  return n;
+
+  return { promise, cleanup, get triggered() { return cancelled; } };
 }
 
-/** P1-D：原子领单（优先级 + SKIP LOCKED）。 */
-async function claimNextJob() {
-  await releaseStaleClaims();
-
-  const { data: claim, error } = await supabase.rpc('claim_next_discovery_job', {
-    p_worker_id: WORKER_ID,
-  });
-
-  if (error) {
-    if (error.message && error.message.toLowerCase().includes('schema cache')) {
-      console.warn('[worker] claim RPC error (schema cache refreshing, waiting 30s):', error.message);
-      await sleep(30_000);
-    } else {
-      console.error('[worker] claim_next_discovery_job error:', error.message);
+function mergeDomainBlacklist(policies) {
+  const hosts = new Set();
+  for (const row of (policies || [])) {
+    for (const d of (row?.domain_blacklist || [])) {
+      const h = String(d || '').toLowerCase().replace(/^www\./, '');
+      if (h) hosts.add(h);
     }
-    return null;
   }
-
-  if (!claim?.ok || !claim.job_id) {
-    return null;
-  }
-
-  const { data: job, error: jobErr } = await supabase
-    .from('discovery_jobs')
-    .select('id,category,country_iso,requested_by,session_id,parent_job_id,action_type,sweep_count,status')
-    .eq('id', claim.job_id)
-    .maybeSingle();
-
-  if (jobErr || !job) {
-    console.error('[worker] load claimed job failed:', jobErr?.message || claim.job_id);
-    return null;
-  }
-
-  if (job.status === 'cancelled') {
-    console.log(`[worker] claimed job ${job.id} already cancelled, skipping`);
-    return null;
-  }
-
-  console.log(
-    `[worker] claimed job ${job.id} (${job.category}/${job.country_iso}, action=${job.action_type || 'new_search'})`,
-  );
-  return job;
+  return [...hosts];
 }
 
-async function readResultCountFromBulk(jobId) {
+function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, reweightPolicies = []) {
+  return new Promise((resolve) => {
+    // 提取 Pillar 0 产业链扩展结果（由 zhimao interpret → expand-query 生成）
+    // 注入 step0 用于替换单一品类词为多样化买家画像搜索词
+    const pillar0 = (meta.action_payload && typeof meta.action_payload === 'object')
+      ? meta.action_payload
+      : null;
+    const pillar0Json = pillar0 ? JSON.stringify(pillar0) : '';
+    const domainBlacklist = mergeDomainBlacklist(reweightPolicies);
+
+    const child = spawn(
+      'node',
+      ['zhimao_v8_ultimate_master.js', countryIso, category],
+      {
+        stdio: 'inherit',
+        // 自成进程组：看门狗需要时可 process.kill(-pid) 连同 master 用 execSync spawn 的
+        // 孙进程（卡死的 step1/3）一起杀掉。master 阻塞在同步 execSync 时，单发 SIGTERM 给
+        // master 是无效的（信号处理函数排在被阻塞的事件循环后面），必须组级 SIGKILL 兜底。
+        detached: true,
+        env: {
+          ...process.env,
+          DISCOVERY_JOB_ID: String(jobId),
+          SWEEP_COUNT:       String(sweepCount),
+          DISCOVERY_SESSION_ID: meta.session_id ? String(meta.session_id) : '',
+          DISCOVERY_PARENT_JOB_ID: meta.parent_job_id ? String(meta.parent_job_id) : '',
+          DISCOVERY_ACTION_TYPE: meta.action_type ? String(meta.action_type) : 'new_search',
+          DISCOVERY_REWEIGHT_JSON: JSON.stringify(Array.isArray(reweightPolicies) ? reweightPolicies : []),
+          DISCOVERY_DOMAIN_BLACKLIST: JSON.stringify(domainBlacklist),
+          PILLAR0_PAYLOAD: pillar0Json,
+          DISCOVERY_COUNTRY_ISO: countryIso || '',
+          DISCOVERY_CATEGORY: category || '',
+          // proxy_hint 桥接：Render env (USE_PROXY/BRD_USER/BRD_PASS) 优先；
+          // 若 Render 未配置，则从 action_payload.proxy_hint 读取（由 zhimao submit 注入）
+          ...(() => {
+            const hint = pillar0?.proxy_hint;
+            if (!hint?.enabled) return {};
+            if (process.env.USE_PROXY === 'true') return {};  // Render 已配置，不覆盖
+            return {
+              USE_PROXY:  'true',
+              BRD_USER:   String(hint.username || ''),
+              BRD_PASS:   String(hint.password || ''),
+              BRD_PROXY:  `http://${hint.host}:${hint.port}`,
+            };
+          })(),
+        },
+      },
+    );
+
+    // 组级杀进程：优先 process.kill(-pid) 命中整个进程组，失败再退化为只杀 master。
+    const killTree = (sig) => {
+      try {
+        if (child.pid) process.kill(-child.pid, sig);
+      } catch (_) {
+        try { child.kill(sig); } catch (__) { /* ignore */ }
+      }
+    };
+
+    // 双路取消监听：Realtime（快）+ 30s 轮询（兜底）
+    const watcher = makeCancelWatcher(jobId);
+    watcher.promise.then(() => {
+      try { child.kill('SIGTERM'); } catch (_) { /* ignore */ }
+    });
+
+    // ── A 看门狗：pipeline 硬上限，避免单个 job 卡死后无终态（用户等满 60min 才自愈）──
+    //   软触发：SIGTERM master → master 在 step 之间会进入 graceful cancel，跑完 step4+5
+    //          落库已采集数据并 exit 4；用户随后能看到"部分结果 + 完成"。
+    //   硬触发：宽限期后仍未退出（多半卡死在某个 step 的同步 execSync 里）→ 组级 SIGKILL，
+    //          回报 TIMEOUT → markFailed('pipeline_timeout')，让用户拿到明确失败可重试。
+    let watchdogState = 'armed'; // armed | soft | hard
+    let killTimer = null;
+    const softTimer = setTimeout(() => {
+      watchdogState = 'soft';
+      console.warn(`[worker] pipeline watchdog: job ${jobId} exceeded ${PIPELINE_MAX_MS}ms — SIGTERM master (graceful cancel, will try to persist partial data)`);
+      try { child.kill('SIGTERM'); } catch (_) { /* ignore */ }
+      killTimer = setTimeout(() => {
+        watchdogState = 'hard';
+        console.warn(`[worker] pipeline watchdog: job ${jobId} still alive ${PIPELINE_KILL_GRACE_MS}ms after SIGTERM — SIGKILL process group`);
+        killTree('SIGKILL');
+      }, PIPELINE_KILL_GRACE_MS);
+    }, PIPELINE_MAX_MS);
+
+    // ── C 运行期心跳 + 真实进度回写 ──────────────────────────────────────────
+    //   pipeline 是黑盒子进程，期间不回写 DB 会让 current_stage 冻在 fetching、
+    //   stage_heartbeat_at 不动、funnel 数字到结束才出现。这里每 N 秒：
+    //     1) 读 funnel 文件 → 以数组形态写 funnel_json（前端真实进度数字立刻可见）
+    //     2) 按最新 step 粗推 current_stage + bump stage_heartbeat_at
+    //   只更新仍处于活态的行（.in 守卫），绝不覆盖已 cancelled/done/failed 的终态。
+    const heartbeat = setInterval(async () => {
+      try {
+        const doc = readFunnelDoc(jobId);
+        const arr = funnelDocToArray(doc);
+        const stage = funnelLatestStage(doc);
+        const patch = { stage_heartbeat_at: new Date().toISOString() };
+        if (arr) patch.funnel_json = arr;
+        if (stage) patch.current_stage = stage;
+        await supabase
+          .from('discovery_jobs')
+          .update(patch)
+          .eq('id', jobId)
+          .in('status', ACTIVE_JOB_STATUSES);
+      } catch (_) { /* 非致命 */ }
+    }, PIPELINE_HEARTBEAT_MS);
+
+    const cleanupTimers = () => {
+      clearTimeout(softTimer);
+      if (killTimer) clearTimeout(killTimer);
+      clearInterval(heartbeat);
+    };
+
+    child.on('close', (code, signal) => {
+      cleanupTimers();
+      watcher.cleanup();
+      // 看门狗硬杀：无优雅落库 → 回报 TIMEOUT，由主循环 markFailed。
+      if (watchdogState === 'hard') {
+        console.warn(`[worker] job ${jobId} hard-killed by watchdog (code=${code}, signal=${signal})`);
+        resolve(PIPELINE_EXIT.TIMEOUT);
+        return;
+      }
+      if (watcher.triggered) {
+        // cancel 信号已发送。
+        // exit 4 = master 完成了 graceful cancel with data，应 finalize
+        // 其他 = 被中途杀死，跳过 finalize
+        if (code === PIPELINE_EXIT.GRACEFUL_CANCEL_WITH_DATA) {
+          resolve(PIPELINE_EXIT.GRACEFUL_CANCEL_WITH_DATA);
+        } else {
+          resolve(PIPELINE_EXIT.CANCELLED);
+        }
+        return;
+      }
+      // 看门狗软触发后 master 优雅退出（exit 4 = 已落库部分数据）由下面的 code 透传处理。
+      resolve(code ?? 1);
+    });
+    child.on('error', () => {
+      cleanupTimers();
+      watcher.cleanup();
+      resolve(PIPELINE_EXIT.CRASH);
+    });
+  });
+}
+
+async function readClaimedJob(jobId) {
   const { data, error } = await supabase
     .from('discovery_jobs')
-    .select('result_count,status')
+    .select('id,category,country_iso,requested_by,session_id,parent_job_id,action_type,action_payload,sweep_count')
     .eq('id', jobId)
     .maybeSingle();
   if (error) {
-    console.error('[worker] read result_count error:', error.message);
+    console.error('[worker] read claimed job error:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function readMappingCount(jobId) {
+  const { count, error } = await supabase
+    .from('discovery_job_leads')
+    .select('company_id', { count: 'exact', head: true })
+    .eq('discovery_job_id', jobId)
+    .neq('quality_grade', 'unqualified');
+  if (error) {
+    console.error('[worker] read mapping count error:', error.message);
     return 0;
   }
-  return Number(data?.result_count ?? 0);
+  return Number(count ?? 0);
 }
 
-async function writeCompletionReason(jobId, reason) {
-  const { error } = await supabase
-    .from('discovery_jobs')
-    .update({ completion_reason: reason })
-    .eq('id', jobId)
-    .eq('status', 'done');
-  if (error) {
-    console.warn('[worker] completion_reason update failed:', error.message);
-  }
-}
-
-async function markDone(job, count, pipelineExit) {
-  if (await cancelListener.isCancelled(job.id)) {
-    console.log(`[worker] markDone skipped — job ${job.id} is cancelled`);
-    return;
-  }
-
-  const completionReason =
-    pipelineExit === PIPELINE_EXIT.NO_DATA || count === 0 ? 'completed_empty' : 'success';
-
-  const pipelineVersion = process.env.PIPELINE_VERSION || 'v8';
-  const { data, error } = await supabase.rpc('discovery_job_finalize', {
-    p_job_id: job.id,
-    p_pipeline_version: pipelineVersion,
-    p_error_summary: null,
-  });
-
-  if (error) {
-    console.error('[worker] finalize RPC failed:', error.message);
+async function markDone(job) {
+  await recordStage(supabase, job.id, 'persisting', { phase: 'pre_finalize' });
+  const fin = await finalizeJob(supabase, job);
+  if (!fin.ok) {
     const nowIso = new Date().toISOString();
     const { error: updateErr } = await supabase
       .from('discovery_jobs')
-      .update({
-        status: 'done',
-        completed_at: nowIso,
-        error_message: null,
-        current_stage: 'done',
-        completion_reason: completionReason,
-      })
+      .update({ status: 'done', completed_at: nowIso })
       .eq('id', job.id)
-      .in('status', ['claimed', 'fetching', 'parsing', 'scoring', 'persisting', 'running', 'pending']);
-    if (updateErr) {
-      console.error('[worker] mark done fallback error:', updateErr.message);
-    }
-  } else if (data?.no_op) {
-    console.log(`[worker] finalize no-op: ${data.reason || 'locked'}`);
-    return;
-  } else {
-    console.log(
-      `[worker] finalize ok: result_count=${data?.result_count ?? count}, completion_reason=${completionReason}`,
-    );
-    await writeCompletionReason(job.id, completionReason);
+      .in('status', ['pending', 'running', 'claimed', 'fetching', 'parsing', 'scoring', 'persisting']);
+    if (updateErr) console.error('[worker] mark done fallback error:', updateErr.message);
   }
 
-  const notifyMode = discoveryCompletionNotifyMode();
-
-  if ((notifyMode === 'supabase' || notifyMode === 'both') && job.requested_by) {
+  if (job.requested_by) {
     const { error: notifyErr } = await supabase.from('notifications').insert({
       recipient_user_id: job.requested_by,
       notification_type: 'discovery_complete',
@@ -265,69 +396,54 @@ async function markDone(job, count, pipelineExit) {
       console.error('[worker] notify error:', notifyErr.message);
     }
   }
-
-  if (notifyMode === 'emit' || notifyMode === 'both') {
-    const emitRes = await emitDiscoveryJobCompleted(job);
-    if (emitRes.skipped) {
-      if (emitRes.reason && emitRes.reason !== 'missing_zhimao_app_url_or_emit_secret') {
-        console.warn('[worker] crm-watch emit skipped:', emitRes.reason);
-      }
-    } else if (!emitRes.ok) {
-      console.error('[worker] crm-watch emit failed:', emitRes.error || emitRes.status, emitRes.data || '');
-    } else if (emitRes.data && typeof emitRes.data === 'object' && emitRes.data.deduped) {
-      console.log('[worker] crm-watch emit deduped=true');
-    } else {
-      console.log('[worker] crm-watch emit ok');
-    }
-  }
 }
 
-async function markFailed(job, msg) {
-  if (await cancelListener.isCancelled(job.id)) {
-    console.log(`[worker] markFailed skipped — job ${job.id} is cancelled`);
-    return;
-  }
-
-  const jobId = job.id;
-  const errText = String(msg || 'pipeline_failed').slice(0, 1000);
-
-  const { error: stageErr } = await supabase.rpc('discovery_job_record_stage', {
-    p_job_id: jobId,
-    p_stage: 'failed',
-    p_claimed_by: WORKER_ID,
-    p_payload: { error_message: errText },
-  });
-  if (stageErr) {
-    console.error('[worker] record_stage failed:', stageErr.message);
-    const { error } = await supabase
-      .from('discovery_jobs')
-      .update({
-        status: 'failed',
-        current_stage: 'failed',
-        completed_at: new Date().toISOString(),
-        error_message: errText,
-      })
-      .eq('id', jobId)
-      .in('status', ['claimed', 'fetching', 'parsing', 'scoring', 'persisting', 'running', 'pending']);
-    if (error) {
-      console.error('[worker] mark failed fallback error:', error.message);
+async function markFailed(jobId, msg) {
+  // 尝试读取 master 写入的 job-scoped 崩溃文件，细化错误定位
+  let detailedMsg = msg;
+  const crashFile = `crash_${jobId}.json`;
+  try {
+    if (require('fs').existsSync(crashFile)) {
+      const info = JSON.parse(require('fs').readFileSync(crashFile, 'utf8'));
+      detailedMsg = `pipeline_crash:${info.step || 'unknown'}`;
+      require('fs').unlinkSync(crashFile);
+      console.warn(`[worker] crash detail: step=${info.step} script=${info.script} error=${info.error?.slice(0, 120)}`);
     }
-  }
+  } catch (_) { /* non-fatal */ }
+  await failJob(supabase, jobId, detailedMsg);
 
   if (process.env.CRM_WATCH_EMIT_ON_FAILURE === 'true') {
-    const emitRes = await emitDiscoveryJobFailed(job, String(msg || 'pipeline_failed'));
-    if (emitRes.skipped) {
-      if (emitRes.reason && emitRes.reason !== 'missing_zhimao_app_url_or_emit_secret') {
-        console.warn('[worker] crm-watch failed emit skipped:', emitRes.reason);
+    try {
+      const { emitDiscoveryJobFailed } = require('./v8_crm_watch_emit');
+      const { data: job } = await supabase
+        .from('discovery_jobs')
+        .select('id,category,country_iso,requested_by')
+        .eq('id', jobId)
+        .maybeSingle();
+      if (job) {
+        const emitRes = await emitDiscoveryJobFailed(job, String(detailedMsg || 'pipeline_failed'));
+        if (emitRes.skipped) {
+          if (emitRes.reason && emitRes.reason !== 'missing_zhimao_app_url_or_emit_secret') {
+            console.warn('[worker] crm-watch failed emit skipped:', emitRes.reason);
+          }
+        } else if (!emitRes.ok) {
+          console.error('[worker] crm-watch failed emit:', emitRes.error || emitRes.status);
+        } else {
+          console.log('[worker] crm-watch failed emit ok');
+        }
       }
-    } else if (!emitRes.ok) {
-      console.error('[worker] crm-watch failed emit:', emitRes.error || emitRes.status);
-    } else {
-      console.log('[worker] crm-watch failed emit ok');
+    } catch (e) {
+      console.warn('[worker] crm-watch failed emit error:', e?.message || e);
     }
   }
 }
 
+/**
+ * Write a heartbeat timestamp to platform_runtime_settings so that the zhimao
+ * admin panel can detect whether this worker is alive.
+ * Key: procure_worker_heartbeat  Value: ISO timestamp
+ * Non-fatal: if the upsert fails we just log and continue.
+ */
 async function writeHeartbeat() {
   const { error } = await supabase
     .from('platform_runtime_settings')
@@ -344,78 +460,152 @@ async function writeHeartbeat() {
   }
 }
 
-async function main() {
-  console.log(`[worker] discovery worker started (id=${WORKER_ID})`);
-  await cancelListener.start(supabase);
-  await writeHeartbeat();
+/**
+ * 认领并跑完一个 job（一个并发车道的一次迭代）。
+ * 返回 true = 确实认领并处理了一个 job；false = 队列暂时没活，调用方应 sleep 后再试。
+ * 多车道并发调用安全：claim 用 FOR UPDATE SKIP LOCKED，各车道各拿一单。
+ */
+async function claimAndProcessOne(workerId) {
+  const claim = await claimNextDiscoveryJob(supabase, workerId);
+  if (!claim.ok || !claim.job || !claim.job.job_id) return false;
 
+  const job = await readClaimedJob(claim.job.job_id);
+  if (!job) return false;
+
+  try {
+    await recordStage(supabase, job.id, 'fetching');
+
+    // 读取该 job 的历史 sweep 次数，传入流水线做深分页
+    const { data: jobMeta } = await supabase
+      .from('discovery_jobs')
+      .select('sweep_count')
+      .eq('id', job.id)
+      .maybeSingle();
+    const sweepCount = Number(jobMeta?.sweep_count ?? 0) + 1;
+
+    const reweightPolicies = await readReweightPolicies(job);
+    console.log(`[worker] [${workerId}] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`);
+    const exitCode = await runPipeline(job.country_iso, job.category, job.id, sweepCount, job, reweightPolicies);
+
+    // CANCELLED 退出码 或 DB 仍显示 cancelled → 均跳过 finalize，不计为失败
+    // 例外：退出码 4（GRACEFUL_CANCEL_WITH_DATA）= master 已完成 step4/5，有数据入库 → 正常 finalize
+    if (exitCode === PIPELINE_EXIT.CANCELLED || await isJobCancelled(supabase, job.id)) {
+      if (exitCode === PIPELINE_EXIT.GRACEFUL_CANCEL_WITH_DATA) {
+        console.log(`[worker] job ${job.id} cancelled but master persisted data (exit 4) — running finalize`);
+        // 继续往下走，正常 markDone
+      } else {
+        console.log(`[worker] job ${job.id} cancelled — skip finalize`);
+        return true;
+      }
+    }
+
+    if (exitCode === PIPELINE_EXIT.CRASH) {
+      await markFailed(job.id, 'pipeline_exit_non_zero');
+      return true;
+    }
+
+    // 看门狗硬超时：pipeline 卡死被强杀，无优雅落库 → markFailed，让用户拿到明确失败可重试。
+    if (exitCode === PIPELINE_EXIT.TIMEOUT) {
+      console.warn(`[worker] job ${job.id} aborted by pipeline watchdog (timeout) — marking failed`);
+      await markFailed(job.id, 'pipeline_timeout');
+      return true;
+    }
+
+    // exit(2) = no new data this sweep — mark done 但 completion_reason=completed_empty
+    let completionReason = 'success';
+    if (exitCode === PIPELINE_EXIT.NO_DATA) {
+      completionReason = 'completed_empty';
+      console.log(`[worker] job ${job.id} sweep=${sweepCount}: no new data (graceful stop).`);
+    }
+
+    const funnelDoc = readFunnelDoc(job.id);
+    if (funnelDoc) {
+      // 与心跳一致：写数组形态，前端 useDiscoveryJobRunner 才认（Array.isArray 判定）。
+      const funnelArr = funnelDocToArray(funnelDoc) ?? funnelDoc;
+      await supabase
+        .from('discovery_jobs')
+        .update({ funnel_json: funnelArr })
+        .eq('id', job.id);
+      deleteFunnelFile(job.id);
+    }
+
+    // 补报中间 stage：流水线（step1-5）以黑盒子进程运行，这里在 markDone 前
+    // 补上 parsing / scoring，让 UI 进度条不出现 fetching→persisting 长空白。
+    await recordStage(supabase, job.id, 'parsing',  { phase: 'step1_step3_complete' });
+    await recordStage(supabase, job.id, 'scoring',  { phase: 'step4_step5_complete', sweep: sweepCount });
+
+    // 更新 sweep_count 方便下轮深分页
+    await supabase
+      .from('discovery_jobs')
+      .update({
+        sweep_count: sweepCount,
+        completion_reason: completionReason,
+      })
+      .eq('id', job.id);
+
+    await markDone(job);
+    const count = await readMappingCount(job.id);
+    console.log(`[worker] [${workerId}] job done ${job.id}, mapping_count=${count}, sweep=${sweepCount}`);
+  } catch (e) {
+    console.error(`[worker] [${workerId}] job ${job.id} error:`, e instanceof Error ? e.message : e);
+    // 兜底：异常落地为 failed，避免任务永远卡在 in-flight（stale 释放兜底也会补）。
+    try { await markFailed(job.id, 'worker_loop_error'); } catch (_) { /* ignore */ }
+  }
+  return true;
+}
+
+/**
+ * 一个并发车道：不停认领 + 处理 job；没活时 sleep(POLL_MS)，有活时只 sleep 一小段再抢下一单。
+ */
+async function lane(laneId) {
+  const workerId = `${process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || 'procure-worker'}#lane${laneId}`;
+  while (true) {
+    let processed = false;
+    try {
+      processed = await claimAndProcessOne(workerId);
+    } catch (e) {
+      console.error(`[worker] [${workerId}] lane error:`, e instanceof Error ? e.message : e);
+    }
+    await sleep(processed ? 1000 : POLL_MS);
+  }
+}
+
+/**
+ * 单例后台维护循环：心跳 + 释放 stale 认领 + enrichment_queue。
+ * 这些是全局性工作，只跑一份，不随并发车道数翻倍。
+ */
+async function housekeeping() {
   while (true) {
     try {
+      // Heartbeat so admin panel shows last-seen time.
       await writeHeartbeat();
-
-      const job = await claimNextJob();
-      if (!job) {
-        if (process.env.ENRICH_IDLE_IN_DISCOVERY_WORKER !== '0') {
-          try {
-            const promoted = await processEnrichmentQueueBatch(supabase);
-            if (promoted > 0) {
-              console.log(`[worker] idle enrichment batch promoted=${promoted}`);
-            }
-          } catch (e) {
-            console.warn('[worker] idle enrichment error:', e?.message || e);
-          }
+      await releaseStaleClaims(supabase, 900);
+      try {
+        const eq = await processEnrichmentBatch(supabase, 5);
+        if (eq.processed > 0) {
+          console.log(`[worker] enrichment_queue processed=${eq.processed}`);
         }
-        await sleep(POLL_MS);
-        continue;
+      } catch (e) {
+        console.warn('[worker] enrichment_queue tick failed:', e?.message || e);
       }
-
-      if (await cancelListener.isCancelled(job.id)) {
-        console.log(`[worker] job ${job.id} cancelled before pipeline start`);
-        await sleep(1000);
-        continue;
-      }
-
-      const sweepCount = Number(job.sweep_count ?? 0) + 1;
-      const reweightPolicies = await readReweightPolicies(job);
-      console.log(
-        `[worker] running job ${job.id}: ${job.category} / ${job.country_iso} (sweep=${sweepCount}, action=${job.action_type || 'new_search'}, reweight=${reweightPolicies.length})`,
-      );
-
-      const exitCode = await runPipeline(
-        job.country_iso,
-        job.category,
-        job.id,
-        sweepCount,
-        job,
-        reweightPolicies,
-      );
-
-      if (await cancelListener.isCancelled(job.id)) {
-        console.log(`[worker] job ${job.id} cancelled — pipeline stopped, no finalize`);
-        await sleep(1000);
-        continue;
-      }
-
-      if (exitCode === PIPELINE_EXIT.CRASH) {
-        await markFailed(job, 'pipeline_exit_non_zero');
-        await sleep(1000);
-        continue;
-      }
-
-      if (exitCode === PIPELINE_EXIT.NO_DATA) {
-        console.log(`[worker] job ${job.id} sweep=${sweepCount}: no new data (graceful stop).`);
-      }
-
-      await supabase.from('discovery_jobs').update({ sweep_count: sweepCount }).eq('id', job.id);
-
-      const count = await readResultCountFromBulk(job.id);
-      await markDone(job, count, exitCode);
-      console.log(`[worker] job done ${job.id}, count=${count}, sweep=${sweepCount}, exit=${exitCode}`);
     } catch (e) {
-      console.error('[worker] loop error:', e instanceof Error ? e.message : e);
+      console.error('[worker] housekeeping error:', e instanceof Error ? e.message : e);
     }
     await sleep(POLL_MS);
   }
+}
+
+async function main() {
+  console.log(`[worker] discovery worker started (concurrency=${PIPELINE_CONCURRENCY})`);
+  // Write initial heartbeat on startup so admin can see the worker came online.
+  await writeHeartbeat();
+
+  const lanes = [];
+  for (let i = 1; i <= PIPELINE_CONCURRENCY; i++) {
+    lanes.push(lane(i));
+  }
+  // housekeeping 与所有车道并行常驻；任一意外退出都不应让进程整体退出（各自 while(true) 内已兜底）。
+  await Promise.all([housekeeping(), ...lanes]);
 }
 
 main().catch((e) => {

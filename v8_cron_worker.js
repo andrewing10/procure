@@ -1,7 +1,7 @@
 require('dotenv').config();
 const fs    = require('fs');
-const https = require('https');
 const { execSync } = require('child_process');
+const { callGeminiJson } = require('./v8_lib_concurrency');
 
 const TAXONOMY_PATH = 'zhimao_global_taxonomy.json';
 const STATE_PATH    = 'zhimao_matrix_state_v8.json';
@@ -9,62 +9,36 @@ const STATE_PATH    = 'zhimao_matrix_state_v8.json';
 const GEMINI_KEY        = process.env.GEMINI_KEY        || '';
 const GEMINI_FAST_MODEL = process.env.GEMINI_FAST_MODEL || 'gemini-3.1-flash-lite';
 const OPENAI_KEY        = process.env.OPENAI_API_KEY    || '';
+const OPENAI_FAST_MODEL = process.env.OPENAI_FAST_MODEL || 'gpt-4.1-mini';
+const CLAUDE_KEY        = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
+const CLAUDE_MODEL      = process.env.ANTHROPIC_MODEL   || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 const SPARSE_THRESHOLD  = 5; // 子品类少于此值时触发自动扩充
 
-// ── Gemini/OpenAI 快速调用（用 Flash-Lite，无需引入 lib_concurrency 的重依赖）─
+if (!GEMINI_KEY && !CLAUDE_KEY && !OPENAI_KEY) {
+    console.error('[cron] GEMINI_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY at least one required');
+}
+
+// 与 zhimao apps/web 业态画像树工程对齐：统一走 callGeminiJson 三家级联
+// Gemini Flash-Lite → Claude sonnet-4-6 → OpenAI gpt-4.1-mini
 async function callLLMJson(prompt) {
-    // 优先 Gemini Flash-Lite
-    if (GEMINI_KEY) {
-        try {
-            const body = JSON.stringify({
-                contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
-            });
-            const result = await new Promise((resolve, reject) => {
-                const req = https.request({
-                    hostname: 'generativelanguage.googleapis.com',
-                    path: `/v1beta/models/${GEMINI_FAST_MODEL}:generateContent?key=${GEMINI_KEY}`,
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                }, res => {
-                    let d = ''; res.on('data', c => d += c);
-                    res.on('end', () => resolve(d));
-                });
-                req.setTimeout(20000, () => { req.destroy(); reject(new Error('timeout')); });
-                req.on('error', reject);
-                req.write(body); req.end();
-            });
-            const parsed = JSON.parse(result);
-            return JSON.parse(parsed.candidates[0].content.parts[0].text);
-        } catch (e) {
-            console.warn(`[cron] Gemini failed: ${e.message} — trying OpenAI fallback`);
-        }
+    if (!GEMINI_KEY && !CLAUDE_KEY && !OPENAI_KEY) {
+        throw new Error('No LLM API available for expandSparseIndustries');
     }
-    // OpenAI 兜底
-    if (OPENAI_KEY) {
-        const body = JSON.stringify({
-            model: process.env.OPENAI_FAST_MODEL || 'gpt-4.1-mini',
-            temperature: 0.2, response_format: { type: 'json_object' },
-            messages: [
-                { role: 'system', content: 'You are a B2B trade data expert. Always respond with valid JSON.' },
-                { role: 'user', content: prompt },
-            ],
-        });
-        const result = await new Promise((resolve, reject) => {
-            const req = https.request({
-                hostname: 'api.openai.com', path: '/v1/chat/completions',
-                method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
-            }, res => {
-                let d = ''; res.on('data', c => d += c);
-                res.on('end', () => resolve(d));
-            });
-            req.setTimeout(25000, () => { req.destroy(); reject(new Error('timeout')); });
-            req.on('error', reject);
-            req.write(body); req.end();
-        });
-        const parsed = JSON.parse(result);
-        return JSON.parse(parsed.choices[0].message.content);
-    }
-    throw new Error('No LLM API available for expandSparseIndustries');
+    // callGeminiJson 要求 apiKey（Gemini）必填；若缺，用 Claude/OpenAI 直接兜底
+    // 这里 Gemini 没 key 时传一个空字符串会被 callGeminiJson 拒绝，所以用 Claude 直跑兜底逻辑
+    // 但实际部署时 GEMINI_KEY 必有，三家都没的极端场景下早已被上面的 throw 截住
+    return callGeminiJson(prompt, {
+        apiKey: GEMINI_KEY,
+        model: GEMINI_FAST_MODEL,
+        temperature: 0.2,
+        timeoutMs: 25_000,
+        maxRetries: 2,
+        label: 'cron/expand-taxonomy',
+        openaiApiKey: OPENAI_KEY,
+        openaiModel: OPENAI_FAST_MODEL,
+        claudeApiKey: CLAUDE_KEY,
+        claudeModel: CLAUDE_MODEL,
+    });
 }
 
 // ── expandSparseIndustries ────────────────────────────────────────────────────

@@ -3,19 +3,43 @@ const fs      = require('fs');
 const { chromium } = require('playwright');
 const cheerio = require('cheerio');
 const { pMap, callGeminiJson } = require('./v8_lib_concurrency');
+const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
+const { extractSocialUrls } = require('./v8_lib_social_extract');
+const { enrichContactsForLead } = require('./v8_lib_contact_enricher');
+const { readIcpContext } = require('./v8_lib_pillar0');
 
 const [inputFile, outputFile] = process.argv.slice(2);
 const SKIP_L3_INFERENCE = process.env.SKIP_L3_INFERENCE === 'true';
+// P6b：供应商模式下，买家"反向验证"会把制造商/出口商判成 seller=none 而误杀目标，
+// 因此跳过 REVERSE-VERIFICATION GATE（step5 同步跳过买家闸门）。
+const IS_SUPPLIER_MODE = readIcpContext().direction === 'find_suppliers';
+
+/**
+ * 买家抓取矩阵：matrix.include_social_profiles 控制社媒 URL 富化。
+ * false → extractFromHTML 不传 socials Set，节省 Playwright 分析时间；
+ * true（默认）→ 正常聚合社媒 URL。
+ */
+const MATRIX_INCLUDE_SOCIAL = (() => {
+  try {
+    const raw = process.env.PILLAR0_PAYLOAD || '';
+    if (!raw) return true;
+    const p = JSON.parse(raw);
+    return p?.matrix?.include_social_profiles !== false;
+  } catch { return true; }
+})();
 
 const GEMINI_KEY   = process.env.GEMINI_KEY;
-// Step3 L3 供应链推断是最复杂的 LLM 任务
-// gemini-2.5-flash-preview-04-17 在 2026-05 是速度/质量最均衡的可用模型；
-// 如需最高精度可设 GEMINI_MODEL=gemini-2.5-pro-preview-05-06（更慢）
-const GEMINI_MODEL = process.env.GEMINI_MODEL      || 'gemini-2.5-flash-preview-04-17';
+// Step3 L3 供应链推断 — 与 zhimao llmClient / render.yaml 对齐（勿用已下线的 preview-04-17）
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
 const OPENAI_KEY   = process.env.OPENAI_API_KEY || '';
-// L3 推断是最复杂的任务，兜底用最强模型 gpt-4o（gpt-5.5 仅在部分账户可用）
-const OPENAI_MODEL = process.env.OPENAI_MODEL   || 'gpt-4o';
+// L3 推断是最复杂的任务；用户指令 2026-05-20：OpenAI 第三位、用 GPT-5.4+
+// （render.yaml 生产 env 已设 OPENAI_MODEL=gpt-5.5；本地 .env 可覆盖）
+const OPENAI_MODEL = process.env.OPENAI_MODEL   || 'gpt-5.4';
+const CLAUDE_KEY   = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 if (!GEMINI_KEY) { console.error('[step3] GEMINI_KEY env var is required'); process.exit(1); }
+
+const GMAPS_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
 
 // Browser / proxy config (unchanged) ─────────────────────────────────────────
 const BRD_USER  = process.env.BRD_USER  || '';
@@ -33,17 +57,13 @@ const PLAYWRIGHT_TIMEOUT  = parseInt(process.env.PLAYWRIGHT_TIMEOUT || '10000', 
 //   STEP3_PAGE_CONCURRENCY           → Playwright contact extraction parallelism
 // batch size 减小到 5（默认）：更短 prompt = Gemini 响应更快，减少超时率
 // 如需高吞吐可在 .env 中设 BOM_BATCH_SIZE=10（需稳定的 Gemini Pro 配额）
-const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '8',  10));
-const L3_CONCURRENCY        = Math.max(1, parseInt(process.env.L3_CONCURRENCY || '6',  10));
+const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '5',  10));
+const L3_CONCURRENCY        = Math.max(1, parseInt(process.env.L3_CONCURRENCY || '3',  10));
 // L3 timeout 提升到 60s：gemini-2.5-flash 通常 10-20s，但高负载时可达 50s+
 const L3_TIMEOUT_MS         = Math.max(5_000, parseInt(process.env.L3_TIMEOUT_MS || '60000', 10));
 const L3_MAX_RETRIES        = Math.max(0, parseInt(process.env.L3_MAX_RETRIES || '3', 10));
 // 并发数提升：4 → 8（在有代理或高带宽环境下可进一步调高至 12）
-const PAGE_CONCURRENCY      = Math.max(1, parseInt(process.env.STEP3_PAGE_CONCURRENCY || '12', 10));
-/** P0-B：L3 推理与 Playwright 联系方式抓取默认并行（各写独立 lead 副本，最后 merge）。 */
-const STEP3_L3_CONTACT_PARALLEL = process.env.STEP3_L3_CONTACT_PARALLEL !== '0';
-/** P1-C：主路径跳过 Playwright，缺 contact 的 lead 入 Supabase 异步队列（默认开）。 */
-const STEP3_DEFER_CONTACT = process.env.STEP3_DEFER_CONTACT !== '0';
+const PAGE_CONCURRENCY      = Math.max(1, parseInt(process.env.STEP3_PAGE_CONCURRENCY || '8', 10));
 
 // ── 域名抓取缓存（本地文件，跳过 30 天内已爬取的域名）─────────────────────────
 // 避免 cron 每次重跑都对同一家公司 Playwright，既浪费时间又增加被封风险
@@ -94,6 +114,56 @@ async function inferL3SupplyChain(leads) {
         const batchTotal = batches.length;
         const startedAt = Date.now();
 
+        // 业态画像树工程 — 反向验证锚点：
+        // expand-query 已经把"用 ${category} 的下游业态画像"作为 personas 输出，step1 用 personas
+        // 的 industry_en 搜到候选公司（不带 category）。这里 L3 必须反向验证"该公司是否真的采购 ${category}"，
+        // 否则会把"电子厂"全收进来，但很多电子厂其实不买纸箱（PCB 厂 vs 整机组装厂）。
+        const TARGET_CATEGORY = String(process.env.DISCOVERY_CATEGORY || '').trim().slice(0, 80);
+        // 供应商模式：不注入买家反向验证（否则 LLM 把目标供应商判 none）。
+        const reverseVerifyBlock = (TARGET_CATEGORY && !IS_SUPPLIER_MODE)
+            ? `
+
+[REVERSE-VERIFICATION GATE — INDUSTRY PERSONA TREE]
+The user's original search target category is: "${TARGET_CATEGORY}".
+For EACH company, additionally output:
+  "target_category_match": "high" | "medium" | "low" | "none"
+    high   = company's primary operations REQUIRE "${TARGET_CATEGORY}" as core input/merchandise (must buy)
+    medium = plausibly procures "${TARGET_CATEGORY}" occasionally / auxiliarily
+    low    = unlikely buyer (industry adjacent but no clear procurement pathway)
+    none   = clearly NOT a buyer (different supply chain, e.g. service-only, software, finance)
+  "target_category_evidence": one short English sentence (≤80 chars) explaining WHY this company would
+    procure "${TARGET_CATEGORY}" — cite the specific use-case (e.g. "Packages e-commerce orders into
+    shipping cartons" / "Imports food products that need outer cartons for distribution").
+  "target_category_reason": short snake_case code: "core_input" | "auxiliary" | "adjacent" | "no_pathway"
+
+⚠ This is the most important field — it gates whether the lead is shown to the user.
+⚠ "Service" entity_role companies almost always = none/low for physical-goods categories.
+⚠ Be conservative: if you cannot articulate a specific procurement use-case, output "low" or "none".
+
+[ENTITY-ROLE DISAMBIGUATION — BUYER vs NON-BUYER]
+The following entity types are NEVER direct buyers regardless of industry relevance:
+1. Manufacturers/producers of the SAME category: If a company MAKES "${TARGET_CATEGORY}", it is the SELLER,
+   not the buyer. E.g. searching "stainless steel tableware" — a tableware manufacturer is the seller.
+   → Assign target_category_match: "none", target_category_reason: "no_pathway"
+2. Trade associations / federations / councils / membership organizations: The ASSOCIATION ITSELF does not
+   procure the category — only its member companies do. E.g. "International Foodservice Distributors
+   Association" represents distributors but does NOT buy tableware itself.
+   → Assign target_category_match: "none", target_category_reason: "no_pathway"
+3. Freight / logistics / customs broker companies: They transport goods, not purchase them.
+   → Assign target_category_match: "none" or "low", target_category_reason: "no_pathway"
+4. Market research / industry analytics firms: They produce reports, not physical goods.
+   → Assign target_category_match: "none", target_category_reason: "no_pathway"
+
+⚠ CRITICAL disambiguation: "entity ITSELF directly procures" = buyer (target_category_match: high/medium)
+   "its members / clients / served parties procure" ≠ that entity is a buyer (target_category_match: none)
+⚠ Verify entity_role field BEFORE assigning target_category_match — Manufacturer entities are sellers
+   for the same category they produce.`
+            : '';
+
+        const reverseVerifyJsonHint = (TARGET_CATEGORY && !IS_SUPPLIER_MODE)
+            ? `,"target_category_match":"...","target_category_evidence":"...","target_category_reason":"..."`
+            : '';
+
         const prompt = `You are a Supply Chain Intelligence AI. Analyze each company and produce a structured L3 procurement inference.
 
 Rules:
@@ -103,10 +173,10 @@ Rules:
 4. confidence_tier: "High" (role is unambiguous), "Medium" (probable), "Low" (guessed).
 5. intent_summary: one English sentence — "<Name> is a <role> that procures <top materials> from upstream suppliers."
 6. purchase_cycle: "weekly" | "monthly" | "quarterly" | "annual" — best estimate.
-7. reason_codes: non-empty array from ["BOM_INFERENCE","ENTITY_ROLE_MANUFACTURER","ENTITY_ROLE_WHOLESALER","ENTITY_ROLE_RETAILER","ENTITY_ROLE_SERVICE","SUPPLY_CHAIN_GRAPH"].
+7. reason_codes: non-empty array from ["BOM_INFERENCE","ENTITY_ROLE_MANUFACTURER","ENTITY_ROLE_WHOLESALER","ENTITY_ROLE_RETAILER","ENTITY_ROLE_SERVICE","SUPPLY_CHAIN_GRAPH"].${reverseVerifyBlock}
 
 Output strict JSON only:
-{"results":[{"name":"Exact Company Name","entity_role":"...","confidence_tier":"...","primary_materials_top3":["...","...","..."],"procurement_items":[{"category":"...","priority":1,"source":"bom","type":"explicit"}],"intent_summary":"...","purchase_cycle":"...","reason_codes":["..."]}]}
+{"results":[{"name":"Exact Company Name","entity_role":"...","confidence_tier":"...","primary_materials_top3":["...","...","..."],"procurement_items":[{"category":"...","priority":1,"source":"bom","type":"explicit"}],"intent_summary":"...","purchase_cycle":"...","reason_codes":["..."]${reverseVerifyJsonHint}}]}
 
 Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet || '').slice(0, 120) })))}`;
 
@@ -118,6 +188,8 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                 label: `step3/L3.b${batchIndex}`,
                 openaiApiKey: OPENAI_KEY,
                 openaiModel:  OPENAI_MODEL,
+                claudeApiKey: CLAUDE_KEY,
+                claudeModel:  CLAUDE_MODEL,
             });
         } catch (e) {
             console.warn(`[step3] L3 batch ${batchIndex}/${batchTotal} FAILED after ${Date.now() - startedAt}ms: ${e.message}`);
@@ -140,6 +212,20 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                 : [];
             if (r.entity_role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
             else if (r.entity_role === 'Wholesaler' || r.entity_role === 'Retailer') lead.confidence_score = (lead.confidence_score || 50) + 10;
+            // 业态画像树工程：反向验证字段（仅在 DISCOVERY_CATEGORY 注入时由 LLM 输出）
+            // 写入 inference_breakdown 既有 JSON，无需 schema 变更；step5 闸门读这里。
+            const reverseMatchRaw = String(r.target_category_match || '').toLowerCase();
+            const reverseMatch = ['high', 'medium', 'low', 'none'].includes(reverseMatchRaw)
+                ? reverseMatchRaw
+                : null;
+            const reverseEvidence = typeof r.target_category_evidence === 'string'
+                ? r.target_category_evidence.trim().slice(0, 120)
+                : '';
+            const reverseReasonRaw = String(r.target_category_reason || '').toLowerCase();
+            const reverseReason = ['core_input', 'auxiliary', 'adjacent', 'no_pathway'].includes(reverseReasonRaw)
+                ? reverseReasonRaw
+                : null;
+
             lead.inference_breakdown = {
                 category:               lead.inferred_bom[0] || null,
                 entity_role:            r.entity_role,
@@ -153,9 +239,14 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                       )
                     : [],
                 intent_summary:         r.intent_summary || '',
-                purchase_cycle:         r.purchase_cycle || 'quarterly',
+                purchase_cycle:         normalizePurchaseCycle(r.purchase_cycle) || 'quarterly',
                 reason_codes:           Array.isArray(r.reason_codes) ? r.reason_codes : ['BOM_INFERENCE'],
-                model_version:          'v8-gemini-l3-v1',
+                // ── 业态画像树反向验证（target_category_* 仅在 worker 注入了 DISCOVERY_CATEGORY 时填充）──
+                target_category:        process.env.DISCOVERY_CATEGORY || null,
+                target_category_match:  reverseMatch,        // 'high'|'medium'|'low'|'none'|null
+                target_category_evidence: reverseEvidence || null,
+                target_category_reason: reverseReason,       // 'core_input'|'auxiliary'|'adjacent'|'no_pathway'|null
+                model_version:          'v8-gemini-l3-v2',   // bump：新增反向验证字段
                 demand_source:          'inferred',
                 graph_snapshot_version: 'v1',
                 created_at:             now,
@@ -222,8 +313,9 @@ function normalizeWhatsApp(raw) {
     return digits.startsWith('+') ? digits : `+${digits}`;
 }
 
-// ─── HTML 字段提取（邮箱、电话、WhatsApp 专项提取）────────────────────────
-const extractFromHTML = (html, emails, phones) => {
+// ─── HTML 字段提取（邮箱、电话、WhatsApp、公开社媒主页 URL 一并抽取）─────
+// 买家抓取矩阵 Batch 3：socials 为 Set<string>，每次合并；不传时仅抽 email/phone（向后兼容）
+const extractFromHTML = (html, emails, phones, socials) => {
     const $ = cheerio.load(html);
 
     $('a[href^="mailto:"]').each((_, el) => {
@@ -256,26 +348,96 @@ const extractFromHTML = (html, emails, phones) => {
         const em = m[1].toLowerCase();
         if (!em.endsWith('.png') && !em.endsWith('.jpg') && !em.endsWith('.jpeg')) emails.add(em);
     }
+
+    if (socials instanceof Set) {
+        try {
+            const urls = extractSocialUrls($, html);
+            for (const u of urls) socials.add(u);
+        } catch (_) { /* social extraction is opportunistic */ }
+    }
 };
 
-/**
- * 快速 contact 解析：step1 字段 + 域名缓存，不启动 Playwright。
- * @returns {{ lead: object, needsBrowser: boolean }}
- */
-function resolveContactFast(lead) {
+// ─── Google Places API：按公司名称查电话 + 官网（节省 Playwright 资源）────────
+// 策略：有 GMAPS_KEY + 公司名 → findplacefromtext，命中返回 {phone, website}
+// 无 key 或查无 → null（不阻塞主流程）
+const https2 = require('https');
+function httpsGetStep3(url) {
+    return new Promise(resolve => {
+        https2.get(url, r => {
+            let data = ''; r.on('data', c => data += c);
+            r.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
+        }).on('error', () => resolve({}));
+    });
+}
+
+async function lookupContactViaGooglePlaces(companyName, countryIso) {
+    if (!GMAPS_KEY || !companyName) return null;
+    try {
+        const q = encodeURIComponent(`${companyName}${countryIso ? ' ' + countryIso : ''}`);
+        const findUrl = `https://maps.googleapis.com/maps/api/place/findplacefromtext/json`
+            + `?input=${q}&inputtype=textquery`
+            + `&fields=place_id,name,business_status`
+            + `&key=${GMAPS_KEY}`;
+        const findRes = await httpsGetStep3(findUrl);
+        if (findRes.status !== 'OK' || !findRes.candidates?.length) return null;
+
+        const placeId = findRes.candidates[0].place_id;
+        if (!placeId) return null;
+
+        const detUrl = `https://maps.googleapis.com/maps/api/place/details/json`
+            + `?place_id=${encodeURIComponent(placeId)}`
+            + `&fields=name,formatted_phone_number,website,business_status`
+            + `&key=${GMAPS_KEY}`;
+        const detRes = await httpsGetStep3(detUrl);
+        if (detRes.status !== 'OK' || !detRes.result) return null;
+
+        const r = detRes.result;
+        const phone   = r.formatted_phone_number || null;
+        const website = r.website || null;
+        if (!phone && !website) return null;
+        return { phone, website, business_status: r.business_status || null, source: 'google_places' };
+    } catch (_) { return null; }
+}
+
+async function extractContactForLead(lead, contexts) {
     let score = lead.confidence_score || 50;
     lead.primary_email = lead.primary_email || lead.email || null;
     lead.primary_phone = lead.primary_phone || lead.phone || null;
 
+    // step1 已带齐联系方式时跳过 GMaps / Playwright
     if (lead.primary_email && lead.primary_phone) {
         score += 30;
         if (lead.pillar?.includes('LBS')) score += 15;
         lead.confidence_score = Math.min(score, 100);
-        return { lead, needsBrowser: false };
+        return lead;
     }
 
-    const domainStr = String(lead.domain || '');
-    if (domainStr.startsWith('http')) {
+    // ── ❶ Google Places API 预填充（比 Playwright 快 10-50x，节省代理配额）────
+    // 只对还缺电话/官网的 lead 执行，且必须有公司名
+    if (GMAPS_KEY && lead.company_name && (!lead.primary_phone || !lead.domain)) {
+        const gmapsResult = await lookupContactViaGooglePlaces(lead.company_name, lead.country_iso || '');
+        if (gmapsResult) {
+            if (gmapsResult.phone && !lead.primary_phone) {
+                lead.primary_phone = gmapsResult.phone;
+                score += 20;
+            }
+            if (gmapsResult.website && !lead.domain) {
+                lead.domain = gmapsResult.website;
+                score += 15;
+            }
+            if (gmapsResult.business_status === 'OPERATIONAL') score += 10;
+            lead._gmaps_contact_filled = true;
+            console.log(`[step3] Google Places prefill: ${lead.company_name} → phone=${gmapsResult.phone || 'none'} website=${gmapsResult.website || 'none'}`);
+            // 如果电话和官网都补全了，跳过 Playwright（大幅节约时间）
+            if (lead.primary_phone && lead.domain) {
+                lead.confidence_score = Math.min(score, 100);
+                return lead;
+            }
+        }
+    }
+
+    // ── 缓存命中：跳过 Playwright，直接使用已缓存的联系方式 ──────────────────
+    if (lead.domain && lead.domain.startsWith('http')) {
         const cached = getCachedContact(lead.domain);
         if (cached) {
             if (cached.primary_email && !lead.primary_email) lead.primary_email = cached.primary_email;
@@ -287,31 +449,19 @@ function resolveContactFast(lead) {
                 score = Math.min(score, 85);
             }
             lead.confidence_score = Math.min(score, 100);
-            const stillNeed = !(lead.primary_email && lead.primary_phone);
-            return { lead, needsBrowser: stillNeed };
+            return lead; // 命中缓存，跳过 Playwright
         }
     }
 
-    if (domainStr.startsWith('http') && !lead.primary_email && !lead.primary_phone) {
-        lead.confidence_score = Math.min(score, 85);
-        return { lead, needsBrowser: true };
-    }
-
-    lead.confidence_score = Math.min(score, 100);
-    return { lead, needsBrowser: false };
-}
-
-async function extractContactForLead(lead, contexts) {
-    const { lead: fastLead, needsBrowser } = resolveContactFast({ ...lead });
-    Object.assign(lead, fastLead);
-    if (!needsBrowser) return lead;
-
-    let score = lead.confidence_score || 50;
     if (lead.domain && lead.domain.startsWith('http')) {
         const isFb = lead.domain.includes('facebook.com');
         const ctx  = isFb ? contexts.mobile : contexts.desktop;
-        const emails = new Set();
-        const phones = new Set();
+        const emails  = new Set();
+        const phones  = new Set();
+        // 买家抓取矩阵：matrix.include_social_profiles=false 时跳过社媒 URL 聚合以节省时间
+        const socials = MATRIX_INCLUDE_SOCIAL
+            ? new Set(Array.isArray(lead.social_profile_urls) ? lead.social_profile_urls : [])
+            : null;
         let page;
         try {
             page = await ctx.newPage();
@@ -319,10 +469,10 @@ async function extractContactForLead(lead, contexts) {
                 let fbUrl = lead.domain.replace('www.facebook.com', 'mbasic.facebook.com');
                 if (!fbUrl.includes('/groups/') && !fbUrl.includes('/share/') && !fbUrl.includes('/about')) fbUrl = fbUrl.replace(/\/$/, '') + '/about';
                 await page.goto(fbUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
-                extractFromHTML(await page.content(), emails, phones);
+                extractFromHTML(await page.content(), emails, phones, socials);
             } else {
                 await page.goto(lead.domain, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
-                extractFromHTML(await page.content(), emails, phones);
+                extractFromHTML(await page.content(), emails, phones, socials);
                 try {
                     const contactHref = await page.evaluate(() => {
                         const anchors = Array.from(document.querySelectorAll('a[href]'));
@@ -333,7 +483,7 @@ async function extractContactForLead(lead, contexts) {
                     if (contactHref) {
                         const contactUrl = contactHref.startsWith('http') ? contactHref : new URL(contactHref, lead.domain).href;
                         await page.goto(contactUrl, { waitUntil: 'domcontentloaded', timeout: PLAYWRIGHT_TIMEOUT });
-                        extractFromHTML(await page.content(), emails, phones);
+                        extractFromHTML(await page.content(), emails, phones, socials);
                     }
                 } catch (_) { /* contact page unreachable — ignore */ }
             }
@@ -346,7 +496,12 @@ async function extractContactForLead(lead, contexts) {
         if (emails.size > 0) lead.primary_email = Array.from(emails)[0];
         const cleanPhones = Array.from(phones).filter(p => p.length < 20);
         if (cleanPhones.length > 0) lead.primary_phone = cleanPhones[0];
+        // 买家抓取矩阵：仅在 includeSocial=true 时写 social_profile_urls
+        if (MATRIX_INCLUDE_SOCIAL && socials instanceof Set && socials.size > 0) {
+            lead.social_profile_urls = [...socials].slice(0, 8);
+        }
 
+        // 写入缓存（无论是否找到联系方式，避免下次重复爬取）
         setCachedContact(lead.domain, lead.primary_email, lead.primary_phone);
 
         if (lead.primary_email || lead.primary_phone) console.log(`[step3] Enriched: ${lead.company_name} | ${lead.primary_email || ''}`);
@@ -359,37 +514,63 @@ async function extractContactForLead(lead, contexts) {
         score = Math.min(score, 85);
     }
     lead.confidence_score = Math.min(score, 100);
+
+    // ─── 5 层兜底 enricher（仅在 Playwright + GMaps 都空时启用） ───────────
+    // 旧实现到此为止：contact 全空就放过，下游 quality_gate 因 procurementSignalCount>0
+    // 仍放它进 L1 → 用户看到"信息薄 0 + 优质 30 分"的欺骗卡。
+    // 现接入 v8_lib_contact_enricher 的 5 层管道：直连 → 代理 → BFS → LLM → Serper
+    // 任一层抓到就回填 primary_email/primary_phone；总 budget ~30s 控成本。
+    if (!lead.primary_email && !lead.primary_phone && lead.domain) {
+        try {
+            const enr = await enrichContactsForLead({
+                domain: lead.domain,
+                company_name: lead.company_name,
+                primary_email: lead.primary_email,
+                primary_phone: lead.primary_phone,
+            });
+            if (enr.filled) {
+                if (!lead.primary_email && enr.primary_email) lead.primary_email = enr.primary_email;
+                if (!lead.primary_phone && enr.primary_phone) lead.primary_phone = enr.primary_phone;
+                if (enr.primary_whatsapp) lead.primary_whatsapp = enr.primary_whatsapp;
+                lead._enricher_via = enr.via;
+                if (enr.llm_persons && enr.llm_persons.length > 0) {
+                    lead._enricher_persons = enr.llm_persons;
+                }
+                lead.confidence_score = Math.min((lead.confidence_score || 0) + 25, 100);
+                // 写缓存避免下次重抓
+                setCachedContact(lead.domain, lead.primary_email, lead.primary_phone);
+                console.log(`[step3] 5-layer enricher filled (${enr.via}): ${lead.company_name} | ${lead.primary_email || ''} | ${lead.primary_phone || ''}`);
+            } else {
+                lead._enricher_via = enr.via; // 'no_domain' | 'none' 等
+                if (enr.any_blocked) lead._enricher_any_blocked = true;
+            }
+        } catch (e) {
+            // 兜底失败一律安静吞，不影响主链
+            console.warn(`[step3] 5-layer enricher exception for ${lead.company_name}:`, e && e.message ? e.message : String(e));
+        }
+    }
     return lead;
 }
 
-/** P0-B：L3 与 contact 并行后按 index 合并（两路写不同字段，无竞态）。 */
-function mergeL3AndContact(original, l3Leads, contactLeads) {
-    return original.map((orig, i) => {
-        const l3 = l3Leads[i] || orig;
-        const contact = contactLeads[i] || orig;
-        return {
-            ...orig,
-            entity_role: l3.entity_role ?? orig.entity_role,
-            inferred_bom: l3.inferred_bom ?? orig.inferred_bom,
-            inference_breakdown: l3.inference_breakdown ?? orig.inference_breakdown,
-            confidence_score: contact.confidence_score ?? l3.confidence_score ?? orig.confidence_score,
-            primary_email: contact.primary_email ?? orig.primary_email,
-            primary_phone: contact.primary_phone ?? orig.primary_phone,
-        };
-    });
-}
+async function run() {
+    let leads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
+    if (SKIP_L3_INFERENCE) {
+        console.log('[step3] SKIP_L3_INFERENCE=true, skipping L3 inference and only extracting contacts.');
+    } else {
+        leads = await inferL3SupplyChain(leads);
+    }
 
-async function launchStep3Browser() {
     let browser;
     if (USE_BRD_SB) {
         if (!BRD_SB_WSS) { console.error('[step3] USE_BRD_SB=true but BRD_SB_WSS not set'); process.exit(1); }
         console.log('[step3] Using BrightData Scraping Browser via CDP (反检测最强模式)');
         browser = await chromium.connectOverCDP(BRD_SB_WSS);
     } else {
+        // ── 启动参数：隐藏自动化特征，绕过 Cloudflare / Akamai 基础检测 ─────────
         const launchOptions = {
             headless: true,
             args: [
-                '--disable-blink-features=AutomationControlled',
+                '--disable-blink-features=AutomationControlled',  // 最关键：隐藏自动化标识
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
@@ -401,7 +582,7 @@ async function launchStep3Browser() {
                 '--disable-infobars',
                 '--disable-extensions',
             ],
-            ignoreDefaultArgs: ['--enable-automation'],
+            ignoreDefaultArgs: ['--enable-automation'],           // 移除 Playwright 默认的自动化标志
         };
         if (USE_PROXY) {
             if (!BRD_USER || !BRD_PASS) { console.error('[step3] USE_PROXY=true but BRD_USER/BRD_PASS not set'); process.exit(1); }
@@ -409,6 +590,7 @@ async function launchStep3Browser() {
             launchOptions.proxy = { server: BRD_PROXY, username: BRD_USER, password: BRD_PASS };
         } else {
             console.warn('[step3] ⚠️  USE_PROXY=false：使用本机IP。欧美大企业站点可能被 Cloudflare 拦截。');
+            console.warn('[step3] ⚠️  建议：设置 USE_PROXY=true + BRD_USER/BRD_PASS 以启用住宅IP代理。');
         }
         try {
             browser = await chromium.launch(launchOptions);
@@ -419,17 +601,15 @@ async function launchStep3Browser() {
                     'node ' + require('path').join(__dirname, 'node_modules', '.bin', 'playwright') + ' install chromium',
                     { stdio: 'inherit' }
                 );
+                console.log("[step3] Chromium install complete — retrying launch...");
                 browser = await chromium.launch(launchOptions);
             } else {
                 throw launchErr;
             }
         }
     }
-    return browser;
-}
 
-async function runContactExtraction(leads) {
-    const browser = await launchStep3Browser();
+    // ── 反检测 Context 配置：随机 UA + 视口 + 语言头 + stealth 脚本注入 ─────────
     const desktopUA = pick(UA_POOL_DESKTOP);
     const mobileUA  = pick(UA_POOL_MOBILE);
     const viewport  = pick(VIEWPORT_POOL);
@@ -459,8 +639,11 @@ async function runContactExtraction(leads) {
         },
     });
 
+    // ── stealth 脚本：在每个页面加载前注入，覆盖 Playwright 暴露的机器人标识 ────
     await desktopCtx.addInitScript(STEALTH_INIT_SCRIPT);
     await mobileCtx.addInitScript(STEALTH_INIT_SCRIPT);
+
+    console.log(`[step3] Browser ready. UA=${desktopUA.slice(0, 60)}...`);
 
     console.log(`[step3] Contact extraction over ${leads.length} leads, page concurrency=${PAGE_CONCURRENCY}, page timeout=${PLAYWRIGHT_TIMEOUT}ms`);
     const overallStart = Date.now();
@@ -471,92 +654,14 @@ async function runContactExtraction(leads) {
     );
 
     await browser.close();
-    flushDomainCache();
+    flushDomainCache(); // 持久化本次抓取结果到缓存文件
 
+    // pMap may return Error instances if any worker threw — keep success rows only.
     const finalLeads = enriched.filter(x => x && !(x instanceof Error));
     const contactHit = finalLeads.filter(l => l.primary_email || l.primary_phone).length;
-    console.log(`[step3] Contact track done — hit=${contactHit}/${finalLeads.length} in ${Date.now() - overallStart}ms`);
-    return finalLeads;
-}
 
-async function runDeferredContactPath(rawLeads) {
-    const wallStart = Date.now();
-    const l3Out = await inferL3SupplyChain(JSON.parse(JSON.stringify(rawLeads)));
-    const deferred = [];
-    const finalLeads = l3Out.map((l) => {
-        const { lead, needsBrowser } = resolveContactFast({ ...l });
-        if (needsBrowser) deferred.push(lead);
-        return lead;
-    });
-
-    let enqueued = 0;
-    if (deferred.length > 0) {
-        const { getSupabase, enqueueDeferredContacts } = require('./v8_supabase_enrichment_queue');
-        const supabase = getSupabase();
-        if (supabase) {
-            const res = await enqueueDeferredContacts(
-                supabase,
-                deferred,
-                process.env.DISCOVERY_JOB_ID || null,
-            );
-            enqueued = res.enqueued || 0;
-            console.log(`[step3] P1-C: deferred ${enqueued}/${deferred.length} leads to discovery_enrichment_queue`);
-        } else {
-            console.warn('[step3] P1-C: supabase env missing, cannot enqueue deferred contacts');
-        }
-    }
-
-    const contactHit = finalLeads.filter(l => l.primary_email || l.primary_phone).length;
-    const { patchFunnelStep } = require('./v8_discovery_funnel');
-    await patchFunnelStep('step3', {
-        label: 'L3 + deferred contact',
-        input: rawLeads.length,
-        contact_hit: contactHit,
-        deferred_contact: enqueued,
-        wall_ms: Date.now() - wallStart,
-    });
-
-    return finalLeads;
-}
-
-async function run() {
-    const rawLeads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
-    let finalLeads;
-
-    if (SKIP_L3_INFERENCE) {
-        console.log('[step3] SKIP_L3_INFERENCE=true, skipping L3 inference and only extracting contacts.');
-        finalLeads = await runContactExtraction(rawLeads);
-    } else if (STEP3_DEFER_CONTACT) {
-        console.log('[step3] P1-C: L3 only + fast contact; Playwright deferred to discovery_enrichment_queue');
-        finalLeads = await runDeferredContactPath(rawLeads);
-    } else if (STEP3_L3_CONTACT_PARALLEL) {
-        const leadsForL3 = JSON.parse(JSON.stringify(rawLeads));
-        const leadsForContact = JSON.parse(JSON.stringify(rawLeads));
-        const wallStart = Date.now();
-        console.log('[step3] P0-B: L3 supply-chain inference ∥ Playwright contact extraction (parallel)');
-        const [l3Out, contactOut] = await Promise.all([
-            inferL3SupplyChain(leadsForL3),
-            runContactExtraction(leadsForContact),
-        ]);
-        finalLeads = mergeL3AndContact(rawLeads, l3Out, contactOut);
-        console.log(`[step3] Parallel merge wall=${Date.now() - wallStart}ms`);
-    } else {
-        const l3Out = await inferL3SupplyChain(rawLeads);
-        finalLeads = await runContactExtraction(l3Out);
-    }
-
-    const contactHit = finalLeads.filter(l => l.primary_email || l.primary_phone).length;
     fs.writeFileSync(outputFile, JSON.stringify(finalLeads, null, 2));
-    console.log(`[step3] Done — ${finalLeads.length} enriched leads (contact_hit=${contactHit}, hit_rate=${Math.round(contactHit / Math.max(finalLeads.length, 1) * 100)}%) → ${outputFile}`);
+    console.log(`[step3] Done — ${finalLeads.length} enriched leads (contact_hit=${contactHit}, hit_rate=${Math.round(contactHit/finalLeads.length*100)}%) in ${Date.now() - overallStart}ms → ${outputFile}`);
 }
 
-if (require.main === module) {
-    run().catch(e => { console.error('[step3] fatal:', e); process.exit(1); });
-}
-
-module.exports = {
-    inferL3SupplyChain,
-    runContactExtraction,
-    resolveContactFast,
-    mergeL3AndContact,
-};
+run().catch(e => { console.error('[step3] fatal:', e); process.exit(1); });

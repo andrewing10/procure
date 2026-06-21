@@ -7,12 +7,20 @@ services:
     startCommand: node v8_discovery_worker.js
     envVars:
       # ── LLM ──────────────────────────────────────────────────────────
+      # 与 zhimao apps/web/lib/search/llmClient.ts 对齐（业态画像树工程标准）
+      # 三家级联：Gemini → Claude → OpenAI；每家有 multi-model fallback chain
       - key: GEMINI_KEY
         sync: false
       - key: GEMINI_MODEL
         value: "gemini-3.1-pro-preview"
       - key: GEMINI_FAST_MODEL
         value: "gemini-3.1-flash-lite"
+      # Claude 兜底（用户指令 2026-05-20：Gemini 之后 / OpenAI 之前）
+      # ANTHROPIC_API_KEY 与 zhimao Vercel 部署使用同一把 key（去 Render Dashboard 填）
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: "claude-sonnet-4-6"
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL
@@ -51,6 +59,12 @@ services:
       # ── 运行模式 ────────────────────────────────────────────────────
       - key: SKIP_SQLITE
         value: "true"
+      # ── ICP 质量闸门 ─────────────────────────────────────────────────
+      # soft     → 只丢 industry_match=none（默认）；保留 low（相邻行业真实进口商）
+      # balanced → 丢 low+none（过于激进，量损失 30-40%，不建议）
+      # off      → 全量进 L1
+      - key: ICP_MATCH_THRESHOLD
+        value: "soft"
       - key: PLAYWRIGHT_TIMEOUT
         value: "12000"
       - key: STEP3_PAGE_CONCURRENCY

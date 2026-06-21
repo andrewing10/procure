@@ -14,17 +14,27 @@
 
 require('./load-env');
 const fs    = require('fs');
-const https = require('https');
+const { callGeminiJson } = require('./v8_lib_concurrency');
 
 const TAXONOMY_PATH   = 'zhimao_global_taxonomy.json';
 const ECONOMICS_PATH  = 'zhimao_supply_chain_economics.json';
 const COEFF_PATH      = 'zhimao_l3_coefficients_v2.json';
 const GEMINI_KEY      = process.env.GEMINI_KEY;
 const GEMINI_MODEL    = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+const OPENAI_KEY      = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL    = process.env.OPENAI_MODEL || 'gpt-5.5';
+const CLAUDE_KEY      = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
+const CLAUDE_MODEL    = process.env.ANTHROPIC_MODEL   || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 const FORCE           = process.argv.includes('--force');
 const DELAY_MS        = parseInt(process.env.BUILDER_DELAY_MS || '2000', 10);
 
-if (!GEMINI_KEY) { console.error('[builder] GEMINI_KEY is required'); process.exit(1); }
+if (!GEMINI_KEY && !CLAUDE_KEY && !OPENAI_KEY) {
+    console.error('[builder] GEMINI_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY at least one required');
+    process.exit(1);
+}
+if (!GEMINI_KEY) {
+    console.warn('[builder] GEMINI_KEY not set — will use Claude/OpenAI fallback for industry knowledge generation.');
+}
 
 // ── NAICS3 mapping for coefficient table ────────────────────────────────────
 const NAICS3_MAP = {
@@ -40,44 +50,22 @@ const NAICS3_MAP = {
     'Chemicals':             '325',
 };
 
-// ── Gemini helper (with retry for 503/429) ──────────────────────────────────
-const GEMINI_RETRIES  = 4;
-const GEMINI_RETRY_MS = 8000;
-
-async function callGemini(prompt, attempt = 1) {
-    const reqData = JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
+// ── LLM 调用：与 zhimao apps/web 业态画像树工程对齐，统一走 callGeminiJson ──
+// 三家级联：Gemini (pro-preview，知识库构造对质量要求高) → Claude sonnet-4-6 → OpenAI gpt-5.5
+// callGeminiJson 内部已有 maxRetries（500/503/429 自动指数退避）+ multi-model fallback chain
+async function callGemini(prompt) {
+    return callGeminiJson(prompt, {
+        apiKey: GEMINI_KEY,
+        model: GEMINI_MODEL,
+        temperature: 0.2,
+        timeoutMs: 60_000,
+        maxRetries: 4,
+        label: 'builder/industry-knowledge',
+        openaiApiKey: OPENAI_KEY,
+        openaiModel: OPENAI_MODEL,
+        claudeApiKey: CLAUDE_KEY,
+        claudeModel: CLAUDE_MODEL,
     });
-    const raw = await new Promise((resolve, reject) => {
-        const req = https.request({
-            hostname: 'generativelanguage.googleapis.com',
-            path:     `/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
-            method:   'POST',
-            headers:  { 'Content-Type': 'application/json' },
-        }, res => {
-            let body = '';
-            res.on('data', c => body += c);
-            res.on('end', () => resolve({ status: res.statusCode, body }));
-        });
-        req.on('error', reject);
-        req.write(reqData);
-        req.end();
-    });
-
-    // Retry on transient server errors (503 overload, 429 rate limit)
-    if ((raw.status === 503 || raw.status === 429) && attempt <= GEMINI_RETRIES) {
-        const wait = GEMINI_RETRY_MS * attempt;
-        console.log(`[builder]   ↻ HTTP ${raw.status}, retry ${attempt}/${GEMINI_RETRIES} in ${wait}ms...`);
-        await sleep(wait);
-        return callGemini(prompt, attempt + 1);
-    }
-
-    const parsed = JSON.parse(raw.body);
-    if (!parsed.candidates) {
-        throw new Error(`Gemini error: ${JSON.stringify(parsed.error || raw.body.slice(0, 200))}`);
-    }
-    return JSON.parse(parsed.candidates[0].content.parts[0].text);
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }

@@ -14,9 +14,17 @@ const Database = require('better-sqlite3');
 const { createClient } = require('@supabase/supabase-js');
 const { directIngestQualifiedLeads } = require('./v8_direct_l1_ingest');
 const { mirrorBuyerPersonsFromLeads } = require('./v8_buyer_persons_mirror');
-const { evaluateLead } = require('./v8_quality_gate');
+const { evaluateLead, evaluateLeadSupplier, isNegativeKeywordHit } = require('./v8_quality_gate');
+const { appendFunnelStep } = require('./v8_lib_funnel');
+const { enqueueEnrichmentLeads } = require('./v8_lib_enrichment_supabase');
+const { readIncrementalBlacklist, readIcpContext } = require('./v8_lib_pillar0');
 
 const [inputFile, outputFile] = process.argv.slice(2);
+
+// P6 ICP context（从 PILLAR0_PAYLOAD.icp_context 读取，submit/route.ts P5 注入）
+const ICP_CTX = readIcpContext();
+const IS_SUPPLIER_MODE = ICP_CTX.direction === 'find_suppliers';
+const NEGATIVE_KEYWORDS = ICP_CTX.negativeKeywords; // string[]（已小写）
 
 const DISCOVERY_JOB_ID = process.env.DISCOVERY_JOB_ID || null;
 const SKIP_SQLITE = process.env.SKIP_SQLITE === 'true';
@@ -106,9 +114,12 @@ function applySourceBoost(lead) {
   ).length;
 
   if (dimensionCount >= 2) {
+    // 不再强制 >= 92。Combo 仅作为 +20 增量 boost，让 confidence_score 真实反映
+    // "contact 完整度 + L3 推断"——避免 BOL_SIGNAL（航运/海关数据）+ 流水号邮箱
+    // 这种"商业证据强但联系方式垃圾"的 lead 被强制拉到 92 误导用户。
+    // 商业证据强度由 quality_grade=premium 单独表达，与 score 解耦。
     const prev = Number(lead.confidence_score ?? 60) + total;
-    const forced = Math.max(prev, 92);
-    lead.confidence_score = Math.min(100, forced);
+    lead.confidence_score = Math.min(100, prev + 20);
     lead._combo_triggered = true;
     return lead;
   }
@@ -122,30 +133,173 @@ function applySourceBoost(lead) {
 
 const totalLeads = leads.length;
 const gradeStats = { premium: 0, qualified: 0, unqualified: 0 };
+// Batch A.4：ICP 闸门阈值
+//
+//   soft (默认)  → 只丢 none（明确无关，如房产中介、餐厅），保留 low/medium/high
+//   balanced     → 丢 low+none
+//   off          → 不拦截任何（全量进 L1，人工审核）
+//
+// 默认保持 soft：买家抓取场景中 industry_match=low 往往是采购频次低但真实进口的企业
+// （如物流公司采购纸箱、贸易商采购包装材料），balanced 会把它们整批丢弃。
+const ICP_THRESHOLD = String(process.env.ICP_MATCH_THRESHOLD || 'soft').toLowerCase();
+const icpStats = { high: 0, medium: 0, low: 0, none: 0, unset: 0 };
+
+// 目标国：从 worker 注入的 DISCOVERY_COUNTRY_ISO，用于校验 lead.country 是否一致。
+// 实测 (job 2ba18da6) 36 条 MY 结果中有 6 条是 US/DE/AU/CN，根因是 LLM 推断的国家与
+// 用户搜索目标国不一致仍然写入。这里做兜底过滤：跨国结果直接降级为 unqualified，
+// 不写入 L1（用户搜 MY 看到 CN 公司是核心错乱体验）。
+const TARGET_COUNTRY_ISO = String(process.env.DISCOVERY_COUNTRY_ISO || '').toUpperCase();
+
+// ── 业态画像树工程：反向验证闸门 ─────────────────────────────────────────────
+// step3 L3 prompt 已在 DISCOVERY_CATEGORY 注入时输出 target_category_match：
+//   high   → 该公司核心采购该品类（强买家）
+//   medium → 偶发性采购（弱买家但有意义）
+//   low    → 不太可能采购（业态相邻但无明确路径）
+//   none   → 明确不采购（服务业、不同供应链）
+// 闸门策略与 ICP 阈值对齐，但更激进：reverse-verify 失败直接判为 unqualified，
+// 因为这是 LLM 在拿到 company_name + snippet 后做的"是否会买"的反向推断，
+// 比 industry_match 更强、更直接。
+//
+// REVERSE_VERIFY_MODE：
+//   strict   → 丢 low + none（默认在 default category 时启用，建议生产）
+//   balanced → 仅丢 none
+//   off      → 不拦截（用户取消反向验证、调试用）
+const REVERSE_VERIFY_MODE = String(process.env.REVERSE_VERIFY_MODE || 'balanced').toLowerCase();
+const reverseStats = { high: 0, medium: 0, low: 0, none: 0, unset: 0 };
+const TARGET_CATEGORY_FROM_ENV = String(process.env.DISCOVERY_CATEGORY || '').trim();
+
 const validLeads = leads
   .map(applySourceBoost)
   .filter((lead) => {
-    if (!String(lead.country || '').trim()) return false;
-    const { qualified, grade } = evaluateLead(lead);
+    const leadCountry = String(lead.country || '').trim().toUpperCase();
+    if (!leadCountry) return false;
+
+    // 跨国校验：lead.country 与本次 job 目标国不一致 → 降级丢弃
+    // 例外：seed/HVC 类来源（pillar 0）是种子库反哺，允许跨国
+    if (TARGET_COUNTRY_ISO && leadCountry !== TARGET_COUNTRY_ISO) {
+      const isSeedSource = String(lead.pillar || '').match(/Pillar 0|Seed/i) || lead.verified_source_id;
+      if (!isSeedSource) {
+        lead._quality_grade = 'unqualified';
+        gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
+        return false;
+      }
+    }
+
+    // P6 负向关键词前置拦截（ICP grounding，优先于其他质量判断）
+    if (isNegativeKeywordHit(lead.company_name, lead.description || lead.snippet, NEGATIVE_KEYWORDS)) {
+      lead._quality_grade = 'unqualified';
+      lead.reject_codes = Array.isArray(lead.reject_codes)
+        ? [...lead.reject_codes, 'NEGATIVE_KEYWORD_HIT']
+        : ['NEGATIVE_KEYWORD_HIT'];
+      gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
+      return false;
+    }
+
+    // P6 方向感知评分：供应商模式用 evaluateLeadSupplier，买家模式沿用 evaluateLead。
+    // 2026-05-23：传 category（DISCOVERY_CATEGORY）启用 CATEGORY_B2C_WHITELIST，
+    //   面粉→bakery / 化妆品→spa / 海鲜→restaurant 等真买家不再被一刀切；
+    //   见 v8_quality_gate.js BIZ_ANTI_GROUPS + CATEGORY_B2C_WHITELIST 双仓镜像段。
+    const evalFn = IS_SUPPLIER_MODE ? evaluateLeadSupplier : evaluateLead;
+    const { qualified, grade } = evalFn(lead, TARGET_CATEGORY_FROM_ENV, NEGATIVE_KEYWORDS);
+    const matchRaw = String(lead.industry_match || '').toLowerCase();
+    const m = ['high', 'medium', 'low', 'none'].includes(matchRaw) ? matchRaw : 'unset';
+    icpStats[m] += 1;
+    // 闸门逻辑：
+    //   balanced → 丢 low + none
+    //   soft     → 只丢 none
+    //   off      → 不拦截
+    const shouldDrop =
+      (ICP_THRESHOLD === 'balanced' && (m === 'low' || m === 'none')) ||
+      (ICP_THRESHOLD === 'soft'     && m === 'none');
+    if (shouldDrop) {
+      lead._quality_grade = 'unqualified';
+      lead.reject_codes = Array.isArray(lead.reject_codes)
+        ? [...lead.reject_codes, 'ICP_MATCH_LOW']
+        : ['ICP_MATCH_LOW'];
+      gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
+      return false;
+    }
+
+    // ── 业态画像树反向验证闸门 ───────────────────────────────────────────────
+    // 仅在用户输入了 TARGET_CATEGORY 且 REVERSE_VERIFY_MODE != 'off' 时生效。
+    // 例外：seed/HVC 来源（pillar 0）跳过反向验证（已是种子库已验证企业）。
+    const isSeedSource =
+      String(lead.pillar || '').match(/Pillar 0|Seed/i) || lead.verified_source_id;
+    // P6b 供应商模式：反向验证是"该公司是否买家"的买家闸门，对供应商无意义且会误杀，跳过。
+    if (
+      TARGET_CATEGORY_FROM_ENV &&
+      REVERSE_VERIFY_MODE !== 'off' &&
+      !IS_SUPPLIER_MODE &&
+      !isSeedSource &&
+      lead.inference_breakdown &&
+      typeof lead.inference_breakdown === 'object'
+    ) {
+      const rmRaw = String(lead.inference_breakdown.target_category_match || '').toLowerCase();
+      const rm = ['high', 'medium', 'low', 'none'].includes(rmRaw) ? rmRaw : 'unset';
+      reverseStats[rm] += 1;
+      const reverseDrop =
+        (REVERSE_VERIFY_MODE === 'strict'   && (rm === 'low' || rm === 'none')) ||
+        (REVERSE_VERIFY_MODE === 'balanced' && rm === 'none');
+      if (reverseDrop) {
+        lead._quality_grade = 'unqualified';
+        lead.reject_codes = Array.isArray(lead.reject_codes)
+          ? [...lead.reject_codes, 'REVERSE_VERIFY_FAIL']
+          : ['REVERSE_VERIFY_FAIL'];
+        gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
+        return false;
+      }
+      // 通过反向验证：把 evidence 透传到 lead 顶层（给前端 lead 卡展示"为什么这家公司是买家"）
+      if (lead.inference_breakdown.target_category_evidence) {
+        lead.target_category_evidence = lead.inference_breakdown.target_category_evidence;
+      }
+      if (rm === 'medium' || rm === 'low') lead.needs_human_review = true;
+    } else if (TARGET_CATEGORY_FROM_ENV && !isSeedSource && !IS_SUPPLIER_MODE) {
+      // L3 没填反向验证（SKIP_L3_INFERENCE 或 LLM 失败）→ 计入 unset，不拦截
+      reverseStats.unset += 1;
+    }
+
     gradeStats[grade] = (gradeStats[grade] || 0) + 1;
     lead._quality_grade = grade;
+    if (m === 'medium') lead.needs_human_review = true;
     return qualified;
   });
 
 const droppedQuality = totalLeads - validLeads.length;
+const reverseLog = TARGET_CATEGORY_FROM_ENV
+  ? ` reverse(${REVERSE_VERIFY_MODE},${TARGET_CATEGORY_FROM_ENV})=high:${reverseStats.high} medium:${reverseStats.medium} low:${reverseStats.low} none:${reverseStats.none} unset:${reverseStats.unset}`
+  : '';
 if (droppedQuality > 0) {
   console.log(
-    `[step5] quality-gate veto: dropped ${droppedQuality}/${totalLeads} (unqualified). grade distribution: premium=${gradeStats.premium} qualified=${gradeStats.qualified} unqualified=${gradeStats.unqualified}`,
+    `[step5] quality-gate veto: dropped ${droppedQuality}/${totalLeads}. grade=premium:${gradeStats.premium} qualified:${gradeStats.qualified} unqualified:${gradeStats.unqualified}; icp=high:${icpStats.high} medium:${icpStats.medium} low:${icpStats.low} none:${icpStats.none} unset:${icpStats.unset} (threshold=${ICP_THRESHOLD})${reverseLog}`,
   );
 } else {
   console.log(
-    `[step5] quality-gate pass: ${validLeads.length}/${totalLeads}. premium=${gradeStats.premium} qualified=${gradeStats.qualified}`,
+    `[step5] quality-gate pass: ${validLeads.length}/${totalLeads}. premium=${gradeStats.premium} qualified=${gradeStats.qualified}; icp=high:${icpStats.high} medium:${icpStats.medium} unset:${icpStats.unset}${reverseLog}`,
   );
+}
+
+const supabaseEnrichmentQueue = [];
+let enqueueRejected = 0;
+
+// 2026-05-23 双仓修：判断 lead.domain 是否真的可作为后续 step3 contact 抓取的入口。
+// 旧逻辑只判 `lead.domain` truthy，导致 inferred 类 lead 给个 garbage 字符串（如 "/"、
+// "n/a"、纯白空格 trim 失败）也进 enrichment_queue，下游 worker 取出来跑 step3 立即返回
+// contact_hit=0 ——日志里出现的 6 条连续 0% hit + 53ms 早返回正是这个 case。
+function isUsableDomain(d) {
+  if (typeof d !== 'string') return false;
+  const cleaned = d.trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0];
+  if (!cleaned || cleaned.length < 4) return false;
+  if (!cleaned.includes('.')) return false;
+  if (/^[\d.]+$/.test(cleaned)) return true; // IPv4 字面量极少见但合法
+  // 至少有一个字母段，且不是 ".com"/"a.b" 这种短到不能用的
+  if (!/[a-z]/.test(cleaned)) return false;
+  return true;
 }
 
 validLeads.forEach((lead) => {
   const hasContact = !!(lead.primary_email || lead.primary_phone);
   const isHot = lead.confidence_score >= 90 && hasContact;
+  const usableDomain = isUsableDomain(lead.domain);
   if (isHot && insertMain) {
     insertMain.run(
       lead.company_name,
@@ -158,10 +312,25 @@ validLeads.forEach((lead) => {
       lead.pillar,
       new Date().toISOString(),
     );
-  } else if (lead.domain && insertQueue) {
+  } else if (usableDomain && insertQueue) {
     insertQueue.run(lead.company_name, lead.domain, lead.country || '', lead.confidence_score);
+  } else if (usableDomain && SKIP_SQLITE && !hasContact) {
+    supabaseEnrichmentQueue.push({
+      discovery_job_id: DISCOVERY_JOB_ID,
+      company_name: lead.company_name,
+      domain: lead.domain,
+      country_iso: String(lead.country || '').slice(0, 2).toUpperCase() || null,
+      payload_json: { confidence_score: lead.confidence_score, pillar: lead.pillar },
+    });
+  } else if (!usableDomain && !hasContact) {
+    // domain 不可用 + 无联系方式 → 入 enrichment_queue 也是浪费下游 worker 一次空转
+    enqueueRejected += 1;
   }
 });
+
+if (enqueueRejected > 0) {
+  console.log(`[step5] enrichment_queue: skipped ${enqueueRejected} leads (no usable domain — inferred-only with garbage host)`);
+}
 
 // ── 种子库反哺写回 ───────────────────────────────────────────────────────────
 (function writeSeedFeedback() {
@@ -212,55 +381,86 @@ validLeads.forEach((lead) => {
 })();
 
 (async () => {
-  let ingestResult = null;
   if (validLeads.length > 0) {
     console.log(`[step5] Supabase L1 ingest: ${validLeads.length} leads...`);
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
-    ingestResult = await directIngestQualifiedLeads(supabase, validLeads, {
+    // PR-DEDUP-CACHE L2-2 (2026-05-28)：增量补抓模式
+    //   zhimao submit route 在 action_type='incremental_search' 时注入
+    //   PILLAR0_PAYLOAD.incremental_mode + incremental_blacklist_company_ids，
+    //   此处解析后传入 ingest，命中黑名单的 company_id 不写映射（只更新 L1 主表）。
+    const incrementalCfg = readIncrementalBlacklist(null);
+    if (incrementalCfg.enabled) {
+      console.log(
+        `[step5] incremental mode: parent=${incrementalCfg.parentJobId || 'unknown'}, ` +
+          `blacklist=${incrementalCfg.blacklistSet.size}`,
+      );
+    }
+    const result = await directIngestQualifiedLeads(supabase, validLeads, {
       discoveryJobId: DISCOVERY_JOB_ID,
+      incrementalMode: incrementalCfg.enabled,
+      incrementalParentJobId: incrementalCfg.parentJobId,
+      incrementalBlacklistSet: incrementalCfg.blacklistSet,
     });
-    if (ingestResult.errors.length) {
-      console.warn('[step5] ingest messages:', JSON.stringify(ingestResult.errors.slice(0, 20)));
-      if (ingestResult.errors.length > 20) {
-        console.warn(`[step5] ... and ${ingestResult.errors.length - 20} more`);
+    if (incrementalCfg.enabled && (result.incrementalSkipped || 0) > 0) {
+      console.log(
+        `[step5] incremental: skipped ${result.incrementalSkipped} leads (already in parent job ${incrementalCfg.parentJobId})`,
+      );
+    }
+    if (result.errors.length) {
+      console.warn('[step5] ingest messages:', JSON.stringify(result.errors.slice(0, 20)));
+      if (result.errors.length > 20) {
+        console.warn(`[step5] ... and ${result.errors.length - 20} more`);
       }
     }
-    if (!ingestResult.ok) {
+    if (!result.ok) {
       console.error('[step5] Supabase L1 ingest failed (see L1 upsert errors above).');
       writeFallbackInbox(validLeads, 'supabase_l1_ingest_failed');
       process.exit(1);
     }
-    if (ingestResult.resolvedLeads < validLeads.length) {
+    if (result.resolvedLeads < validLeads.length) {
       console.warn(
-        `[step5] resolved ${ingestResult.resolvedLeads}/${validLeads.length} leads (some rows skipped or id lookup failed).`,
+        `[step5] resolved ${result.resolvedLeads}/${validLeads.length} leads (some rows skipped or id lookup failed).`,
       );
     }
     console.log(
-      `[step5] ingest ok: resolvedLeads=${ingestResult.resolvedLeads}, mappedLeads=${ingestResult.mappedLeads ?? ingestResult.resolvedLeads}, edgesWritten=${ingestResult.edgesWritten}`,
+      `[step5] ingest ok: resolvedLeads=${result.resolvedLeads}, edgesWritten=${result.edgesWritten}`,
     );
-
-    const persons = await mirrorBuyerPersonsFromLeads(
-      supabase,
-      ingestResult.resolvedPairs || [],
-    );
-    ingestResult.personsMirrored = persons.mirrored;
+    const persons = await mirrorBuyerPersonsFromLeads(supabase, result.resolvedPairs || []);
+    if (persons.mirrored > 0) {
+      console.log(`[step5] buyer_persons mirrored=${persons.mirrored}`);
+    }
+    if (supabaseEnrichmentQueue.length > 0) {
+      const n = await enqueueEnrichmentLeads(supabase, supabaseEnrichmentQueue);
+      if (n > 0) console.log(`[step5] Supabase enrichment_queue: +${n} rows`);
+    }
+    if (DISCOVERY_JOB_ID) {
+      appendFunnelStep(DISCOVERY_JOB_ID, 'step5', {
+        total_in: totalLeads,
+        valid_leads: validLeads.length,
+        l1_resolved: result.resolvedLeads,
+        dropped_quality: droppedQuality,
+        grade_stats: gradeStats,
+        icp_stats: icpStats,
+        enrichment_queued: supabaseEnrichmentQueue.length,
+        enrichment_queue_skipped: enqueueRejected,
+        incremental_mode: incrementalCfg.enabled,
+        incremental_parent_job_id: incrementalCfg.parentJobId,
+        incremental_blacklist_size: incrementalCfg.blacklistSet.size,
+        incremental_skipped: result.incrementalSkipped || 0,
+      });
+    }
   } else {
     console.log('[step5] No valid leads to persist.');
+    if (DISCOVERY_JOB_ID) {
+      appendFunnelStep(DISCOVERY_JOB_ID, 'step5', {
+        total_in: totalLeads,
+        valid_leads: 0,
+        dropped_quality: droppedQuality,
+      });
+    }
   }
-
-  const { patchFunnelStep } = require('./v8_discovery_funnel');
-  await patchFunnelStep('step5', {
-    label: 'Routing & Persistence',
-    input_total: totalLeads,
-    qualified: validLeads.length,
-    premium: gradeStats.premium,
-    l1_written: ingestResult?.resolvedLeads ?? 0,
-    mapped: ingestResult?.mappedLeads ?? ingestResult?.resolvedLeads ?? 0,
-    buyer_persons_mirrored: ingestResult?.personsMirrored ?? 0,
-  });
-
   fs.writeFileSync(outputFile, JSON.stringify({ status: 'success', db_injected: validLeads.length }, null, 2));
   console.log(`[step5] Done → ${outputFile}`);
 })();

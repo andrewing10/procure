@@ -136,62 +136,185 @@ async function requestJsonWithRetry({
     return { statusCode: 0, error: lastError, attempts: attempt };
 }
 
+// 与 zhimao apps/web/lib/search/llmClient.ts 对齐（业态画像树工程标准）
+// 实测见 zhimao apps/web/scripts/test-gemini-models.mjs（2026-05-20）：
+//   - gemini-3-flash-preview   ~1.4s ✓ 最快（默认 fallback 首位）
+//   - gemini-3.1-pro-preview   ~4.5s ✓ 但复杂 JSON schema 偶尔 >15s（30s timeout 覆盖）
+//   - gemini-2.5-flash         ~4.5s ✓ 第三档
+//   - gemini-2.5-pro           >12s timeout ✗ 已剔除
+//   - gemini-3.1-pro / gemini-3-pro   404 不存在
+const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+const GEMINI_MODEL_FALLBACK_CHAIN = [
+    DEFAULT_GEMINI_MODEL,
+    'gemini-3-flash-preview',
+    'gemini-3.1-pro-preview',
+    'gemini-2.5-flash',
+].filter((m, i, a) => m && a.indexOf(m) === i);
+
+// Claude fallback — 用户指令 2026-05-20：把 Claude 调到 Gemini 之后、OpenAI 之前
+// 用户钦定默认 model: claude-sonnet-4-6（性价比 + 稳定，2.3s）
+// 实测（zhimao apps/web/scripts/test-claude-openai-models.mjs）：
+//   - claude-sonnet-4-6 2.3s ✓ 默认
+//   - claude-opus-4-7   1.4s ✓ 最快质量兜底
+//   - claude-opus-4-6   1.7s ✓
+//   - claude-sonnet-4-5 1.5s ✓ 更便宜兜底
+//   - claude-sonnet-4-7 404 不存在
+const DEFAULT_CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
+const CLAUDE_MODEL_FALLBACK_CHAIN = [
+    DEFAULT_CLAUDE_MODEL,
+    'claude-sonnet-4-6',
+    'claude-opus-4-7',
+    'claude-opus-4-6',
+    'claude-sonnet-4-5',
+].filter((m, i, a) => m && a.indexOf(m) === i);
+
+function isGeminiModelUnavailableError(err) {
+    const msg = String(err?.message || err || '').toLowerCase();
+    return msg.includes('not found') || msg.includes('not supported') || msg.includes('is not found for api version');
+}
+
 // ─── callGeminiJson ─────────────────────────────────────────────────────────
-// 模型分级策略（按任务复杂度）：
-//   复杂任务（L3 供应链推断）→ GEMINI_MODEL=gemini-2.5-flash-preview-04-17（env 默认）
-//   简单任务（翻译/名称提取）→ GEMINI_FAST_MODEL=gemini-2.0-flash-lite（env 快速模式）
-//   所有 Gemini 失败后      → OpenAI gpt-4o 自动兜底（OPENAI_API_KEY）
+// Provider 优先级（用户指令 2026-05-20）：
+//   1. Gemini（GEMINI_MODEL，默认 gemini-3.1-pro-preview，含模型 fallback chain）
+//   2. Claude（ANTHROPIC_API_KEY，默认 claude-opus-4-7，含模型 fallback chain）← NEW
+//   3. OpenAI（OPENAI_API_KEY，默认 gpt-5.4）
 async function callGeminiJson(promptText, {
     apiKey,
-    model = 'gemini-2.5-flash-preview-04-17',
+    model = DEFAULT_GEMINI_MODEL,
     temperature = 0.1,
     timeoutMs = 60_000,
     maxRetries = 3,
     label = 'gemini',
     openaiApiKey = process.env.OPENAI_API_KEY || '',
-    // 兜底模型：gpt-4o（广泛可用）；如账户支持 gpt-5.5 可在 env 中覆盖
-    openaiModel  = process.env.OPENAI_MODEL    || 'gpt-4o',
+    // OpenAI 兜底：用户硬规则 GPT-5.4+
+    openaiModel  = process.env.OPENAI_MODEL    || 'gpt-5.4',
+    claudeApiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '',
+    claudeModel  = DEFAULT_CLAUDE_MODEL,
     disableFallback = false,
 } = {}) {
     if (!apiKey) throw new Error('GEMINI_KEY required');
 
-    // ── 1. 尝试 Gemini ────────────────────────────────────────────────────────
+    // ── 1. 尝试 Gemini（主模型 + 回退链）────────────────────────────────────────
     let geminiError = null;
-    try {
-        const reqBody = JSON.stringify({
-            contents: [{ parts: [{ text: promptText }] }],
-            generationConfig: { temperature, responseMimeType: 'application/json' },
-        });
-        const r = await requestJsonWithRetry({
-            hostname: 'generativelanguage.googleapis.com',
-            path: `/v1beta/models/${model}:generateContent?key=${apiKey}`,
-            method: 'POST',
-            body: reqBody,
-            timeoutMs,
-            maxRetries,
-            label,
-        });
-        if (r.error) throw new Error(`gemini_failed: ${r.error.message}`);
-        if (!r.json) throw new Error(`gemini_parse_failed: status=${r.statusCode}, body=${(r.raw || '').slice(0, 200)}`);
-        if (r.json.error) throw new Error(`gemini_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
-        const text = r.json?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (!text) throw new Error(`gemini_empty_candidate: status=${r.statusCode}`);
-        try { return JSON.parse(text); }
-        catch (e) { throw new Error(`gemini_text_not_json: ${e.message}; head=${String(text).slice(0, 200)}`); }
-    } catch (err) {
-        geminiError = err;
-        console.warn(`[${label}] Gemini failed (${err.message.slice(0, 120)})`);
+    const modelsToTry = [model, ...GEMINI_MODEL_FALLBACK_CHAIN].filter((m, i, a) => m && a.indexOf(m) === i);
+    for (const tryModel of modelsToTry) {
+        try {
+            const reqBody = JSON.stringify({
+                contents: [{ parts: [{ text: promptText }] }],
+                generationConfig: { temperature, responseMimeType: 'application/json' },
+            });
+            const r = await requestJsonWithRetry({
+                hostname: 'generativelanguage.googleapis.com',
+                path: `/v1beta/models/${tryModel}:generateContent?key=${apiKey}`,
+                method: 'POST',
+                body: reqBody,
+                timeoutMs,
+                maxRetries,
+                label: `${label}/${tryModel}`,
+            });
+            if (r.error) throw new Error(`gemini_failed: ${r.error.message}`);
+            if (!r.json) throw new Error(`gemini_parse_failed: status=${r.statusCode}, body=${(r.raw || '').slice(0, 200)}`);
+            if (r.json.error) throw new Error(`gemini_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
+            const text = r.json?.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) throw new Error(`gemini_empty_candidate: status=${r.statusCode}`);
+            try {
+                const parsed = JSON.parse(text);
+                if (tryModel !== model) {
+                    console.log(`[${label}] Gemini succeeded with fallback model ${tryModel}`);
+                }
+                return parsed;
+            } catch (e) {
+                throw new Error(`gemini_text_not_json: ${e.message}; head=${String(text).slice(0, 200)}`);
+            }
+        } catch (err) {
+            geminiError = err;
+            if (isGeminiModelUnavailableError(err)) {
+                console.warn(`[${label}] Gemini model ${tryModel} unavailable (${err.message.slice(0, 100)}), trying next…`);
+                continue;
+            }
+            console.warn(`[${label}] Gemini failed (${err.message.slice(0, 120)})`);
+            break;
+        }
     }
 
-    // ── 2. OpenAI 兜底（Gemini 限流/错误时自动切换）────────────────────────────
+    // ── 2. Claude 兜底（用户指令 2026-05-20：Claude 在 OpenAI 之前）────────────
+    let claudeError = null;
+    if (!disableFallback && claudeApiKey) {
+        const claudeModelsToTry = [claudeModel, ...CLAUDE_MODEL_FALLBACK_CHAIN].filter(
+            (m, i, a) => m && a.indexOf(m) === i,
+        );
+        for (const tryClaudeModel of claudeModelsToTry) {
+            try {
+                console.warn(`[${label}] → Falling back to Claude ${tryClaudeModel}...`);
+                const claudeBody = JSON.stringify({
+                    model: tryClaudeModel,
+                    max_tokens: 4096,
+                    temperature,
+                    system:
+                        'You are a B2B procurement data extraction assistant. Respond ONLY with a valid JSON object. No markdown fences, no explanation.',
+                    messages: [{ role: 'user', content: promptText }],
+                });
+                const r = await requestJsonWithRetry({
+                    hostname: 'api.anthropic.com',
+                    path: '/v1/messages',
+                    method: 'POST',
+                    headers: {
+                        'x-api-key': claudeApiKey,
+                        'anthropic-version': '2023-06-01',
+                    },
+                    body: claudeBody,
+                    timeoutMs: timeoutMs + 5_000,
+                    maxRetries: 2,
+                    label: `${label}/claude-fallback`,
+                });
+                if (r.error) throw new Error(`claude_failed: ${r.error.message}`);
+                if (!r.json) throw new Error(`claude_parse_failed: status=${r.statusCode}`);
+                if (r.json.error) throw new Error(`claude_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
+                const text = (r.json?.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('').trim();
+                if (!text) throw new Error('claude_empty_response');
+                // Claude 偶尔包 ```json ... ```，剥一下
+                const cleaned = text.replace(/^```[a-z]*\n?/im, '').replace(/\n?```$/m, '').trim();
+                const result = JSON.parse(cleaned);
+                if (tryClaudeModel !== claudeModel) {
+                    console.log(`[${label}] Claude succeeded with fallback model ${tryClaudeModel}`);
+                } else {
+                    console.log(`[${label}] Claude fallback succeeded (${tryClaudeModel})`);
+                }
+                return result;
+            } catch (clErr) {
+                claudeError = clErr;
+                const msg = String(clErr.message || '');
+                // 模型不存在 → 试下一个；其他错误 → 中断 Claude 链路转 OpenAI
+                if (msg.includes('not_found') || msg.includes('404') || msg.includes('claude_text_not_json')) {
+                    console.warn(`[${label}] Claude model ${tryClaudeModel} not available (${msg.slice(0, 80)}), trying next…`);
+                    continue;
+                }
+                console.warn(`[${label}] Claude failed (${msg.slice(0, 100)})`);
+                break;
+            }
+        }
+    }
+
+    // ── 3. OpenAI 兜底（用户指令 2026-05-20：第三位）─────────────────────────
     if (disableFallback || !openaiApiKey) {
         throw geminiError;
     }
     console.warn(`[${label}] → Falling back to OpenAI ${openaiModel}...`);
     try {
+        // GPT-5 reasoning 系列实测约束（2026-05-20 procure/scripts/test-gpt55-temperature.cjs）：
+        //   - gpt-5 / gpt-5.5：reasoning model → 必须 max_completion_tokens；temperature 只支持 1（默认）
+        //   - gpt-5.4 / gpt-5.4-mini：chat model → 同样用 max_completion_tokens；temperature 支持自定义
+        //   - gpt-4.x：用 max_tokens；temperature 支持自定义
+        const isGpt5Plus = /^gpt-5/i.test(openaiModel);
+        // gpt-5.0 / gpt-5.5 等"纯 reasoning"模型；gpt-5.4 是 chat 变体支持 temperature
+        const isGpt5Reasoning = /^gpt-5(\.\d+)?$/i.test(openaiModel) && !/^gpt-5\.4/i.test(openaiModel);
+        const tokenField = isGpt5Plus ? 'max_completion_tokens' : 'max_tokens';
         const oaBody = JSON.stringify({
             model: openaiModel,
-            temperature,
+            // reasoning 模型不传 temperature；chat 模型传配置值
+            ...(isGpt5Reasoning ? {} : { temperature }),
+            // reasoning 模型给更大 budget（reasoning tokens 会占用 max_completion_tokens）
+            [tokenField]: isGpt5Reasoning ? 8192 : 4096,
             response_format: { type: 'json_object' },
             messages: [
                 { role: 'system', content: 'You are a B2B procurement data extraction assistant. Always respond with valid JSON.' },
@@ -204,7 +327,7 @@ async function callGeminiJson(promptText, {
             method: 'POST',
             headers: { Authorization: `Bearer ${openaiApiKey}` },
             body: oaBody,
-            timeoutMs: timeoutMs + 10_000, // OpenAI 通常比 Gemini 慢，给额外余量
+            timeoutMs: timeoutMs + 10_000,
             maxRetries: 2,
             label: `${label}/openai-fallback`,
         });
@@ -217,7 +340,8 @@ async function callGeminiJson(promptText, {
         console.log(`[${label}] OpenAI fallback succeeded`);
         return result;
     } catch (oaErr) {
-        throw new Error(`both_llm_failed: gemini=(${geminiError.message.slice(0, 80)}), openai=(${oaErr.message.slice(0, 80)})`);
+        const claudeMsg = claudeError ? `, claude=(${String(claudeError.message || '').slice(0, 60)})` : '';
+        throw new Error(`all_llm_failed: gemini=(${geminiError.message.slice(0, 60)})${claudeMsg}, openai=(${oaErr.message.slice(0, 60)})`);
     }
 }
 
@@ -267,12 +391,15 @@ const NEWS_DOMAIN_HOSTS = new Set([
 ]);
 const NEWS_DOMAIN_RE = /\.(news|press|media|journalist|tribune|gazette|herald|chronicle|times\.com\.sg|daily|weekly|post\.com)$/i;
 
+// 注意：importyeti / volza / panjiva 不在此 PLATFORM 黑名单——它们是真实进口商目录的
+// 强信号源。step1 fromOrganic 把这些站的 link 转为 source_url（lead.link=null），
+// preFilterRawLeads 不会因 link=null 把它们当 no_signal 丢掉（看 line 351：仅在 title+snippet 都空时丢）。
 const PLATFORM_HOSTS = [
     'alibaba.com', 'aliexpress.com', 'amazon.com', 'thomasnet.com',
     'globalsources.com', 'made-in-china.com', 'tradeindia.com',
     'indiamart.com', 'tradewheel.com', 'ec21.com', 'ecplaza.net',
-    'tradekey.com', 'go4worldbusiness.com', 'panjiva.com',
-    'importyeti.com', 'volza.com', 'reddit.com', 'quora.com',
+    'tradekey.com', 'go4worldbusiness.com',
+    'reddit.com', 'quora.com',
     'wikipedia.org', 'wikihow.com', 'youtube.com',
     'facebook.com', 'instagram.com', 'linkedin.com', 'x.com', 'twitter.com', 'tiktok.com',
 ];
@@ -288,26 +415,55 @@ function isNewsDomain(link) {
     return false;
 }
 
-function preFilterRawLeads(rawItems) {
+function loadDomainBlacklistFromEnv() {
+    const raw = process.env.DISCOVERY_DOMAIN_BLACKLIST || '[]';
+    try {
+        const arr = JSON.parse(raw);
+        return Array.isArray(arr)
+            ? arr.map((d) => String(d || '').toLowerCase().replace(/^www\./, '')).filter(Boolean)
+            : [];
+    } catch {
+        return [];
+    }
+}
+
+// P6b 供应商模式：找供应商时不能把"中国制造商/出口商/工厂"当污染丢掉——它们正是目标。
+// 同理 thomasnet/globalsources/made-in-china 等供应商目录站不再当 platform 噪声整条丢
+// （step1 供应商目录 pillar 已把 link=null + source_url，本函数不会因 link 命中 PLATFORM_HOSTS 丢，
+//  但 factory-direct organic 仍可能命中 cn_supplier，这里据 supplierMode 放行）。
+function preFilterRawLeads(rawItems, opts) {
     if (!Array.isArray(rawItems)) return { kept: [], dropped: 0, reasons: {} };
+    const supplierMode = !!(opts && opts.supplierMode);
     const kept = [];
-    const reasons = { listicle: 0, platform: 0, cn_supplier: 0, no_signal: 0, news_media: 0, closed_biz: 0 };
+    const domainBlacklist = loadDomainBlacklistFromEnv();
+    const blacklistSet = new Set(domainBlacklist);
+    const reasons = { listicle: 0, platform: 0, cn_supplier: 0, no_signal: 0, news_media: 0, closed_biz: 0, policy_domain: 0 };
     for (const r of rawItems) {
         const title = String(r.title || '').trim();
         const snippet = String(r.snippet || '').trim();
         const link = String(r.link || '').toLowerCase();
         const combined = `${title} ${snippet}`;
 
+        if (blacklistSet.size > 0 && link) {
+            try {
+                const host = new URL(link.startsWith('http') ? link : `https://${link}`).hostname.toLowerCase().replace(/^www\./, '');
+                if (blacklistSet.has(host)) { reasons.policy_domain += 1; continue; }
+            } catch { /* ignore */ }
+        }
+
         if (!title && !snippet) { reasons.no_signal += 1; continue; }
         if (LISTICLE_RE.test(title) || LISTICLE_RE.test(snippet)) { reasons.listicle += 1; continue; }
-        if (PLATFORM_HOSTS.some(h => link.includes(h))) { reasons.platform += 1; continue; }
+        // 供应商模式：保留带 link 的供应商目录站结果（step1 已对目录 pillar 置 link=null，
+        // 此处仅 factory-direct organic 带 link，故 supplierMode 下不按 PLATFORM_HOSTS 一刀切）。
+        if (!supplierMode && PLATFORM_HOSTS.some(h => link.includes(h))) { reasons.platform += 1; continue; }
         // 新闻媒体：域名黑名单 + 标题特征
         if (isNewsDomain(link) || NEWS_TITLE_RE.test(title)) { reasons.news_media += 1; continue; }
         // 已结业商家：snippet/title 含关闭特征词
         if (CLOSED_BIZ_RE.test(combined)) { reasons.closed_biz += 1; continue; }
         // CN-supplier hint must be in the snippet+title combo and not contradicted
         // by a non-CN country mention. Coarse but cheap.
-        if (CN_HINT_RE.test(combined) && /\b(supplier|exporter|manufacturer|factory)\b/i.test(snippet)) {
+        // 供应商模式：中国制造商/出口商正是目标，不丢。
+        if (!supplierMode && CN_HINT_RE.test(combined) && /\b(supplier|exporter|manufacturer|factory)\b/i.test(snippet)) {
             reasons.cn_supplier += 1; continue;
         }
         kept.push(r);

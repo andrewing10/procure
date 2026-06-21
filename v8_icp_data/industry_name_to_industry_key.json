@@ -1,0 +1,814 @@
+{
+  "$schema": "https://catagent.io/data/industry-name-to-key-v1.json",
+  "description": "行业名（中英）→ industry_key 精确映射，用于 naics3 多对一消歧；匹配时忽略标点、大小写",
+  "version": "v2",
+  "entries": [
+    {
+      "name_zh": "光伏",
+      "name_en": "photovoltaic",
+      "industry_key": "photovoltaic_solar"
+    },
+    {
+      "name_zh": "太阳能",
+      "name_en": "solar",
+      "industry_key": "photovoltaic_solar"
+    },
+    {
+      "name_zh": "半导体",
+      "name_en": "semiconductor",
+      "industry_key": "semiconductor"
+    },
+    {
+      "name_zh": "芯片",
+      "name_en": "chip",
+      "industry_key": "semiconductor"
+    },
+    {
+      "name_zh": "家电",
+      "name_en": "appliance",
+      "industry_key": "appliance_manufacturing"
+    },
+    {
+      "name_zh": "储能",
+      "name_en": "battery storage",
+      "industry_key": "battery_energy_storage"
+    },
+    {
+      "name_zh": "电池",
+      "name_en": "battery",
+      "industry_key": "battery_energy_storage"
+    },
+    {
+      "name_zh": "造船",
+      "name_en": "ship building",
+      "industry_key": "ship_building"
+    },
+    {
+      "name_zh": "船舶",
+      "name_en": "ship",
+      "industry_key": "ship_building"
+    },
+    {
+      "name_zh": "实验室",
+      "name_en": "laboratory",
+      "industry_key": "laboratory_testing"
+    },
+    {
+      "name_zh": "检测",
+      "name_en": "testing",
+      "industry_key": "laboratory_testing"
+    },
+    {
+      "name_zh": "激光",
+      "name_en": "laser",
+      "industry_key": "electronics_assembly"
+    },
+    {
+      "name_zh": "激光光电",
+      "name_en": "laser photonics",
+      "industry_key": "electronics_assembly"
+    },
+    {
+      "name_zh": "光电",
+      "name_en": "photonics",
+      "industry_key": "electronics_assembly"
+    },
+    {
+      "name_zh": "电子组装",
+      "name_en": "electronics assembly",
+      "industry_key": "electronics_assembly"
+    },
+    {
+      "name_zh": "电子制造",
+      "name_en": "electronic manufacturing",
+      "industry_key": "electronics_assembly"
+    },
+    {
+      "name_zh": "电子元器件",
+      "name_en": "electronic components",
+      "industry_key": "electronics_assembly"
+    },
+    {
+      "name_zh": "元器件",
+      "name_en": "components",
+      "industry_key": "electronics_assembly"
+    },
+    {
+      "name_zh": "广告营销",
+      "name_en": "Advertising & Marketing",
+      "industry_key": "advertising_marketing"
+    },
+    {
+      "name_zh": "农产品初加工",
+      "name_en": "Primary Agri Processing",
+      "industry_key": "agri_primary_processing"
+    },
+    {
+      "name_zh": "农机制造",
+      "name_en": "Agricultural Machinery",
+      "industry_key": "agricultural_machinery"
+    },
+    {
+      "name_zh": "种子饲料",
+      "name_en": "Seed & Feed",
+      "industry_key": "agriculture_seed_feed"
+    },
+    {
+      "name_zh": "门诊医疗",
+      "name_en": "Ambulatory Healthcare",
+      "industry_key": "ambulatory_healthcare"
+    },
+    {
+      "name_zh": "娱乐游乐",
+      "name_en": "Amusement & Recreation",
+      "industry_key": "amusement_recreation"
+    },
+    {
+      "name_zh": "建筑设计",
+      "name_en": "Architectural Engineering",
+      "industry_key": "architectural_engineering"
+    },
+    {
+      "name_zh": "汽修4S",
+      "name_en": "Auto Repair 4S",
+      "industry_key": "auto_repair_4s"
+    },
+    {
+      "name_zh": "汽车零部件",
+      "name_en": "Automotive Parts",
+      "industry_key": "automotive_parts"
+    },
+    {
+      "name_zh": "汽配",
+      "name_en": "auto parts",
+      "industry_key": "automotive_parts"
+    },
+    {
+      "name_zh": "航空船舶",
+      "name_en": "Aviation & Marine",
+      "industry_key": "aviation_marine"
+    },
+    {
+      "name_zh": "银行金融",
+      "name_en": "Banking & Finance",
+      "industry_key": "banking_finance"
+    },
+    {
+      "name_zh": "美妆个护",
+      "name_en": "Beauty & Personal Care",
+      "industry_key": "beauty_personal_care"
+    },
+    {
+      "name_zh": "饮料制造",
+      "name_en": "Beverage Manufacturing",
+      "industry_key": "beverage_manufacturing"
+    },
+    {
+      "name_zh": "电缆线缆",
+      "name_en": "Cable & Wire",
+      "industry_key": "cable_wire"
+    },
+    {
+      "name_zh": "团餐",
+      "name_en": "Catering Group",
+      "industry_key": "catering_group"
+    },
+    {
+      "name_zh": "餐饮",
+      "name_en": "catering",
+      "industry_key": "catering_group"
+    },
+    {
+      "name_zh": "化工",
+      "name_en": "Chemical Processing",
+      "industry_key": "chemical_processing"
+    },
+    {
+      "name_zh": "清洁环卫",
+      "name_en": "Cleaning & Sanitation",
+      "industry_key": "cleaning_sanitation"
+    },
+    {
+      "name_zh": "咖啡茶饮",
+      "name_en": "Coffee & Tea Chain",
+      "industry_key": "coffee_tea_chain"
+    },
+    {
+      "name_zh": "建材",
+      "name_en": "Construction Material",
+      "industry_key": "construction_material"
+    },
+    {
+      "name_zh": "建筑装修",
+      "name_en": "Construction Subcontract",
+      "industry_key": "construction_subcontract"
+    },
+    {
+      "name_zh": "电商履约",
+      "name_en": "E-commerce Fulfillment",
+      "industry_key": "ecommerce_fulfillment"
+    },
+    {
+      "name_zh": "教育设备",
+      "name_en": "Education Equipment",
+      "industry_key": "education_equipment"
+    },
+    {
+      "name_zh": "教育服务",
+      "name_en": "Educational Services",
+      "industry_key": "educational_services"
+    },
+    {
+      "name_zh": "电气设备制造",
+      "name_en": "Electrical Equipment",
+      "industry_key": "electrical_equipment_mfg"
+    },
+    {
+      "name_zh": "能源油气",
+      "name_en": "Energy Oil & Gas",
+      "industry_key": "energy_oil_gas"
+    },
+    {
+      "name_zh": "环保水处理",
+      "name_en": "Environmental & Water",
+      "industry_key": "environmental_water"
+    },
+    {
+      "name_zh": "会展",
+      "name_en": "Exhibition & Events",
+      "industry_key": "exhibition_events"
+    },
+    {
+      "name_zh": "鲜花绿植",
+      "name_en": "Flower & Greenery",
+      "industry_key": "flower_greenery"
+    },
+    {
+      "name_zh": "烘焙乳品",
+      "name_en": "Bakery & Dairy",
+      "industry_key": "food_processing_bakery_dairy"
+    },
+    {
+      "name_zh": "食品加工",
+      "name_en": "food processing",
+      "industry_key": "food_processing_bakery_dairy"
+    },
+    {
+      "name_zh": "预制菜/预制食品",
+      "name_en": "Prepared Food",
+      "industry_key": "food_processing_prepared"
+    },
+    {
+      "name_zh": "公路货运",
+      "name_en": "Freight Trucking",
+      "industry_key": "freight_trucking"
+    },
+    {
+      "name_zh": "家具木制品",
+      "name_en": "Furniture & Wood",
+      "industry_key": "furniture_wood"
+    },
+    {
+      "name_zh": "礼品促销",
+      "name_en": "Gift & Promotional",
+      "industry_key": "gift_promotional"
+    },
+    {
+      "name_zh": "政府公共",
+      "name_en": "Government & Public",
+      "industry_key": "government_public"
+    },
+    {
+      "name_zh": "医院医疗",
+      "name_en": "Healthcare & Hospital",
+      "industry_key": "healthcare_hospital"
+    },
+    {
+      "name_zh": "酒店住宿",
+      "name_en": "Hotel Accommodation",
+      "industry_key": "hotel_accommodation"
+    },
+    {
+      "name_zh": "酒店",
+      "name_en": "hotel",
+      "industry_key": "hotel_accommodation"
+    },
+    {
+      "name_zh": "暖通设备",
+      "name_en": "HVAC Equipment",
+      "industry_key": "hvac_equipment"
+    },
+    {
+      "name_zh": "保险",
+      "name_en": "Insurance",
+      "industry_key": "insurance"
+    },
+    {
+      "name_zh": "IT软件服务",
+      "name_en": "IT & Software Services",
+      "industry_key": "it_software_services"
+    },
+    {
+      "name_zh": "园林绿化",
+      "name_en": "Landscaping Services",
+      "industry_key": "landscaping_services"
+    },
+    {
+      "name_zh": "皮革鞋靴",
+      "name_en": "Leather & Footwear",
+      "industry_key": "leather_footwear"
+    },
+    {
+      "name_zh": "法律服务",
+      "name_en": "Legal Services",
+      "industry_key": "legal_services"
+    },
+    {
+      "name_zh": "物流仓储",
+      "name_en": "Logistics & Warehousing",
+      "industry_key": "logistics_warehousing"
+    },
+    {
+      "name_zh": "机械设备制造",
+      "name_en": "Machinery & Equipment",
+      "industry_key": "machinery_equipment_mfg"
+    },
+    {
+      "name_zh": "机械",
+      "name_en": "machinery",
+      "industry_key": "machinery_equipment_mfg"
+    },
+    {
+      "name_zh": "母婴",
+      "name_en": "Maternal & Infant",
+      "industry_key": "maternal_infant"
+    },
+    {
+      "name_zh": "医疗器械",
+      "name_en": "Medical Device",
+      "industry_key": "medical_device"
+    },
+    {
+      "name_zh": "医疗设备",
+      "name_en": "medical equipment",
+      "industry_key": "medical_device"
+    },
+    {
+      "name_zh": "金属钣金",
+      "name_en": "Metal Fabrication",
+      "industry_key": "metal_fabrication"
+    },
+    {
+      "name_zh": "采矿冶金",
+      "name_en": "Mining & Metallurgy",
+      "industry_key": "mining_metallurgy"
+    },
+    {
+      "name_zh": "护理养老",
+      "name_en": "Nursing & Residential",
+      "industry_key": "nursing_residential"
+    },
+    {
+      "name_zh": "纸浆造纸",
+      "name_en": "Paper & Pulp",
+      "industry_key": "paper_pulp"
+    },
+    {
+      "name_zh": "演艺",
+      "name_en": "Performing Arts",
+      "industry_key": "performing_arts"
+    },
+    {
+      "name_zh": "除虫",
+      "name_en": "Pest Control",
+      "industry_key": "pest_control_services"
+    },
+    {
+      "name_zh": "宠物",
+      "name_en": "Pet Industry",
+      "industry_key": "pet_industry"
+    },
+    {
+      "name_zh": "石油炼化",
+      "name_en": "Petroleum Refining",
+      "industry_key": "petroleum_refining"
+    },
+    {
+      "name_zh": "医药化妆品",
+      "name_en": "Pharma & Cosmetics",
+      "industry_key": "pharma_cosmetics"
+    },
+    {
+      "name_zh": "药店",
+      "name_en": "Pharmacy & Drug Retail",
+      "industry_key": "pharmacy_drug_retail"
+    },
+    {
+      "name_zh": "钢铁冶炼",
+      "name_en": "Primary Metal & Steel",
+      "industry_key": "primary_metal_steel"
+    },
+    {
+      "name_zh": "铁路运输",
+      "name_en": "Rail Transport",
+      "industry_key": "rail_transport"
+    },
+    {
+      "name_zh": "房地产建筑",
+      "name_en": "Real Estate & Construction",
+      "industry_key": "real_estate_construction"
+    },
+    {
+      "name_zh": "物业服务",
+      "name_en": "Real Estate Services",
+      "industry_key": "real_estate_services"
+    },
+    {
+      "name_zh": "再生资源",
+      "name_en": "Recycling & Waste",
+      "industry_key": "recycling_waste"
+    },
+    {
+      "name_zh": "租赁",
+      "name_en": "Rental & Leasing",
+      "industry_key": "rental_leasing"
+    },
+    {
+      "name_zh": "零售连锁",
+      "name_en": "Retail & Franchise",
+      "industry_key": "retail_franchise"
+    },
+    {
+      "name_zh": "橡胶轮胎",
+      "name_en": "Rubber & Tire",
+      "industry_key": "rubber_tire"
+    },
+    {
+      "name_zh": "安防军警",
+      "name_en": "Security & Defense",
+      "industry_key": "security_defense"
+    },
+    {
+      "name_zh": "安保服务",
+      "name_en": "Security Services",
+      "industry_key": "security_services"
+    },
+    {
+      "name_zh": "固废处理",
+      "name_en": "Solid Waste Management",
+      "industry_key": "solid_waste_management"
+    },
+    {
+      "name_zh": "体育健身器材",
+      "name_en": "Sports & Fitness Equipment",
+      "industry_key": "sports_fitness_equipment"
+    },
+    {
+      "name_zh": "电信",
+      "name_en": "Telecom",
+      "industry_key": "telecom"
+    },
+    {
+      "name_zh": "玩具婴童",
+      "name_en": "Toy & Children",
+      "industry_key": "toy_children"
+    },
+    {
+      "name_zh": "贸易批发",
+      "name_en": "Trade & Distribution",
+      "industry_key": "trade_distribution"
+    },
+    {
+      "name_zh": "批发",
+      "name_en": "wholesale",
+      "industry_key": "trade_distribution"
+    },
+    {
+      "name_zh": "运输辅助",
+      "name_en": "Transport Support",
+      "industry_key": "transport_support"
+    },
+    {
+      "name_zh": "木制品制造",
+      "name_en": "Wood Products",
+      "industry_key": "wood_product_mfg"
+    },
+    {"name_zh": "木材加工", "name_en": "wood processing", "industry_key": "wood_product_mfg"},
+    {"name_zh": "光伏组件", "name_en": "solar panel", "industry_key": "photovoltaic_solar"},
+    {"name_zh": "太阳能板", "name_en": "solar panel", "industry_key": "photovoltaic_solar"},
+    {"name_zh": "集成电路", "name_en": "IC", "industry_key": "semiconductor"},
+    {"name_zh": "白电", "name_en": "white goods", "industry_key": "appliance_manufacturing"},
+    {"name_zh": "家用电器", "name_en": "home appliance", "industry_key": "appliance_manufacturing"},
+    {"name_zh": "动力电池", "name_en": "power battery", "industry_key": "battery_energy_storage"},
+    {"name_zh": "船厂", "name_en": "shipyard", "industry_key": "ship_building"},
+    {"name_zh": "第三方检测", "name_en": "third party testing", "industry_key": "laboratory_testing"},
+    {"name_zh": "认证检测", "name_en": "certification testing", "industry_key": "laboratory_testing"},
+    {"name_zh": "电子代工", "name_en": "EMS", "industry_key": "electronics_assembly"},
+    {"name_zh": "贴片", "name_en": "SMT", "industry_key": "electronics_assembly"},
+    {"name_zh": "广告", "name_en": "advertising", "industry_key": "advertising_marketing"},
+    {"name_zh": "营销", "name_en": "marketing", "industry_key": "advertising_marketing"},
+    {"name_zh": "农机", "name_en": "farm machinery", "industry_key": "agricultural_machinery"},
+    {"name_zh": "农业机械", "name_en": "agricultural machinery", "industry_key": "agricultural_machinery"},
+    {"name_zh": "拖拉机", "name_en": "tractor", "industry_key": "agricultural_machinery"},
+    {"name_zh": "种子", "name_en": "seed", "industry_key": "agriculture_seed_feed"},
+    {"name_zh": "饲料", "name_en": "feed", "industry_key": "agriculture_seed_feed"},
+    {"name_zh": "种业", "name_en": "seed industry", "industry_key": "agriculture_seed_feed"},
+    {"name_zh": "门诊", "name_en": "outpatient", "industry_key": "ambulatory_healthcare"},
+    {"name_zh": "诊所", "name_en": "clinic", "industry_key": "ambulatory_healthcare"},
+    {"name_zh": "游乐", "name_en": "recreation", "industry_key": "amusement_recreation"},
+    {"name_zh": "主题乐园", "name_en": "theme park", "industry_key": "amusement_recreation"},
+    {"name_zh": "4S店", "name_en": "4S store", "industry_key": "auto_repair_4s"},
+    {"name_zh": "汽车维修", "name_en": "auto repair", "industry_key": "auto_repair_4s"},
+    {"name_zh": "汽修", "name_en": "auto repair", "industry_key": "auto_repair_4s"},
+    {"name_zh": "汽车配件", "name_en": "auto parts", "industry_key": "automotive_parts"},
+    {"name_zh": "航空", "name_en": "aviation", "industry_key": "aviation_marine"},
+    {"name_zh": "航天", "name_en": "aerospace", "industry_key": "aviation_marine"},
+    {"name_zh": "海工", "name_en": "marine engineering", "industry_key": "aviation_marine"},
+    {"name_zh": "银行", "name_en": "banking", "industry_key": "banking_finance"},
+    {"name_zh": "金融", "name_en": "finance", "industry_key": "banking_finance"},
+    {"name_zh": "证券", "name_en": "securities", "industry_key": "banking_finance"},
+    {"name_zh": "美妆", "name_en": "beauty", "industry_key": "beauty_personal_care"},
+    {"name_zh": "个护", "name_en": "personal care", "industry_key": "beauty_personal_care"},
+    {"name_zh": "日化", "name_en": "daily chemical", "industry_key": "beauty_personal_care"},
+    {"name_zh": "化妆品", "name_en": "cosmetics", "industry_key": "beauty_personal_care"},
+    {"name_zh": "饮料", "name_en": "beverage", "industry_key": "beverage_manufacturing"},
+    {"name_zh": "酒水", "name_en": "alcoholic beverage", "industry_key": "beverage_manufacturing"},
+    {"name_zh": "线缆", "name_en": "cable", "industry_key": "cable_wire"},
+    {"name_zh": "电缆", "name_en": "power cable", "industry_key": "cable_wire"},
+    {"name_zh": "食堂", "name_en": "canteen", "industry_key": "catering_group"},
+    {"name_zh": "快餐", "name_en": "fast food", "industry_key": "catering_group"},
+    {"name_zh": "配餐", "name_en": "catering", "industry_key": "catering_group"},
+    {"name_zh": "化学品", "name_en": "chemicals", "industry_key": "chemical_processing"},
+    {"name_zh": "石化", "name_en": "petrochemical", "industry_key": "chemical_processing"},
+    {"name_zh": "精细化工", "name_en": "fine chemical", "industry_key": "chemical_processing"},
+    {"name_zh": "清洁", "name_en": "cleaning", "industry_key": "cleaning_sanitation"},
+    {"name_zh": "环卫", "name_en": "sanitation", "industry_key": "cleaning_sanitation"},
+    {"name_zh": "咖啡", "name_en": "coffee", "industry_key": "coffee_tea_chain"},
+    {"name_zh": "茶饮", "name_en": "tea drink", "industry_key": "coffee_tea_chain"},
+    {"name_zh": "奶茶", "name_en": "bubble tea", "industry_key": "coffee_tea_chain"},
+    {"name_zh": "建筑材料", "name_en": "building material", "industry_key": "construction_material"},
+    {"name_zh": "水泥", "name_en": "cement", "industry_key": "construction_material"},
+    {"name_zh": "装修", "name_en": "renovation", "industry_key": "construction_subcontract"},
+    {"name_zh": "施工", "name_en": "construction", "industry_key": "construction_subcontract"},
+    {"name_zh": "分包", "name_en": "subcontract", "industry_key": "construction_subcontract"},
+    {"name_zh": "电商", "name_en": "e-commerce", "industry_key": "ecommerce_fulfillment"},
+    {"name_zh": "仓储", "name_en": "warehousing", "industry_key": "ecommerce_fulfillment"},
+    {"name_zh": "履约", "name_en": "fulfillment", "industry_key": "ecommerce_fulfillment"},
+    {"name_zh": "教具", "name_en": "teaching equipment", "industry_key": "education_equipment"},
+    {"name_zh": "教学设备", "name_en": "educational equipment", "industry_key": "education_equipment"},
+    {"name_zh": "教育", "name_en": "education", "industry_key": "educational_services"},
+    {"name_zh": "培训", "name_en": "training", "industry_key": "educational_services"},
+    {"name_zh": "电气", "name_en": "electrical", "industry_key": "electrical_equipment_mfg"},
+    {"name_zh": "电气设备", "name_en": "electrical equipment", "industry_key": "electrical_equipment_mfg"},
+    {"name_zh": "油气", "name_en": "oil and gas", "industry_key": "energy_oil_gas"},
+    {"name_zh": "石油", "name_en": "oil", "industry_key": "energy_oil_gas"},
+    {"name_zh": "天然气", "name_en": "natural gas", "industry_key": "energy_oil_gas"},
+    {"name_zh": "能源", "name_en": "energy", "industry_key": "energy_oil_gas"},
+    {"name_zh": "环保", "name_en": "environmental", "industry_key": "environmental_water"},
+    {"name_zh": "水处理", "name_en": "water treatment", "industry_key": "environmental_water"},
+    {"name_zh": "污水处理", "name_en": "wastewater", "industry_key": "environmental_water"},
+    {"name_zh": "展览", "name_en": "exhibition", "industry_key": "exhibition_events"},
+    {"name_zh": "展会", "name_en": "trade show", "industry_key": "exhibition_events"},
+    {"name_zh": "鲜花", "name_en": "flower", "industry_key": "flower_greenery"},
+    {"name_zh": "绿植", "name_en": "greenery", "industry_key": "flower_greenery"},
+    {"name_zh": "花卉", "name_en": "ornamental plant", "industry_key": "flower_greenery"},
+    {"name_zh": "园艺", "name_en": "horticulture", "industry_key": "flower_greenery"},
+    {"name_zh": "烘焙", "name_en": "bakery", "industry_key": "food_processing_bakery_dairy"},
+    {"name_zh": "乳品", "name_en": "dairy", "industry_key": "food_processing_bakery_dairy"},
+    {"name_zh": "乳业", "name_en": "dairy industry", "industry_key": "food_processing_bakery_dairy"},
+    {"name_zh": "预制菜", "name_en": "prepared food", "industry_key": "food_processing_prepared"},
+    {"name_zh": "预制食品", "name_en": "prepared food", "industry_key": "food_processing_prepared"},
+    {"name_zh": "中央厨房", "name_en": "central kitchen", "industry_key": "food_processing_prepared"},
+    {"name_zh": "货运", "name_en": "freight", "industry_key": "freight_trucking"},
+    {"name_zh": "卡车", "name_en": "trucking", "industry_key": "freight_trucking"},
+    {"name_zh": "陆运", "name_en": "road transport", "industry_key": "freight_trucking"},
+    {"name_zh": "家具", "name_en": "furniture", "industry_key": "furniture_wood"},
+    {"name_zh": "家居", "name_en": "home furnishing", "industry_key": "furniture_wood"},
+    {"name_zh": "办公家具", "name_en": "office furniture", "industry_key": "furniture_wood"},
+    {"name_zh": "礼品", "name_en": "gift", "industry_key": "gift_promotional"},
+    {"name_zh": "促销品", "name_en": "promotional", "industry_key": "gift_promotional"},
+    {"name_zh": "政府", "name_en": "government", "industry_key": "government_public"},
+    {"name_zh": "公共事业", "name_en": "public sector", "industry_key": "government_public"},
+    {"name_zh": "市政", "name_en": "municipal", "industry_key": "government_public"},
+    {"name_zh": "医院", "name_en": "hospital", "industry_key": "healthcare_hospital"},
+    {"name_zh": "医疗", "name_en": "healthcare", "industry_key": "healthcare_hospital"},
+    {"name_zh": "宾馆", "name_en": "guesthouse", "industry_key": "hotel_accommodation"},
+    {"name_zh": "住宿", "name_en": "accommodation", "industry_key": "hotel_accommodation"},
+    {"name_zh": "民宿", "name_en": "homestay", "industry_key": "hotel_accommodation"},
+    {"name_zh": "暖通", "name_en": "HVAC", "industry_key": "hvac_equipment"},
+    {"name_zh": "空调", "name_en": "air conditioning", "industry_key": "hvac_equipment"},
+    {"name_zh": "制冷", "name_en": "refrigeration", "industry_key": "hvac_equipment"},
+    {"name_zh": "采暖", "name_en": "heating", "industry_key": "hvac_equipment"},
+    {"name_zh": "保险业", "name_en": "insurance", "industry_key": "insurance"},
+    {"name_zh": "IT", "name_en": "IT", "industry_key": "it_software_services"},
+    {"name_zh": "软件", "name_en": "software", "industry_key": "it_software_services"},
+    {"name_zh": "互联网", "name_en": "internet", "industry_key": "it_software_services"},
+    {"name_zh": "园林", "name_en": "landscaping", "industry_key": "landscaping_services"},
+    {"name_zh": "绿化", "name_en": "greening", "industry_key": "landscaping_services"},
+    {"name_zh": "景观", "name_en": "landscape", "industry_key": "landscaping_services"},
+    {"name_zh": "皮革", "name_en": "leather", "industry_key": "leather_footwear"},
+    {"name_zh": "鞋靴", "name_en": "footwear", "industry_key": "leather_footwear"},
+    {"name_zh": "箱包", "name_en": "luggage", "industry_key": "leather_footwear"},
+    {"name_zh": "法律", "name_en": "legal", "industry_key": "legal_services"},
+    {"name_zh": "律师", "name_en": "lawyer", "industry_key": "legal_services"},
+    {"name_zh": "律所", "name_en": "law firm", "industry_key": "legal_services"},
+    {"name_zh": "物流", "name_en": "logistics", "industry_key": "logistics_warehousing"},
+    {"name_zh": "供应链", "name_en": "supply chain", "industry_key": "logistics_warehousing"},
+    {"name_zh": "仓库", "name_en": "warehouse", "industry_key": "logistics_warehousing"},
+    {"name_zh": "设备制造", "name_en": "equipment manufacturing", "industry_key": "machinery_equipment_mfg"},
+    {"name_zh": "通用设备", "name_en": "general machinery", "industry_key": "machinery_equipment_mfg"},
+    {"name_zh": "机床", "name_en": "machine tool", "industry_key": "machinery_equipment_mfg"},
+    {"name_zh": "母婴用品", "name_en": "maternal infant", "industry_key": "maternal_infant"},
+    {"name_zh": "婴童", "name_en": "infant", "industry_key": "maternal_infant"},
+    {"name_zh": "奶粉", "name_en": "formula", "industry_key": "maternal_infant"},
+    {"name_zh": "医械", "name_en": "medical device", "industry_key": "medical_device"},
+    {"name_zh": "耗材", "name_en": "consumables", "industry_key": "medical_device"},
+    {"name_zh": "体外诊断", "name_en": "IVD", "industry_key": "medical_device"},
+    {"name_zh": "钣金", "name_en": "sheet metal", "industry_key": "metal_fabrication"},
+    {"name_zh": "金属加工", "name_en": "metal processing", "industry_key": "metal_fabrication"},
+    {"name_zh": "冲压", "name_en": "stamping", "industry_key": "metal_fabrication"},
+    {"name_zh": "采矿", "name_en": "mining", "industry_key": "mining_metallurgy"},
+    {"name_zh": "冶金", "name_en": "metallurgy", "industry_key": "mining_metallurgy"},
+    {"name_zh": "矿业", "name_en": "mining industry", "industry_key": "mining_metallurgy"},
+    {"name_zh": "矿山", "name_en": "mine", "industry_key": "mining_metallurgy"},
+    {"name_zh": "养老", "name_en": "elderly care", "industry_key": "nursing_residential"},
+    {"name_zh": "护理", "name_en": "nursing", "industry_key": "nursing_residential"},
+    {"name_zh": "康养", "name_en": "wellness care", "industry_key": "nursing_residential"},
+    {"name_zh": "养老院", "name_en": "nursing home", "industry_key": "nursing_residential"},
+    {"name_zh": "造纸", "name_en": "paper making", "industry_key": "paper_pulp"},
+    {"name_zh": "纸浆", "name_en": "pulp", "industry_key": "paper_pulp"},
+    {"name_zh": "纸张", "name_en": "paper", "industry_key": "paper_pulp"},
+    {"name_zh": "演出", "name_en": "performing", "industry_key": "performing_arts"},
+    {"name_zh": "剧院", "name_en": "theater", "industry_key": "performing_arts"},
+    {"name_zh": "杀虫", "name_en": "pest control", "industry_key": "pest_control_services"},
+    {"name_zh": "白蚁", "name_en": "termite", "industry_key": "pest_control_services"},
+    {"name_zh": "有害生物防治", "name_en": "pest control", "industry_key": "pest_control_services"},
+    {"name_zh": "宠物食品", "name_en": "pet food", "industry_key": "pet_industry"},
+    {"name_zh": "宠物用品", "name_en": "pet supplies", "industry_key": "pet_industry"},
+    {"name_zh": "宠粮", "name_en": "pet food", "industry_key": "pet_industry"},
+    {"name_zh": "炼化", "name_en": "refining", "industry_key": "petroleum_refining"},
+    {"name_zh": "炼油", "name_en": "oil refining", "industry_key": "petroleum_refining"},
+    {"name_zh": "医药", "name_en": "pharma", "industry_key": "pharma_cosmetics"},
+    {"name_zh": "药妆", "name_en": "cosmeceutical", "industry_key": "pharma_cosmetics"},
+    {"name_zh": "药品零售", "name_en": "drug retail", "industry_key": "pharmacy_drug_retail"},
+    {"name_zh": "药房", "name_en": "pharmacy", "industry_key": "pharmacy_drug_retail"},
+    {"name_zh": "钢铁", "name_en": "steel", "industry_key": "primary_metal_steel"},
+    {"name_zh": "冶炼", "name_en": "smelting", "industry_key": "primary_metal_steel"},
+    {"name_zh": "钢材", "name_en": "steel product", "industry_key": "primary_metal_steel"},
+    {"name_zh": "黑色金属", "name_en": "ferrous metal", "industry_key": "primary_metal_steel"},
+    {"name_zh": "铁路", "name_en": "rail", "industry_key": "rail_transport"},
+    {"name_zh": "轨道交通", "name_en": "rail transit", "industry_key": "rail_transport"},
+    {"name_zh": "高铁", "name_en": "high speed rail", "industry_key": "rail_transport"},
+    {"name_zh": "房地产", "name_en": "real estate", "industry_key": "real_estate_construction"},
+    {"name_zh": "建筑", "name_en": "construction", "industry_key": "real_estate_construction"},
+    {"name_zh": "开发商", "name_en": "developer", "industry_key": "real_estate_construction"},
+    {"name_zh": "物业", "name_en": "property management", "industry_key": "real_estate_services"},
+    {"name_zh": "物管", "name_en": "property services", "industry_key": "real_estate_services"},
+    {"name_zh": "回收", "name_en": "recycling", "industry_key": "recycling_waste"},
+    {"name_zh": "废品", "name_en": "scrap", "industry_key": "recycling_waste"},
+    {"name_zh": "循环利用", "name_en": "circular economy", "industry_key": "recycling_waste"},
+    {"name_zh": "设备租赁", "name_en": "equipment rental", "industry_key": "rental_leasing"},
+    {"name_zh": "融资租赁", "name_en": "leasing", "industry_key": "rental_leasing"},
+    {"name_zh": "零售", "name_en": "retail", "industry_key": "retail_franchise"},
+    {"name_zh": "连锁", "name_en": "franchise", "industry_key": "retail_franchise"},
+    {"name_zh": "便利店", "name_en": "convenience store", "industry_key": "retail_franchise"},
+    {"name_zh": "超市", "name_en": "supermarket", "industry_key": "retail_franchise"},
+    {"name_zh": "橡胶", "name_en": "rubber", "industry_key": "rubber_tire"},
+    {"name_zh": "轮胎", "name_en": "tire", "industry_key": "rubber_tire"},
+    {"name_zh": "橡胶制品", "name_en": "rubber products", "industry_key": "rubber_tire"},
+    {"name_zh": "安防", "name_en": "security", "industry_key": "security_defense"},
+    {"name_zh": "军工", "name_en": "defense", "industry_key": "security_defense"},
+    {"name_zh": "国防", "name_en": "defense", "industry_key": "security_defense"},
+    {"name_zh": "安保", "name_en": "security services", "industry_key": "security_services"},
+    {"name_zh": "人防", "name_en": "security guard", "industry_key": "security_services"},
+    {"name_zh": "固废", "name_en": "solid waste", "industry_key": "solid_waste_management"},
+    {"name_zh": "垃圾", "name_en": "waste", "industry_key": "solid_waste_management"},
+    {"name_zh": "垃圾处理", "name_en": "waste management", "industry_key": "solid_waste_management"},
+    {"name_zh": "体育", "name_en": "sports", "industry_key": "sports_fitness_equipment"},
+    {"name_zh": "健身", "name_en": "fitness", "industry_key": "sports_fitness_equipment"},
+    {"name_zh": "健身器材", "name_en": "fitness equipment", "industry_key": "sports_fitness_equipment"},
+    {"name_zh": "运动器材", "name_en": "sports equipment", "industry_key": "sports_fitness_equipment"},
+    {"name_zh": "通信", "name_en": "telecom", "industry_key": "telecom"},
+    {"name_zh": "运营商", "name_en": "carrier", "industry_key": "telecom"},
+    {"name_zh": "电信运营", "name_en": "telecom operator", "industry_key": "telecom"},
+    {"name_zh": "玩具", "name_en": "toy", "industry_key": "toy_children"},
+    {"name_zh": "童车", "name_en": "children vehicle", "industry_key": "toy_children"},
+    {"name_zh": "贸易", "name_en": "trade", "industry_key": "trade_distribution"},
+    {"name_zh": "分销", "name_en": "distribution", "industry_key": "trade_distribution"},
+    {"name_zh": "经销商", "name_en": "distributor", "industry_key": "trade_distribution"},
+    {"name_zh": "运输", "name_en": "transport", "industry_key": "transport_support"},
+    {"name_zh": "货运代理", "name_en": "freight forwarder", "industry_key": "transport_support"},
+    {"name_zh": "货代", "name_en": "forwarder", "industry_key": "transport_support"},
+    {"name_zh": "组件", "name_en": "solar module", "industry_key": "photovoltaic_solar"},
+    {"name_zh": "光伏组件", "name_en": "PV module", "industry_key": "photovoltaic_solar"},
+    {"name_zh": "晶圆", "name_en": "wafer", "industry_key": "semiconductor"},
+    {"name_zh": "Fab", "name_en": "fab", "industry_key": "semiconductor"},
+    {"name_zh": "IC设计", "name_en": "IC design", "industry_key": "semiconductor"},
+    {"name_zh": "PCBA", "name_en": "PCBA", "industry_key": "electronics_assembly"},
+    {"name_zh": "OEM", "name_en": "OEM", "industry_key": "electronics_assembly"},
+    {"name_zh": "ODM", "name_en": "ODM", "industry_key": "electronics_assembly"},
+    {"name_zh": "SMT", "name_en": "SMT", "industry_key": "electronics_assembly"},
+    {"name_zh": "EMS", "name_en": "EMS", "industry_key": "electronics_assembly"},
+    {"name_zh": "代工", "name_en": "contract manufacturing", "industry_key": "electronics_assembly"},
+    {"name_zh": "动力电池", "name_en": "EV battery", "industry_key": "battery_energy_storage"},
+    {"name_zh": "锂电", "name_en": "lithium battery", "industry_key": "battery_energy_storage"},
+    {"name_zh": "船厂", "name_en": "shipyard", "industry_key": "ship_building"},
+    {"name_zh": "海工", "name_en": "offshore", "industry_key": "ship_building"},
+    {"name_zh": "第三方检测", "name_en": "third party testing", "industry_key": "laboratory_testing"},
+    {"name_zh": "CNAS", "name_en": "CNAS", "industry_key": "laboratory_testing"},
+    {"name_zh": "白电", "name_en": "white goods", "industry_key": "appliance_manufacturing"},
+    {"name_zh": "厨电", "name_en": "kitchen appliance", "industry_key": "appliance_manufacturing"},
+    {"name_zh": "小家电", "name_en": "small appliance", "industry_key": "appliance_manufacturing"},
+    {"name_zh": "品牌", "name_en": "brand", "industry_key": "advertising_marketing"},
+    {"name_zh": "初加工", "name_en": "primary processing", "industry_key": "agri_primary_processing"},
+    {"name_zh": "农机", "name_en": "farm machinery", "industry_key": "agricultural_machinery"},
+    {"name_zh": "种业", "name_en": "seed industry", "industry_key": "agriculture_seed_feed"},
+    {"name_zh": "诊所", "name_en": "clinic", "industry_key": "ambulatory_healthcare"},
+    {"name_zh": "乐园", "name_en": "theme park", "industry_key": "amusement_recreation"},
+    {"name_zh": "景区", "name_en": "scenic area", "industry_key": "amusement_recreation"},
+    {"name_zh": "4S", "name_en": "4S", "industry_key": "auto_repair_4s"},
+    {"name_zh": "汽修", "name_en": "auto repair", "industry_key": "auto_repair_4s"},
+    {"name_zh": "Tier1", "name_en": "Tier 1", "industry_key": "automotive_parts"},
+    {"name_zh": "后市场", "name_en": "aftermarket", "industry_key": "automotive_parts"},
+    {"name_zh": "航天", "name_en": "aerospace", "industry_key": "aviation_marine"},
+    {"name_zh": "证券", "name_en": "securities", "industry_key": "banking_finance"},
+    {"name_zh": "日化", "name_en": "daily chemical", "industry_key": "beauty_personal_care"},
+    {"name_zh": "软饮", "name_en": "soft drink", "industry_key": "beverage_manufacturing"},
+    {"name_zh": "线缆", "name_en": "cable", "industry_key": "cable_wire"},
+    {"name_zh": "食堂", "name_en": "canteen", "industry_key": "catering_group"},
+    {"name_zh": "快餐", "name_en": "fast food", "industry_key": "catering_group"},
+    {"name_zh": "石化", "name_en": "petrochemical", "industry_key": "chemical_processing"},
+    {"name_zh": "精细化工", "name_en": "fine chemical", "industry_key": "chemical_processing"},
+    {"name_zh": "消杀", "name_en": "disinfection", "industry_key": "cleaning_sanitation"},
+    {"name_zh": "奶茶", "name_en": "bubble tea", "industry_key": "coffee_tea_chain"},
+    {"name_zh": "新式茶饮", "name_en": "new tea", "industry_key": "coffee_tea_chain"},
+    {"name_zh": "水泥", "name_en": "cement", "industry_key": "construction_material"},
+    {"name_zh": "装修", "name_en": "renovation", "industry_key": "construction_subcontract"},
+    {"name_zh": "总包", "name_en": "general contractor", "industry_key": "construction_subcontract"},
+    {"name_zh": "履约", "name_en": "fulfillment", "industry_key": "ecommerce_fulfillment"},
+    {"name_zh": "教具", "name_en": "teaching aid", "industry_key": "education_equipment"},
+    {"name_zh": "K12", "name_en": "K12", "industry_key": "educational_services"},
+    {"name_zh": "输配电", "name_en": "power transmission", "industry_key": "electrical_equipment_mfg"},
+    {"name_zh": "炼化", "name_en": "refining", "industry_key": "energy_oil_gas"},
+    {"name_zh": "炼油", "name_en": "oil refining", "industry_key": "petroleum_refining"},
+    {"name_zh": "污水处理", "name_en": "wastewater", "industry_key": "environmental_water"},
+    {"name_zh": "展会", "name_en": "trade show", "industry_key": "exhibition_events"},
+    {"name_zh": "花卉", "name_en": "flower", "industry_key": "flower_greenery"},
+    {"name_zh": "乳业", "name_en": "dairy industry", "industry_key": "food_processing_bakery_dairy"},
+    {"name_zh": "中央厨房", "name_en": "central kitchen", "industry_key": "food_processing_prepared"},
+    {"name_zh": "RTE", "name_en": "RTE", "industry_key": "food_processing_prepared"},
+    {"name_zh": "陆运", "name_en": "road freight", "industry_key": "freight_trucking"},
+    {"name_zh": "家居", "name_en": "home furnishing", "industry_key": "furniture_wood"},
+    {"name_zh": "文创", "name_en": "cultural creative", "industry_key": "gift_promotional"},
+    {"name_zh": "市政", "name_en": "municipal", "industry_key": "government_public"},
+    {"name_zh": "公立医院", "name_en": "public hospital", "industry_key": "healthcare_hospital"},
+    {"name_zh": "民宿", "name_en": "homestay", "industry_key": "hotel_accommodation"},
+    {"name_zh": "客栈", "name_en": "inn", "industry_key": "hotel_accommodation"},
+    {"name_zh": "MICE", "name_en": "MICE", "industry_key": "hotel_accommodation"},
+    {"name_zh": "暖通", "name_en": "HVAC", "industry_key": "hvac_equipment"},
+    {"name_zh": "制冷", "name_en": "refrigeration", "industry_key": "hvac_equipment"},
+    {"name_zh": "SaaS", "name_en": "SaaS", "industry_key": "it_software_services"},
+    {"name_zh": "景观", "name_en": "landscape", "industry_key": "landscaping_services"},
+    {"name_zh": "箱包", "name_en": "luggage", "industry_key": "leather_footwear"},
+    {"name_zh": "律所", "name_en": "law firm", "industry_key": "legal_services"},
+    {"name_zh": "3PL", "name_en": "3PL", "industry_key": "logistics_warehousing"},
+    {"name_zh": "WMS", "name_en": "WMS", "industry_key": "logistics_warehousing"},
+    {"name_zh": "TMS", "name_en": "TMS", "industry_key": "logistics_warehousing"},
+    {"name_zh": "机床", "name_en": "machine tool", "industry_key": "machinery_equipment_mfg"},
+    {"name_zh": "通用设备", "name_en": "general machinery", "industry_key": "machinery_equipment_mfg"},
+    {"name_zh": "婴童", "name_en": "infant", "industry_key": "maternal_infant"},
+    {"name_zh": "医械", "name_en": "med device", "industry_key": "medical_device"},
+    {"name_zh": "IVD", "name_en": "IVD", "industry_key": "medical_device"},
+    {"name_zh": "体外诊断", "name_en": "in vitro diagnostic", "industry_key": "medical_device"},
+    {"name_zh": "钣金", "name_en": "sheet metal", "industry_key": "metal_fabrication"},
+    {"name_zh": "冲压", "name_en": "stamping", "industry_key": "metal_fabrication"},
+    {"name_zh": "矿山", "name_en": "mine", "industry_key": "mining_metallurgy"},
+    {"name_zh": "康养", "name_en": "wellness care", "industry_key": "nursing_residential"},
+    {"name_zh": "养老院", "name_en": "nursing home", "industry_key": "nursing_residential"},
+    {"name_zh": "纸浆", "name_en": "pulp", "industry_key": "paper_pulp"},
+    {"name_zh": "白蚁", "name_en": "termite", "industry_key": "pest_control_services"},
+    {"name_zh": "宠粮", "name_en": "pet food", "industry_key": "pet_industry"},
+    {"name_zh": "药妆", "name_en": "cosmeceutical", "industry_key": "pharma_cosmetics"},
+    {"name_zh": "药房", "name_en": "pharmacy", "industry_key": "pharmacy_drug_retail"},
+    {"name_zh": "钢材", "name_en": "steel product", "industry_key": "primary_metal_steel"},
+    {"name_zh": "黑色金属", "name_en": "ferrous metal", "industry_key": "primary_metal_steel"},
+    {"name_zh": "轨道交通", "name_en": "rail transit", "industry_key": "rail_transport"},
+    {"name_zh": "高铁", "name_en": "high speed rail", "industry_key": "rail_transport"},
+    {"name_zh": "开发商", "name_en": "developer", "industry_key": "real_estate_construction"},
+    {"name_zh": "物管", "name_en": "property management", "industry_key": "real_estate_services"},
+    {"name_zh": "废品", "name_en": "scrap", "industry_key": "recycling_waste"},
+    {"name_zh": "融资租赁", "name_en": "leasing", "industry_key": "rental_leasing"},
+    {"name_zh": "便利店", "name_en": "convenience store", "industry_key": "retail_franchise"},
+    {"name_zh": "CVS", "name_en": "CVS", "industry_key": "retail_franchise"},
+    {"name_zh": "商超", "name_en": "supermarket", "industry_key": "retail_franchise"},
+    {"name_zh": "KA", "name_en": "KA", "industry_key": "retail_franchise"},
+    {"name_zh": "橡胶制品", "name_en": "rubber products", "industry_key": "rubber_tire"},
+    {"name_zh": "军工", "name_en": "defense", "industry_key": "security_defense"},
+    {"name_zh": "人防", "name_en": "security guard", "industry_key": "security_services"},
+    {"name_zh": "固废", "name_en": "solid waste", "industry_key": "solid_waste_management"},
+    {"name_zh": "运动器材", "name_en": "sports equipment", "industry_key": "sports_fitness_equipment"},
+    {"name_zh": "运营商", "name_en": "carrier", "industry_key": "telecom"},
+    {"name_zh": "童车", "name_en": "stroller", "industry_key": "toy_children"},
+    {"name_zh": "分销", "name_en": "distribution", "industry_key": "trade_distribution"}
+  ]
+}
