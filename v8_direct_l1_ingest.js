@@ -12,6 +12,7 @@
 const { upsertJobLeadMapping } = require('./v8_zhimao_contract');
 const { inferProcurementSignalCount, inferEntityType } = require('./v8_quality_gate');
 const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
+const { buildContactChannels } = require('./v8_lib_channel_spec');
 const { readIcpContext } = require('./v8_lib_pillar0');
 // P6b：直写 L1 路径不经 zhimao bulk HTTP 路由，故在此处镜像 find_suppliers 的
 // trade_role/biz_type 强化（bulk/route.ts 已对 HTTP 路径做同样覆盖）。
@@ -85,6 +86,9 @@ const COMMERCE_COLUMNS = ['contact_bundle', 'sellable_skus', 'data_archetype', '
 /** entity_type 列（读路径 dataIntelPublic 已依赖，正常必存在）；旧库缺列时 strip 兜底 */
 const ENTITY_TYPE_COLUMNS = ['entity_type'];
 
+/** zhimao 迁移 20260793000000；未部署时 strip 后照常入库（channels 仅缺展示，不阻断） */
+const CHANNELS_COLUMNS = ['contact_channels'];
+
 function stripIcpEvidenceColumns(row) {
   const out = { ...row };
   for (const col of ICP_EVIDENCE_COLUMNS) delete out[col];
@@ -107,6 +111,18 @@ function stripCommerceColumns(row) {
   const out = { ...row };
   for (const col of COMMERCE_COLUMNS) delete out[col];
   return out;
+}
+
+function stripChannelsColumns(row) {
+  const out = { ...row };
+  for (const col of CHANNELS_COLUMNS) delete out[col];
+  return out;
+}
+
+function isMissingChannelsColumnError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  if (err?.code !== 'PGRST204' && !msg.includes('schema cache')) return false;
+  return CHANNELS_COLUMNS.some((col) => msg.includes(col));
 }
 
 function isMissingIcpColumnError(err) {
@@ -152,6 +168,17 @@ async function upsertL1Chunk(supabase, batchPayload) {
   if (res.error && isMissingEntityTypeColumnError(res.error)) {
     console.warn('[direct-l1] entity_type column missing; retrying without entity_type.');
     payload = payload.map(stripEntityTypeColumns);
+    res = await supabase
+      .from('data_intel_l1_companies')
+      .upsert(payload, { onConflict: 'name_canonical,country', ignoreDuplicates: true })
+      .select('company_id,name_canonical,country');
+  }
+  if (res.error && isMissingChannelsColumnError(res.error)) {
+    console.warn(
+      '[direct-l1] contact_channels column missing; retrying without it. ' +
+        'Deploy zhimao migration 20260793000000_l1_contact_channels.sql',
+    );
+    payload = payload.map(stripChannelsColumns);
     res = await supabase
       .from('data_intel_l1_companies')
       .upsert(payload, { onConflict: 'name_canonical,country', ignoreDuplicates: true })
@@ -507,6 +534,17 @@ function buildL1Row(lead, nowIso) {
   };
   const { intent_patch, ...commerce } = deriveL1CommerceFields(commerceInput);
   Object.assign(row, commerce, intent_patch);
+
+  // B3：把买家可达渠道「开放集合」合成进 L1（不写死成 email/phone/WA）。
+  // 来源：L1 现有 primary_email/phone + lead.primary_whatsapp + social_profile_urls
+  //       + step3 enricher 产出的 channels（lead._enricher_channels）。
+  row.contact_channels = buildContactChannels({
+    email: row.primary_email,
+    phone: row.primary_phone,
+    whatsapp: lead.primary_whatsapp || null,
+    socialUrls: row.social_profile_urls,
+    extraChannels: Array.isArray(lead._enricher_channels) ? lead._enricher_channels : [],
+  });
 
   Object.keys(row).forEach((k) => {
     if (row[k] === undefined) delete row[k];
