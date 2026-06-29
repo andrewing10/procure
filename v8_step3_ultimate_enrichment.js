@@ -92,6 +92,43 @@ function flushDomainCache() {
     try { fs.writeFileSync(DOMAIN_CACHE_FILE, JSON.stringify(domainContactCache, null, 2)); } catch {}
 }
 
+// ── L3 推断缓存（跨 sweep 复用，避免对同一公司重复调 Gemini）─────────────────
+// 键 = 公司名(归一化) | 目标品类 | 买家/供应商方向（target_category_match 依赖这两者，必须入键）。
+// 缓存未命中 = 完全维持原 LLM 推断行为；命中则套用上次结果，省掉一次 batch 的 token + 时延。
+const L3_CACHE_FILE = 'zhimao_l3_inference_cache.json';
+const L3_CACHE_TTL_DAYS = parseInt(process.env.L3_CACHE_TTL_DAYS || '30', 10);
+let l3InferenceCache = {};
+try {
+    if (fs.existsSync(L3_CACHE_FILE)) l3InferenceCache = JSON.parse(fs.readFileSync(L3_CACHE_FILE, 'utf8'));
+} catch { l3InferenceCache = {}; }
+
+const normNameL3 = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+function l3CacheKeyFor(lead) {
+    const cat = String(process.env.DISCOVERY_CATEGORY || '').trim().slice(0, 80).toLowerCase();
+    return `${normNameL3(lead.company_name)}|${cat}|${IS_SUPPLIER_MODE ? 'sup' : 'buy'}`;
+}
+function getCachedL3(key) {
+    const entry = l3InferenceCache[key];
+    if (!entry || !entry.v) return null;
+    const ageMs = Date.now() - new Date(entry.cached_at).getTime();
+    if (ageMs > L3_CACHE_TTL_DAYS * 86400 * 1000) return null;
+    return entry.v;
+}
+function setCachedL3(key, value) {
+    if (key && value) l3InferenceCache[key] = { v: value, cached_at: new Date().toISOString() };
+}
+function flushL3Cache() {
+    try { fs.writeFileSync(L3_CACHE_FILE, JSON.stringify(l3InferenceCache)); } catch {}
+}
+// 命中缓存时把已推断字段套回 lead（与下方 LLM 合并路径写入的字段保持一致）。
+function applyCachedL3(lead, c) {
+    lead.entity_role = c.entity_role || 'Service';
+    lead.inferred_bom = Array.isArray(c.inferred_bom) ? c.inferred_bom : [];
+    if (lead.entity_role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
+    else if (lead.entity_role === 'Wholesaler' || lead.entity_role === 'Retailer') lead.confidence_score = (lead.confidence_score || 50) + 10;
+    lead.inference_breakdown = c.inference_breakdown;
+}
+
 /**
  * L3 Supply Chain Inference (Gemini).
  *
@@ -101,11 +138,24 @@ function flushDomainCache() {
 async function inferL3SupplyChain(leads) {
     if (leads.length === 0) return leads;
 
-    const batches = [];
-    for (let i = 0; i < leads.length; i += BOM_BATCH_SIZE) {
-        batches.push(leads.slice(i, i + BOM_BATCH_SIZE));
+    // 跨 sweep 复用：命中 L3 缓存的 lead 直接套用上次推断，不再调 LLM（缓存未命中=维持原行为）。
+    const toInfer = [];
+    let l3CacheHits = 0;
+    for (const lead of leads) {
+        const cached = getCachedL3(l3CacheKeyFor(lead));
+        if (cached) { applyCachedL3(lead, cached); l3CacheHits += 1; }
+        else toInfer.push(lead);
     }
-    console.log(`[step3] L3 supply-chain inference for ${leads.length} entities in ${batches.length} batch(es) of ${BOM_BATCH_SIZE}, concurrency=${L3_CONCURRENCY}, timeout=${L3_TIMEOUT_MS}ms`);
+    if (toInfer.length === 0) {
+        console.log(`[step3] L3 inference: all ${leads.length} entities served from cache (0 LLM calls)`);
+        return leads;
+    }
+
+    const batches = [];
+    for (let i = 0; i < toInfer.length; i += BOM_BATCH_SIZE) {
+        batches.push(toInfer.slice(i, i + BOM_BATCH_SIZE));
+    }
+    console.log(`[step3] L3 supply-chain inference for ${toInfer.length} entities (cache_hit=${l3CacheHits}/${leads.length}) in ${batches.length} batch(es) of ${BOM_BATCH_SIZE}, concurrency=${L3_CONCURRENCY}, timeout=${L3_TIMEOUT_MS}ms`);
 
     const overallStart = Date.now();
 
@@ -260,12 +310,19 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                     published_at: now,
                 },
             };
+            // 写 L3 缓存：只存合并后用得到的字段，下次同公司+品类直接复用
+            setCachedL3(l3CacheKeyFor(lead), {
+                entity_role: lead.entity_role,
+                inferred_bom: lead.inferred_bom,
+                inference_breakdown: lead.inference_breakdown,
+            });
             merged += 1;
         }
         console.log(`[step3] L3 batch ${batchIndex}/${batchTotal} merged ${merged}/${batch.length} (${Date.now() - startedAt}ms)`);
     }, { concurrency: L3_CONCURRENCY });
 
-    console.log(`[step3] L3 inference total wall=${Date.now() - overallStart}ms`);
+    flushL3Cache();
+    console.log(`[step3] L3 inference total wall=${Date.now() - overallStart}ms (cache_hit=${l3CacheHits}/${leads.length})`);
     return leads;
 }
 
@@ -370,18 +427,21 @@ function httpsGetStep3(url) {
     });
 }
 
-async function lookupContactViaGooglePlaces(companyName, countryIso) {
+async function lookupContactViaGooglePlaces(companyName, countryIso, knownPlaceId = null) {
     if (!GMAPS_KEY || !companyName) return null;
     try {
-        const q = encodeURIComponent(`${companyName}${countryIso ? ' ' + countryIso : ''}`);
-        const findUrl = `https://maps.googleapis.com/maps/api/place/findplacefromtext/json`
-            + `?input=${q}&inputtype=textquery`
-            + `&fields=place_id,name,business_status`
-            + `&key=${GMAPS_KEY}`;
-        const findRes = await httpsGetStep3(findUrl);
-        if (findRes.status !== 'OK' || !findRes.candidates?.length) return null;
-
-        const placeId = findRes.candidates[0].place_id;
+        // step1 maps pillar 已带 place_id 时直接查详情，省掉一次 findplacefromtext 调用（去重复 Places 计费）。
+        let placeId = knownPlaceId || null;
+        if (!placeId) {
+            const q = encodeURIComponent(`${companyName}${countryIso ? ' ' + countryIso : ''}`);
+            const findUrl = `https://maps.googleapis.com/maps/api/place/findplacefromtext/json`
+                + `?input=${q}&inputtype=textquery`
+                + `&fields=place_id,name,business_status`
+                + `&key=${GMAPS_KEY}`;
+            const findRes = await httpsGetStep3(findUrl);
+            if (findRes.status !== 'OK' || !findRes.candidates?.length) return null;
+            placeId = findRes.candidates[0].place_id;
+        }
         if (!placeId) return null;
 
         const detUrl = `https://maps.googleapis.com/maps/api/place/details/json`
@@ -404,18 +464,10 @@ async function extractContactForLead(lead, contexts) {
     lead.primary_email = lead.primary_email || lead.email || null;
     lead.primary_phone = lead.primary_phone || lead.phone || null;
 
-    // step1 已带齐联系方式时跳过 GMaps / Playwright
-    if (lead.primary_email && lead.primary_phone) {
-        score += 30;
-        if (lead.pillar?.includes('LBS')) score += 15;
-        lead.confidence_score = Math.min(score, 100);
-        return lead;
-    }
-
     // ── ❶ Google Places API 预填充（比 Playwright 快 10-50x，节省代理配额）────
     // 只对还缺电话/官网的 lead 执行，且必须有公司名
     if (GMAPS_KEY && lead.company_name && (!lead.primary_phone || !lead.domain)) {
-        const gmapsResult = await lookupContactViaGooglePlaces(lead.company_name, lead.country_iso || '');
+        const gmapsResult = await lookupContactViaGooglePlaces(lead.company_name, lead.country_iso || '', lead.place_id || null);
         if (gmapsResult) {
             if (gmapsResult.phone && !lead.primary_phone) {
                 lead.primary_phone = gmapsResult.phone;
