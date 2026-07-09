@@ -18,6 +18,14 @@ const V8_SUPPORTED_ISO2 = new Set([
 
 const DEFAULT_PIPELINE_VERSION = 'v8';
 
+/** Render / pm2 / 本机统一实例 ID（pm2 多 fork 时拼 NODE_APP_INSTANCE） */
+function resolveWorkerInstanceId() {
+  const base = process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || 'procure-worker';
+  const idx = process.env.NODE_APP_INSTANCE;
+  if (idx === undefined || idx === null || String(idx).trim() === '') return base;
+  return `${base}-${idx}`;
+}
+
 function resolvePipelineVersion(jobOrIso) {
   const iso = typeof jobOrIso === 'string'
     ? jobOrIso
@@ -36,7 +44,7 @@ async function recordStage(supabase, jobId, stage, payload = null) {
   const { data, error } = await supabase.rpc('discovery_job_record_stage', {
     p_job_id: jobId,
     p_stage: stage,
-    p_claimed_by: process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || 'procure-worker',
+    p_claimed_by: resolveWorkerInstanceId(),
     p_payload: payload,
   });
   if (error) {
@@ -107,7 +115,7 @@ async function releaseStaleClaims(supabase, staleSeconds = 900) {
 
 async function claimNextDiscoveryJob(supabase, workerId) {
   const { data, error } = await supabase.rpc('claim_next_discovery_job', {
-    p_worker_id: workerId || process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || 'procure-worker',
+    p_worker_id: workerId || resolveWorkerInstanceId(),
   });
   if (error) {
     console.warn('[zhimao-contract] claim_next_discovery_job failed:', error.message);
@@ -141,6 +149,7 @@ async function upsertJobLeadMapping(supabase, discoveryJobId, companyId, quality
 
 module.exports = {
   V8_SUPPORTED_ISO2,
+  resolveWorkerInstanceId,
   resolvePipelineVersion,
   recordStage,
   finalizeJob,

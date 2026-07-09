@@ -1,6 +1,6 @@
-require('dotenv').config();
+require('./load-env');
 const { spawn, execSync } = require('child_process');
-const { createClient } = require('@supabase/supabase-js');
+const { createSupabaseClient } = require('./v8_supabase_client');
 const {
   recordStage,
   finalizeJob,
@@ -8,6 +8,7 @@ const {
   isJobCancelled,
   releaseStaleClaims,
   claimNextDiscoveryJob,
+  resolveWorkerInstanceId,
 } = require('./v8_zhimao_contract');
 const { readFunnelDoc, deleteFunnelFile } = require('./v8_lib_funnel');
 const { processEnrichmentBatch } = require('./v8_lib_enrichment_supabase');
@@ -30,9 +31,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { autoRefreshToken: false, persistSession: false },
-});
+const supabase = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const POLL_MS = Math.max(Number(process.env.DISCOVERY_POLL_MS || 15000), 3000);
 
@@ -558,7 +557,7 @@ async function claimAndProcessOne(workerId) {
  * 一个并发车道：不停认领 + 处理 job；没活时 sleep(POLL_MS)，有活时只 sleep 一小段再抢下一单。
  */
 async function lane(laneId) {
-  const workerId = `${process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || 'procure-worker'}#lane${laneId}`;
+  const workerId = `${resolveWorkerInstanceId()}#lane${laneId}`;
   while (true) {
     let processed = false;
     try {

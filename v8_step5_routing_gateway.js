@@ -11,7 +11,7 @@
 require('./load-env');
 const fs = require('fs');
 const Database = require('better-sqlite3');
-const { createClient } = require('@supabase/supabase-js');
+const { createSupabaseClient } = require('./v8_supabase_client');
 const { directIngestQualifiedLeads } = require('./v8_direct_l1_ingest');
 const { mirrorBuyerPersonsFromLeads } = require('./v8_buyer_persons_mirror');
 const { evaluateLead, evaluateLeadSupplier, isNegativeKeywordHit } = require('./v8_quality_gate');
@@ -195,12 +195,6 @@ const validLeads = leads
       return false;
     }
 
-    // P6 方向感知评分：供应商模式用 evaluateLeadSupplier，买家模式沿用 evaluateLead。
-    // 2026-05-23：传 category（DISCOVERY_CATEGORY）启用 CATEGORY_B2C_WHITELIST，
-    //   面粉→bakery / 化妆品→spa / 海鲜→restaurant 等真买家不再被一刀切；
-    //   见 v8_quality_gate.js BIZ_ANTI_GROUPS + CATEGORY_B2C_WHITELIST 双仓镜像段。
-    const evalFn = IS_SUPPLIER_MODE ? evaluateLeadSupplier : evaluateLead;
-    const { qualified, grade } = evalFn(lead, TARGET_CATEGORY_FROM_ENV, NEGATIVE_KEYWORDS);
     const matchRaw = String(lead.industry_match || '').toLowerCase();
     const m = ['high', 'medium', 'low', 'none'].includes(matchRaw) ? matchRaw : 'unset';
     icpStats[m] += 1;
@@ -219,6 +213,23 @@ const validLeads = leads
       gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
       return false;
     }
+
+    // Top-N 截断溢出：未跑 Step3，无 contact/L3；仍入库展示（低 confidence 排后），
+    // 跳过 evaluateLead 的 NO_CONTACT / L3 闸门，也不进 enrichment_queue。
+    if (lead._enrich_deferred) {
+      lead._quality_grade = 'qualified';
+      lead.needs_human_review = true;
+      gradeStats.qualified = (gradeStats.qualified || 0) + 1;
+      if (TARGET_CATEGORY_FROM_ENV && !IS_SUPPLIER_MODE) reverseStats.unset += 1;
+      return true;
+    }
+
+    // P6 方向感知评分：供应商模式用 evaluateLeadSupplier，买家模式沿用 evaluateLead。
+    // 2026-05-23：传 category（DISCOVERY_CATEGORY）启用 CATEGORY_B2C_WHITELIST，
+    //   面粉→bakery / 化妆品→spa / 海鲜→restaurant 等真买家不再被一刀切；
+    //   见 v8_quality_gate.js BIZ_ANTI_GROUPS + CATEGORY_B2C_WHITELIST 双仓镜像段。
+    const evalFn = IS_SUPPLIER_MODE ? evaluateLeadSupplier : evaluateLead;
+    const { qualified, grade } = evalFn(lead, TARGET_CATEGORY_FROM_ENV, NEGATIVE_KEYWORDS);
 
     // ── 业态画像树反向验证闸门 ───────────────────────────────────────────────
     // 仅在用户输入了 TARGET_CATEGORY 且 REVERSE_VERIFY_MODE != 'off' 时生效。
@@ -300,6 +311,11 @@ validLeads.forEach((lead) => {
   const hasContact = !!(lead.primary_email || lead.primary_phone);
   const isHot = lead.confidence_score >= 90 && hasContact;
   const usableDomain = isUsableDomain(lead.domain);
+  // Top-N 溢出：只展示、不异步补 contact（用户明确「后面条数不做」）
+  if (lead._skip_enrichment_queue || lead._enrich_deferred) {
+    enqueueRejected += 1;
+    return;
+  }
   if (isHot && insertMain) {
     insertMain.run(
       lead.company_name,
@@ -383,9 +399,7 @@ if (enqueueRejected > 0) {
 (async () => {
   if (validLeads.length > 0) {
     console.log(`[step5] Supabase L1 ingest: ${validLeads.length} leads...`);
-    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const supabase = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     // PR-DEDUP-CACHE L2-2 (2026-05-28)：增量补抓模式
     //   zhimao submit route 在 action_type='incremental_search' 时注入
     //   PILLAR0_PAYLOAD.incremental_mode + incremental_blacklist_company_ids，

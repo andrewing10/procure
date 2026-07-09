@@ -515,8 +515,8 @@ async function run() {
       const supaKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
       if (supaUrl && supaKey) {
         try {
-          const { createClient } = require('@supabase/supabase-js');
-          const supa = createClient(supaUrl, supaKey, { auth: { persistSession: false } });
+          const { createSupabaseClient } = require('./v8_supabase_client');
+          const supa = createSupabaseClient(supaUrl, supaKey, { auth: { persistSession: false } });
           let q = supa.from('discovery_seeds').select('id,url,seed_type,country_iso,category').eq('status', 'pending');
           if (cc) q = q.or(`country_iso.is.null,country_iso.eq.${cc.toUpperCase()}`);
           const { data: pending, error } = await q.limit(50);

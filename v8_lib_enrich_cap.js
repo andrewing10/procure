@@ -1,0 +1,149 @@
+/**
+ * Step2 → Step3 之间的 Top-N 截断：
+ * 无论 intake 多少条，只对排序后最好的 N 条跑昂贵 Step3；
+ * 溢出条保留轻量字段，Step5 入库后靠更低 confidence 排在后面展示。
+ *
+ * Env: ENRICH_TOP_N（默认 30；<=0 表示不截断）
+ */
+'use strict';
+
+const INTENT_SCORE = {
+  USER_SEED_INLINE: 35,
+  USER_SEED: 32,
+  BOL_SIGNAL: 28,
+  CUSTOMS_SIGNAL: 28,
+  CUSTOMS_DB: 26,
+  IMPORT_RECORD: 24,
+  PROCUREMENT_DECISION_MAKER: 22,
+  PRIVATE_LABEL: 18,
+  B2B_BUYER: 16,
+  PILLAR0_BOOLEAN: 14,
+};
+
+const MATCH_SCORE = { high: 40, medium: 22, low: 8, none: 0 };
+
+function intentBoost(signal) {
+  const key = String(signal || '').toUpperCase();
+  if (INTENT_SCORE[key] != null) return INTENT_SCORE[key];
+  if (!key) return 0;
+  return 6;
+}
+
+function pillarBoost(pillar) {
+  const p = String(pillar || '');
+  if (/Pillar\s*0|Seed/i.test(p)) return 30;
+  if (/Pillar\s*10|VerifiedSource/i.test(p)) return 22;
+  if (/Pillar\s*7|Customs/i.test(p)) return 18;
+  if (/Pillar\s*11|LinkedIn/i.test(p)) return 16;
+  if (/Pillar\s*8|B2B/i.test(p)) return 12;
+  return 4;
+}
+
+function hasUsableDomain(d) {
+  if (typeof d !== 'string') return false;
+  const cleaned = d.trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0];
+  if (!cleaned || cleaned.length < 4 || !cleaned.includes('.')) return false;
+  return /[a-z]/.test(cleaned) || /^[\d.]+$/.test(cleaned);
+}
+
+/**
+ * 预富化排序分（0–100 量级）。Step3 前尚无 confidence_score / L3，
+ * 用 industry_match + 信号源 + pillar + 域名/电话等可观测字段。
+ */
+function preEnrichRankScore(lead) {
+  if (!lead || typeof lead !== 'object') return 0;
+  const matchRaw = String(lead.industry_match || '').toLowerCase();
+  const matchPts = MATCH_SCORE[matchRaw] != null ? MATCH_SCORE[matchRaw] : 5;
+  let score =
+    matchPts +
+    intentBoost(lead.intent_signal) +
+    pillarBoost(lead.pillar) +
+    Number(lead.verified_source_boost || 0);
+
+  if (hasUsableDomain(lead.domain)) score += 12;
+  if (lead.phone || lead.primary_phone) score += 10;
+  if (lead.place_id || lead.maps_url) score += 6;
+  if (lead.source_url || lead.link) score += 3;
+  if (Array.isArray(lead.social_profile_urls) && lead.social_profile_urls.length) score += 4;
+
+  return Math.min(100, Math.round(score));
+}
+
+function compareLeads(a, b) {
+  const sa = preEnrichRankScore(a);
+  const sb = preEnrichRankScore(b);
+  if (sb !== sa) return sb - sa;
+  const ma = String(a.industry_match || '');
+  const mb = String(b.industry_match || '');
+  const order = { high: 3, medium: 2, low: 1, none: 0 };
+  const da = order[ma] || 0;
+  const db = order[mb] || 0;
+  if (db !== da) return db - da;
+  return String(a.company_name || '').localeCompare(String(b.company_name || ''));
+}
+
+/**
+ * @param {object[]} leads
+ * @param {number} topN  ENRICH_TOP_N；<=0 不截断
+ * @returns {{ top: object[], overflow: object[], topN: number, total: number }}
+ */
+function splitEnrichTopN(leads, topN) {
+  const list = Array.isArray(leads) ? leads.slice() : [];
+  const n = Number(topN);
+  const total = list.length;
+  if (!Number.isFinite(n) || n <= 0 || total <= n) {
+    return { top: list, overflow: [], topN: n, total };
+  }
+  list.sort(compareLeads);
+  const top = list.slice(0, n).map((lead, i) => ({
+    ...lead,
+    _enrich_rank: i + 1,
+    _pre_enrich_score: preEnrichRankScore(lead),
+  }));
+  const overflow = list.slice(n).map((lead, i) => ({
+    ...lead,
+    _enrich_deferred: true,
+    _enrich_rank: n + i + 1,
+    _pre_enrich_score: preEnrichRankScore(lead),
+    // 低于典型 Step3 富化分，前端按 confidence 排序时自然靠后
+    confidence_score: Math.min(45, Math.max(15, Math.round(preEnrichRankScore(lead) * 0.45))),
+  }));
+  return { top, overflow, topN: n, total };
+}
+
+function readEnrichTopNFromEnv(env = process.env) {
+  const raw = env.ENRICH_TOP_N;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return 30;
+  const n = parseInt(String(raw), 10);
+  if (!Number.isFinite(n)) return 30;
+  return n;
+}
+
+/**
+ * 把溢出线索压成可进 Step4/5 的轻量 lead（跳过 Step3）。
+ * 不入 enrichment_queue（_skip_enrichment_queue）。
+ */
+function materializeOverflowLead(lead, countryCode) {
+  const score = Number(lead.confidence_score);
+  const confidence = Number.isFinite(score)
+    ? score
+    : Math.min(45, Math.max(15, Math.round(preEnrichRankScore(lead) * 0.45)));
+  return {
+    ...lead,
+    country: lead.country || countryCode || null,
+    confidence_score: confidence,
+    _enrich_deferred: true,
+    _skip_enrichment_queue: true,
+    // 无 L3；step5 reverse-verify 会计 unset 且不拦截
+    entity_role: lead.entity_role || null,
+  };
+}
+
+module.exports = {
+  preEnrichRankScore,
+  compareLeads,
+  splitEnrichTopN,
+  readEnrichTopNFromEnv,
+  materializeOverflowLead,
+  hasUsableDomain,
+};

@@ -3,7 +3,7 @@
  * 格式对齐 zhimao FunnelStep[]（step / signals / accepted / pillars / wall_ms 等）。
  */
 require('./load-env');
-const { createClient } = require('@supabase/supabase-js');
+const { createSupabaseClient } = require('./v8_supabase_client');
 
 let _client = null;
 
@@ -12,9 +12,7 @@ function getSupabase() {
   const url = process.env.SUPABASE_URL || '';
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
   if (!url || !key) return null;
-  _client = createClient(url, key, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
+  _client = createSupabaseClient(url, key);
   return _client;
 }
 

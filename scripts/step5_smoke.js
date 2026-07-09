@@ -6,7 +6,7 @@
 require('../load-env');
 const fs = require('fs');
 const path = require('path');
-const { createClient } = require('@supabase/supabase-js');
+const { createSupabaseClient } = require('../v8_supabase_client');
 const { directIngestQualifiedLeads } = require('../v8_direct_l1_ingest');
 
 const fixturePath = path.join(__dirname, '..', 'fixtures', 'step5_smoke_input.json');
@@ -24,9 +24,7 @@ async function main() {
   const leads = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
   console.log('[smoke] fixture:', fixturePath, 'leads:', leads.length);
 
-  const supabase = createClient(url, key, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
+  const supabase = createSupabaseClient(url, key);
 
   const result = await directIngestQualifiedLeads(supabase, leads, { discoveryJobId: null });
   console.log(

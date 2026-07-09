@@ -1,6 +1,12 @@
 const fs = require('fs');
 const { execSync } = require('child_process');
 const { reportDiscoveryStage } = require('./v8_discovery_stage');
+const {
+    splitEnrichTopN,
+    readEnrichTopNFromEnv,
+    materializeOverflowLead,
+} = require('./v8_lib_enrich_cap');
+const { appendFunnelStep } = require('./v8_lib_funnel');
 
 console.log(`\n==================================================================`);
 console.log(`[V8 ULTIMATE OMNI-MATRIX] FULL PHYSICAL ASSERTION ENGINE`);
@@ -40,7 +46,7 @@ process.on('SIGTERM', () => {
 // 注意：worker 侧另有 DISCOVERY_PIPELINE_MAX_MS 总看门狗（默认 18min）作为整体兜底。
 const STEP_TIMEOUT_MS = Math.max(Number(process.env.DISCOVERY_STEP_TIMEOUT_MS || 10 * 60 * 1000), 30_000);
 
-function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs = "") {
+function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs = "", opts = {}) {
     // ── Graceful cancel：跳过耗时的富化步骤，但不跳过去重和持久化 ──────────────
     // step4 = "4. Global Dedupe", step5 = "5. Routing & Persistence"
     const isPersistenceStep = stepName.startsWith("4.") || stepName.startsWith("5.");
@@ -121,7 +127,7 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
                         : (outputData.db_injected != null ? outputData.db_injected
                             : (outputData.status === 'success' ? 1 : 0))))));
 
-    if (count === 0 && !stepName.includes("Bridge")) {
+    if (count === 0 && !stepName.includes("Bridge") && !opts.allowEmpty) {
         // exit(2) = "graceful stop, no data" — 与 exit(0)=完全成功 / exit(1)=崩溃 语义区分
         // discovery_worker 和 cron_worker 读取此 exit code：
         //   0 → 全量写入成功
@@ -131,7 +137,11 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
         process.exit(2);
     }
 
-    console.log(`[ASSERTION PASSED] ${outputFile} validated with ${count} records.`);
+    if (count === 0 && opts.allowEmpty) {
+        console.warn(`[master] Step "${stepName}" returned 0 results — continuing (allowEmpty, e.g. overflow still pending).`);
+    } else {
+        console.log(`[ASSERTION PASSED] ${outputFile} validated with ${count} records.`);
+    }
     return outputData;
 }
 
@@ -139,6 +149,8 @@ const fileBus = {
     t0_orchestration: `${sessionId}/00_orchestration.json`,
     t1_raw_pool:      `${sessionId}/01_raw_pool.json`,
     t2_intake:        `${sessionId}/02_intake.json`,
+    t2_enrich_top:    `${sessionId}/02b_enrich_top.json`,
+    t2_overflow:      `${sessionId}/02b_enrich_overflow.json`,
     t3_enriched:      `${sessionId}/03_enriched_scored.json`,
     t4_deduped:       `${sessionId}/04_deduped.json`,
     t5_final:         `${sessionId}/05_final_routing.json`,
@@ -203,16 +215,74 @@ runAssertedStep("1. Omni-Pillar Collection (6+1 Hub)", "v8_step1_omni_hub.js", f
 void reportDiscoveryStage('parsing');
 runAssertedStep("2. Strict Entity Intake", "v8_step2_intake.js", fileBus.t1_raw_pool, fileBus.t2_intake);
 
+// PHASE 2.5: Top-N enrich cap — 只对最好的 N 条跑 Step3，溢出轻量入库排后展示
+// Env: ENRICH_TOP_N（默认 30；<=0 关闭截断）
+const ENRICH_TOP_N = readEnrichTopNFromEnv();
+let step3Input = fileBus.t2_intake;
+let overflowLeads = [];
+if (!gracefulCancel && fs.existsSync(fileBus.t2_intake)) {
+    try {
+        const intakeAll = JSON.parse(fs.readFileSync(fileBus.t2_intake, 'utf8'));
+        const { top, overflow, total } = splitEnrichTopN(intakeAll, ENRICH_TOP_N);
+        overflowLeads = overflow.map((l) => materializeOverflowLead(l, countryCode));
+        fs.writeFileSync(fileBus.t2_enrich_top, JSON.stringify(top, null, 2));
+        fs.writeFileSync(fileBus.t2_overflow, JSON.stringify(overflowLeads, null, 2));
+        step3Input = fileBus.t2_enrich_top;
+        console.log(
+            `[master] enrich cap: intake=${total} → top=${top.length} for Step3` +
+            (overflowLeads.length ? `, overflow=${overflowLeads.length} deferred (display later)` : '') +
+            ` (ENRICH_TOP_N=${ENRICH_TOP_N})`,
+        );
+        const jobId = process.env.DISCOVERY_JOB_ID || '';
+        if (jobId) {
+            appendFunnelStep(jobId, 'enrich_cap', {
+                intake_total: total,
+                enrich_top_n: ENRICH_TOP_N,
+                top_count: top.length,
+                overflow_count: overflowLeads.length,
+            });
+        }
+    } catch (e) {
+        console.warn(`[master] enrich cap failed (non-fatal, using full intake):`, e?.message || e);
+        step3Input = fileBus.t2_intake;
+        overflowLeads = [];
+    }
+}
+
 // PHASE 3: L3 Supply-Chain Inference + Contact Extraction
 void reportDiscoveryStage('scoring');
 // Gemini infers entity_role, BOM (primary_materials_top3), procurement_items, confidence_tier,
 // intent_summary — stored as inference_breakdown (L1 column via Step5 Supabase ingest).
-runAssertedStep("3. L3 Supply-Chain Inference & Contact Extraction", "v8_step3_ultimate_enrichment.js", fileBus.t2_intake, fileBus.t3_enriched);
+if (!gracefulCancel && Array.isArray(overflowLeads) && overflowLeads.length > 0 &&
+    fs.existsSync(step3Input)) {
+    let topCount = 0;
+    try {
+        const topArr = JSON.parse(fs.readFileSync(step3Input, 'utf8'));
+        topCount = Array.isArray(topArr) ? topArr.length : 0;
+    } catch (_) { topCount = 0; }
+    if (topCount === 0) {
+        // 截断后 Top 为空（极端）→ 跳过 Step3，直接用溢出轻量线索
+        fs.writeFileSync(fileBus.t3_enriched, JSON.stringify(overflowLeads, null, 2));
+        console.log(`[master] enrich cap: top empty, persisting overflow only (${overflowLeads.length})`);
+        overflowLeads = []; // 已写入，避免下面重复 merge
+    } else {
+        runAssertedStep(
+            "3. L3 Supply-Chain Inference & Contact Extraction",
+            "v8_step3_ultimate_enrichment.js",
+            step3Input,
+            fileBus.t3_enriched,
+            "",
+            { allowEmpty: true },
+        );
+    }
+} else {
+    runAssertedStep("3. L3 Supply-Chain Inference & Contact Extraction", "v8_step3_ultimate_enrichment.js", step3Input, fileBus.t3_enriched);
+}
 
 // PHASE 3.5 (Optional): 税号/工商注册反向验证（置信度加权，加分不减分）
 // 由 TAX_VERIFY_ENABLED=true 环境变量激活；默认关闭，不影响主流水线稳定性
 const fileBus_t3v_verified = `${sessionId}/03b_tax_verified.json`;
-if (process.env.TAX_VERIFY_ENABLED === 'true') {
+if (process.env.TAX_VERIFY_ENABLED === 'true' && fs.existsSync(fileBus.t3_enriched)) {
     runAssertedStep(
         "3.5 Tax Registry Cross-Verify (Bridge)",
         "v8_tax_verifier.js",
@@ -220,6 +290,24 @@ if (process.env.TAX_VERIFY_ENABLED === 'true') {
         fileBus_t3v_verified
     );
     fileBus.t3_enriched = fileBus_t3v_verified; // 后续步骤读取已加权文件
+}
+
+// 合并 Step3 富化结果 + 溢出轻量线索，再进去重（溢出不跑 Step3，但仍展示）
+if (overflowLeads.length > 0) {
+    try {
+        let enriched = [];
+        if (fs.existsSync(fileBus.t3_enriched)) {
+            const parsed = JSON.parse(fs.readFileSync(fileBus.t3_enriched, 'utf8'));
+            enriched = Array.isArray(parsed) ? parsed : [];
+        }
+        const merged = [...enriched, ...overflowLeads];
+        fs.writeFileSync(fileBus.t3_enriched, JSON.stringify(merged, null, 2));
+        console.log(
+            `[master] merged overflow into Step3 output: enriched=${enriched.length} + overflow=${overflowLeads.length} → ${merged.length}`,
+        );
+    } catch (e) {
+        console.warn(`[master] overflow merge failed (non-fatal):`, e?.message || e);
+    }
 }
 
 // PHASE 4: Global Dedupe & Schema Normalization

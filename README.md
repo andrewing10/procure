@@ -29,6 +29,13 @@ node zhimao_v8_ultimate_master.js mx "Consumer Electronics"
 npm run loop
 ```
 
+## Production deploy (Singapore desktop)
+
+Self-host workers with pm2 (Supabase stays in cloud for Phase 1). See:
+
+- [`deploy/procure/README.md`](deploy/procure/README.md) — install, env, cutover from Render
+- [`deploy/host/README.md`](deploy/host/README.md) — host baseline, UFW, Nginx (Phase 2+)
+
 ## Dual-Repo Mirror Contracts (与 zhimao 仓约定)
 
 This worker shares **single-source modules** with the zhimao Next.js app.

@@ -2,7 +2,7 @@
  * Supabase discovery_enrichment_queue — 异步 Playwright 补 contact（替代 SKIP_SQLITE 本地队列表）。
  */
 require('./load-env');
-const { createClient } = require('@supabase/supabase-js');
+const { createSupabaseClient } = require('./v8_supabase_client');
 const { evaluateLead } = require('./v8_quality_gate');
 const { normalizeNameCanonical, directIngestQualifiedLeads } = require('./v8_direct_l1_ingest');
 
@@ -14,9 +14,7 @@ function getSupabase() {
   const url = process.env.SUPABASE_URL || '';
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
   if (!url || !key) return null;
-  return createClient(url, key, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
+  return createSupabaseClient(url, key);
 }
 
 function normalizeCountryIso(country) {

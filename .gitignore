@@ -12,6 +12,7 @@ v8_ultimate_*/
 *.sqlite
 *.log
 *.log.txt
+logs/
 
 # Lead data & exports (business sensitive)
 *_output.json

@@ -3,7 +3,7 @@
  * 非 fatal：RPC 失败只打 warn，不阻断流水线。
  */
 require('./load-env');
-const { createClient } = require('@supabase/supabase-js');
+const { createSupabaseClient } = require('./v8_supabase_client');
 
 let _client = null;
 
@@ -12,15 +12,12 @@ function getSupabase() {
   const url = process.env.SUPABASE_URL || '';
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
   if (!url || !key) return null;
-  _client = createClient(url, key, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
+  _client = createSupabaseClient(url, key);
   return _client;
 }
 
-const CLAIMED_BY = process.env.RENDER_INSTANCE_ID
-  ? `v8-worker/${process.env.RENDER_INSTANCE_ID}`
-  : 'v8-worker/local';
+const { resolveWorkerInstanceId } = require('./v8_zhimao_contract');
+const CLAIMED_BY = `v8-worker/${resolveWorkerInstanceId()}`;
 
 /**
  * @param {'claimed'|'fetching'|'parsing'|'scoring'|'persisting'|'done'|'failed'} stage

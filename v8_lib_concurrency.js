@@ -24,6 +24,58 @@
 
 const https = require('https');
 
+/**
+ * 宽松 JSON 解析：剥 markdown fence、截断补全括号。
+ * L3 大批次时 Gemini 常截断在 results[] 中间，直接 JSON.parse 失败会误触发 Claude 兜底。
+ */
+function parseJsonLoose(text) {
+    let s = String(text || '').trim();
+    if (!s) throw new Error('empty_json_text');
+    s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    try {
+        return JSON.parse(s);
+    } catch (_) { /* continue */ }
+
+    const startObj = s.indexOf('{');
+    const startArr = s.indexOf('[');
+    let start = -1;
+    if (startObj >= 0 && (startArr < 0 || startObj < startArr)) start = startObj;
+    else if (startArr >= 0) start = startArr;
+    if (start > 0) s = s.slice(start);
+
+    try {
+        return JSON.parse(s);
+    } catch (_) { /* continue */ }
+
+    // 截断修复：丢掉末尾不完整 token，再补齐未闭合的引号/括号
+    let repaired = s
+        .replace(/,\s*"[^"\\]*(?:\\.[^"\\]*)*$/, '') // 未完成的 ,"key
+        .replace(/,\s*\{[^}]*$/, '') // 未完成的对象元素
+        .replace(/:\s*"[^"\\]*(?:\\.[^"\\]*)*$/, ':null') // 未完成的字符串值
+        .replace(/,\s*$/, '');
+
+    let inStr = false;
+    let esc = false;
+    const stack = [];
+    for (let i = 0; i < repaired.length; i++) {
+        const ch = repaired[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{' || ch === '[') stack.push(ch);
+        else if (ch === '}' || ch === ']') stack.pop();
+    }
+    if (inStr) repaired += '"';
+    while (stack.length) {
+        repaired += stack.pop() === '{' ? '}' : ']';
+    }
+    return JSON.parse(repaired);
+}
+
 // ─── pMap ───────────────────────────────────────────────────────────────────
 async function pMap(items, mapper, { concurrency = 4, stopOnError = false } = {}) {
     const results = new Array(items.length);
@@ -218,18 +270,19 @@ async function callGeminiJson(promptText, {
             const text = r.json?.candidates?.[0]?.content?.parts?.[0]?.text;
             if (!text) throw new Error(`gemini_empty_candidate: status=${r.statusCode}`);
             try {
-                const parsed = JSON.parse(text);
+                const parsed = parseJsonLoose(text);
                 if (tryModel !== model) {
                     console.log(`[${label}] Gemini succeeded with fallback model ${tryModel}`);
                 }
                 return parsed;
             } catch (e) {
+                // 截断 JSON：先试下一个 Gemini 模型，再走 Claude（比直接 Claude 便宜）
                 throw new Error(`gemini_text_not_json: ${e.message}; head=${String(text).slice(0, 200)}`);
             }
         } catch (err) {
             geminiError = err;
-            if (isGeminiModelUnavailableError(err)) {
-                console.warn(`[${label}] Gemini model ${tryModel} unavailable (${err.message.slice(0, 100)}), trying next…`);
+            if (isGeminiModelUnavailableError(err) || /gemini_text_not_json/.test(String(err.message || ''))) {
+                console.warn(`[${label}] Gemini model ${tryModel} failed (${err.message.slice(0, 100)}), trying next…`);
                 continue;
             }
             console.warn(`[${label}] Gemini failed (${err.message.slice(0, 120)})`);
@@ -272,9 +325,7 @@ async function callGeminiJson(promptText, {
                 if (r.json.error) throw new Error(`claude_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
                 const text = (r.json?.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('').trim();
                 if (!text) throw new Error('claude_empty_response');
-                // Claude 偶尔包 ```json ... ```，剥一下
-                const cleaned = text.replace(/^```[a-z]*\n?/im, '').replace(/\n?```$/m, '').trim();
-                const result = JSON.parse(cleaned);
+                const result = parseJsonLoose(text);
                 if (tryClaudeModel !== claudeModel) {
                     console.log(`[${label}] Claude succeeded with fallback model ${tryClaudeModel}`);
                 } else {
@@ -336,7 +387,7 @@ async function callGeminiJson(promptText, {
         if (r.json.error) throw new Error(`openai_api_error: ${r.json.error.message || JSON.stringify(r.json.error)}`);
         const text = r.json?.choices?.[0]?.message?.content;
         if (!text) throw new Error('openai_empty_response');
-        const result = JSON.parse(text);
+        const result = parseJsonLoose(text);
         console.log(`[${label}] OpenAI fallback succeeded`);
         return result;
     } catch (oaErr) {
@@ -476,5 +527,6 @@ module.exports = {
     sleep,
     requestJsonWithRetry,
     callGeminiJson,
+    parseJsonLoose,
     preFilterRawLeads,
 };

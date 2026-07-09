@@ -1,0 +1,14 @@
+# Cloudflare IP allowlist snippet (optional)
+# 用法:
+#   1. 从 https://www.cloudflare.com/ips-v4 与 ips-v6 拉取当前段
+#   2. 每行写成: allow x.x.x.x/y;
+#   3. 末尾加: deny all;
+#   4. 保存为 /etc/nginx/cloudflare-allow.conf
+#   5. 在各 server {} 内取消注释: include /etc/nginx/cloudflare-allow.conf;
+#
+# 未维护完整列表前不要 include，以免误锁源站。
+#
+# 示例（须用官方最新列表替换）:
+# allow 173.245.48.0/20;
+# allow 103.21.244.0/22;
+# deny all;
