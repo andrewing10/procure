@@ -31,8 +31,11 @@ fs.mkdirSync(sessionId, { recursive: true });
  * 普通 step 接到信号后，等当前 execSync 子进程结束（或被中断），
  * 然后跳过剩余的富化步骤，但**强制运行 step4（去重）和 step5（持久化）**。
  * 这样即使用户取消，已采集/富化的数据也能落库，不会全损。
+ *
+ * partialTimeout：某步（通常 Step3）execSync 超时后降级继续，仍跑 step4/5 输出已有数据。
  */
 let gracefulCancel = false;
+let partialTimeout = false;
 process.on('SIGTERM', () => {
     if (!gracefulCancel) {
         gracefulCancel = true;
@@ -41,17 +44,19 @@ process.on('SIGTERM', () => {
 });
 
 // 单个 step 的硬超时：防止某一步（step1 采集 / step3 富化）卡死把整条 pipeline 拖死。
-// 与 v8_cron_worker.js / v8_enrichment_queue_worker.js 的 execSync timeout 同款思路。
-// 默认 10min，env 可调；命中后 execSync 抛错 → 写 crash 文件 → exit 1 → worker markFailed。
-// 注意：worker 侧另有 DISCOVERY_PIPELINE_MAX_MS 总看门狗（默认 18min）作为整体兜底。
+// 默认 10min，env 可调。富化步超时 → 降级继续 step4/5（不再整单失败空结果）。
+// 注意：worker 侧另有 DISCOVERY_PIPELINE_MAX_MS 总看门狗作为整体兜底。
 const STEP_TIMEOUT_MS = Math.max(Number(process.env.DISCOVERY_STEP_TIMEOUT_MS || 10 * 60 * 1000), 30_000);
 
+function isEnrichmentStep(stepName) {
+    return String(stepName || '').startsWith('3');
+}
+
 function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs = "", opts = {}) {
-    // ── Graceful cancel：跳过耗时的富化步骤，但不跳过去重和持久化 ──────────────
-    // step4 = "4. Global Dedupe", step5 = "5. Routing & Persistence"
+    // ── Graceful cancel：跳过所有非持久化步；partial timeout：只跳过后续富化步 ──
     const isPersistenceStep = stepName.startsWith("4.") || stepName.startsWith("5.");
-    if (gracefulCancel && !isPersistenceStep) {
-        console.warn(`[master] graceful cancel — skipping ${stepName}`);
+    if (!isPersistenceStep && (gracefulCancel || (partialTimeout && isEnrichmentStep(stepName)))) {
+        console.warn(`[master] ${gracefulCancel ? 'graceful cancel' : 'partial timeout'} — skipping ${stepName}`);
         return null;
     }
 
@@ -60,27 +65,38 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
     const inputs = Array.isArray(inputFiles) ? inputFiles : [inputFiles];
     inputs.forEach(inf => {
         if (inf && !fs.existsSync(inf)) {
-            if (gracefulCancel) {
-                // cancel 期间输入文件缺失（该步骤被跳过），静默退出
-                console.warn(`[master] graceful cancel — input '${inf}' missing for ${stepName}, skipping`);
+            if (gracefulCancel || partialTimeout) {
+                console.warn(`[master] degrade — input '${inf}' missing for ${stepName}, skipping`);
                 return;
             }
             console.error(`[HALT] Required input '${inf}' missing.`);
             process.exit(1);
         }
     });
-    // 如果 cancel 期间所有 input 都缺失，直接跳过
-    if (gracefulCancel && inputs.every(inf => inf && !fs.existsSync(inf))) return null;
+    if ((gracefulCancel || partialTimeout) && inputs.every(inf => inf && !fs.existsSync(inf))) return null;
 
     const inputArg = inputs.join(',');
     const cmd = `node ${scriptFile} "${inputArg}" "${outputFile}" ${extraArgs}`;
     console.log(`-> Executing: ${cmd}`);
 
+    // 富化步用 SIGTERM：给 step3 机会写 checkpoint；采集步仍 SIGKILL 防真卡死。
+    const killSignal = isEnrichmentStep(stepName) ? 'SIGTERM' : 'SIGKILL';
+
     try {
-        execSync(cmd, { stdio: 'inherit', timeout: STEP_TIMEOUT_MS, killSignal: 'SIGKILL' });
+        execSync(cmd, { stdio: 'inherit', timeout: STEP_TIMEOUT_MS, killSignal });
     } catch (e) {
-        // execSync 超时：e.killed === true 且 e.signal/e.code 反映被杀；按崩溃处理并标注超时步骤。
-        if (!gracefulCancel && e && e.killed) {
+        const timedOut = !!(e && e.killed);
+        if (timedOut && isEnrichmentStep(stepName)) {
+            // Step3/3.5 超时：有输出就用；没有则后续回退 intake — 绝不整单空失败。
+            partialTimeout = true;
+            if (fs.existsSync(outputFile)) {
+                console.warn(`[master] step timeout — ${stepName} exceeded ${STEP_TIMEOUT_MS}ms but partial output exists; continuing to step4/5`);
+                return null;
+            }
+            console.warn(`[master] step timeout — ${stepName} exceeded ${STEP_TIMEOUT_MS}ms, no output yet; will fall back to intake/overflow for persistence`);
+            return null;
+        }
+        if (timedOut && !gracefulCancel) {
             console.error(`[HALT] Step "${stepName}" exceeded ${STEP_TIMEOUT_MS}ms — killed (likely a stuck upstream). Treating as crash.`);
             const jobId = process.env.DISCOVERY_JOB_ID || 'unknown';
             try {
@@ -91,17 +107,15 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
             } catch (_) { /* ignore */ }
             process.exit(1);
         }
-        if (gracefulCancel) {
-            // step 被 cancel 中断（execSync 异常），检查输出是否有部分数据
+        if (gracefulCancel || partialTimeout) {
             if (fs.existsSync(outputFile)) {
-                console.warn(`[master] graceful cancel — ${stepName} interrupted but partial output exists, continuing to persistence...`);
+                console.warn(`[master] degrade — ${stepName} interrupted but partial output exists, continuing to persistence...`);
                 return null;
             }
-            console.warn(`[master] graceful cancel — ${stepName} interrupted, no output, skipping.`);
+            console.warn(`[master] degrade — ${stepName} interrupted, no output, skipping.`);
             return null;
         }
         console.error(`[HALT] Script crashed: ${scriptFile}. Error: ${e.message}`);
-        // 写入 job-scoped 崩溃文件，供 v8_discovery_worker.js 在 markFailed 时读取
         const jobId = process.env.DISCOVERY_JOB_ID || 'unknown';
         try {
             fs.writeFileSync(
@@ -113,6 +127,10 @@ function runAssertedStep(stepName, scriptFile, inputFiles, outputFile, extraArgs
     }
 
     if (!fs.existsSync(outputFile)) {
+        if (partialTimeout || gracefulCancel || opts.allowEmpty) {
+            console.warn(`[master] output missing after ${stepName} — continuing (degrade/allowEmpty)`);
+            return null;
+        }
         console.error(`[HALT] Physical output missing: ${outputFile}.`);
         process.exit(1);
     }
@@ -311,11 +329,11 @@ if (overflowLeads.length > 0) {
 }
 
 // PHASE 4: Global Dedupe & Schema Normalization
-// graceful cancel 期间：用最佳可用输入（step3 输出 → step2 输出），确保有数据可去重
-const bestAvailableForDedupe = [fileBus.t3_enriched, fileBus.t2_intake]
+// degrade 期间：step3 → enrich_top → intake，确保有数据可去重落库
+const bestAvailableForDedupe = [fileBus.t3_enriched, fileBus.t2_enrich_top, fileBus.t2_intake]
     .find(f => fs.existsSync(f)) ?? fileBus.t3_enriched;
-if (gracefulCancel && bestAvailableForDedupe !== fileBus.t3_enriched) {
-    console.warn(`[master] graceful cancel — step3 output missing, using ${bestAvailableForDedupe} for dedupe`);
+if ((gracefulCancel || partialTimeout) && bestAvailableForDedupe !== fileBus.t3_enriched) {
+    console.warn(`[master] degrade — step3 output missing, using ${bestAvailableForDedupe} for dedupe`);
 }
 runAssertedStep("4. Global Dedupe", "v8_step4_dedupe.js", bestAvailableForDedupe, fileBus.t4_deduped, `"${countryCode}"`);
 
@@ -327,6 +345,10 @@ if (gracefulCancel) {
     console.log(`\n[V8 PIPELINE GRACEFUL CANCEL] Data persisted. Session: ${sessionId}`);
     // 退出码 4 = graceful cancel with data — worker 识别后执行 finalize（不计为失败）
     process.exitCode = 4;
+} else if (partialTimeout) {
+    console.log(`\n[V8 PIPELINE PARTIAL TIMEOUT] Data persisted from best available. Session: ${sessionId}`);
+    // 退出码 6 = 某步超时但已落库部分结果 — worker markDone(partial_timeout)
+    process.exitCode = 6;
 } else {
     console.log(`\n[V8 PIPELINE COMPLETE] Session: ${sessionId}`);
 }

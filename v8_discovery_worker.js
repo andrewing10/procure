@@ -46,7 +46,8 @@ function sleep(ms) {
 //   2 → 本轮无新数据（graceful stop）→ markDone 但标记 result_count 来自 bulk 侧
 //   3 → 子进程被 cancel SIGTERM 终止（无数据持久化），语义上不是"失败"
 //   4 → graceful cancel with data：SIGTERM 到达后 master 仍完成了 step4/5 持久化
-//   5 → 看门狗硬超时：pipeline 超过 DISCOVERY_PIPELINE_MAX_MS 仍未结束，被强杀（markFailed）
+//   5 → 看门狗硬超时：pipeline 超过 DISCOVERY_PIPELINE_MAX_MS 仍未结束，被强杀
+//   6 → 某步（通常 Step3）超时但已用已有数据跑完 step4/5 → markDone(partial_timeout)
 const PIPELINE_EXIT = {
   SUCCESS: 0,
   CRASH: 1,
@@ -54,6 +55,7 @@ const PIPELINE_EXIT = {
   CANCELLED: 3,
   GRACEFUL_CANCEL_WITH_DATA: 4,
   TIMEOUT: 5,
+  PARTIAL_TIMEOUT_WITH_DATA: 6,
 };
 
 // 看门狗参数（env 可调）：
@@ -269,7 +271,8 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
     // 双路取消监听：Realtime（快）+ 30s 轮询（兜底）
     const watcher = makeCancelWatcher(jobId);
     watcher.promise.then(() => {
-      try { child.kill('SIGTERM'); } catch (_) { /* ignore */ }
+      // 组级 SIGTERM：让卡在 step3 的子进程也能刷 checkpoint
+      killTree('SIGTERM');
     });
 
     // ── A 看门狗：pipeline 硬上限，避免单个 job 卡死后无终态（用户等满 60min 才自愈）──
@@ -281,8 +284,9 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
     let killTimer = null;
     const softTimer = setTimeout(() => {
       watchdogState = 'soft';
-      console.warn(`[worker] pipeline watchdog: job ${jobId} exceeded ${PIPELINE_MAX_MS}ms — SIGTERM master (graceful cancel, will try to persist partial data)`);
-      try { child.kill('SIGTERM'); } catch (_) { /* ignore */ }
+      console.warn(`[worker] pipeline watchdog: job ${jobId} exceeded ${PIPELINE_MAX_MS}ms — SIGTERM process group (graceful cancel, will try to persist partial data)`);
+      // 组级 SIGTERM：master 若卡在 execSync，单杀 master 无效；step3 需直接收到信号才能刷 checkpoint
+      killTree('SIGTERM');
       killTimer = setTimeout(() => {
         watchdogState = 'hard';
         console.warn(`[worker] pipeline watchdog: job ${jobId} still alive ${PIPELINE_KILL_GRACE_MS}ms after SIGTERM — SIGKILL process group`);
@@ -446,6 +450,70 @@ async function markFailed(jobId, msg) {
 }
 
 /**
+ * 硬超时后最后一搏：扫描该 job 的 session 目录，用已有 intake/enriched 跑 step4+5 落库。
+ * 成功返回 true（调用方应 markDone），失败返回 false（再 markFailed）。
+ */
+function recoverPartialAfterHardKill(jobId, countryIso) {
+  const fs = require('fs');
+  const path = require('path');
+  const tag = String(jobId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
+  if (!tag) return false;
+
+  let sessions = [];
+  try {
+    sessions = fs.readdirSync('.').filter((d) => {
+      if (!d.startsWith('v8_ultimate_') || !d.includes(`_${tag}`)) return false;
+      try { return fs.statSync(d).isDirectory(); } catch { return false; }
+    });
+  } catch { return false; }
+  if (sessions.length === 0) return false;
+
+  sessions.sort((a, b) => {
+    try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch { return 0; }
+  });
+  const sessionDir = sessions[0];
+  const candidates = [
+    path.join(sessionDir, '03_enriched_scored.json'),
+    path.join(sessionDir, '02b_enrich_top.json'),
+    path.join(sessionDir, '02_intake.json'),
+  ];
+  const input = candidates.find((f) => fs.existsSync(f));
+  if (!input) {
+    console.warn(`[worker] recover: no recoverable input in ${sessionDir}`);
+    return false;
+  }
+
+  const deduped = path.join(sessionDir, '04_deduped.json');
+  const finalOut = path.join(sessionDir, '05_final_routing.json');
+  const country = String(countryIso || 'XX').replace(/[^A-Za-z]/g, '').slice(0, 4) || 'XX';
+  console.warn(`[worker] recover: hard-kill salvage from ${input} → step4+5`);
+  try {
+    execSync(
+      `node v8_step4_dedupe.js "${input}" "${deduped}" "${country}"`,
+      { stdio: 'inherit', timeout: 120_000, env: process.env },
+    );
+    execSync(
+      `node v8_step5_routing_gateway.js "${deduped}" "${finalOut}"`,
+      {
+        stdio: 'inherit',
+        timeout: 180_000,
+        env: {
+          ...process.env,
+          DISCOVERY_JOB_ID: String(jobId),
+          DISCOVERY_COUNTRY_ISO: country,
+        },
+      },
+    );
+    if (!fs.existsSync(finalOut)) return false;
+    console.warn(`[worker] recover: salvage ok → ${finalOut}`);
+    return true;
+  } catch (e) {
+    console.warn(`[worker] recover: salvage failed:`, e?.message || e);
+    return false;
+  }
+}
+
+/**
  * Write a heartbeat timestamp to platform_runtime_settings so that the zhimao
  * admin panel can detect whether this worker is alive.
  * Key: procure_worker_heartbeat  Value: ISO timestamp
@@ -511,18 +579,34 @@ async function claimAndProcessOne(workerId) {
       return true;
     }
 
-    // 看门狗硬超时：pipeline 卡死被强杀，无优雅落库 → markFailed，让用户拿到明确失败可重试。
+    // 看门狗硬超时：先尝试用 session 已有数据跑 step4+5；成功则 partial done，否则 failed。
     if (exitCode === PIPELINE_EXIT.TIMEOUT) {
-      console.warn(`[worker] job ${job.id} aborted by pipeline watchdog (timeout) — marking failed`);
+      console.warn(`[worker] job ${job.id} aborted by pipeline watchdog (timeout) — trying salvage…`);
+      const salvaged = recoverPartialAfterHardKill(job.id, job.country_iso);
+      if (salvaged) {
+        console.warn(`[worker] job ${job.id} salvage ok — marking done (partial_timeout)`);
+        await supabase
+          .from('discovery_jobs')
+          .update({ sweep_count: sweepCount, completion_reason: 'partial_timeout' })
+          .eq('id', job.id);
+        await markDone(job);
+        const count = await readMappingCount(job.id);
+        console.log(`[worker] [${workerId}] job done (salvaged) ${job.id}, mapping_count=${count}`);
+        return true;
+      }
+      console.warn(`[worker] job ${job.id} salvage failed — marking failed`);
       await markFailed(job.id, 'pipeline_timeout');
       return true;
     }
 
-    // exit(2) = no new data this sweep — mark done 但 completion_reason=completed_empty
+    // exit(2) = no new data；exit(6) = 某步超时但已落库部分结果
     let completionReason = 'success';
     if (exitCode === PIPELINE_EXIT.NO_DATA) {
       completionReason = 'completed_empty';
       console.log(`[worker] job ${job.id} sweep=${sweepCount}: no new data (graceful stop).`);
+    } else if (exitCode === PIPELINE_EXIT.PARTIAL_TIMEOUT_WITH_DATA) {
+      completionReason = 'partial_timeout';
+      console.log(`[worker] job ${job.id} sweep=${sweepCount}: partial timeout with data persisted.`);
     }
 
     const funnelDoc = readFunnelDoc(job.id);

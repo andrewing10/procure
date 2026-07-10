@@ -62,9 +62,40 @@ const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE ||
 const L3_CONCURRENCY        = Math.max(1, parseInt(process.env.L3_CONCURRENCY || '3',  10));
 // L3 timeout 提升到 60s：gemini-2.5-flash 通常 10-20s，但高负载时可达 50s+
 const L3_TIMEOUT_MS         = Math.max(5_000, parseInt(process.env.L3_TIMEOUT_MS || '60000', 10));
-const L3_MAX_RETRIES        = Math.max(0, parseInt(process.env.L3_MAX_RETRIES || '3', 10));
+// 默认重试 1：超时场景下 3 次会把单 batch 拖到数分钟，易触发整步 STEP_TIMEOUT
+const L3_MAX_RETRIES        = Math.max(0, parseInt(process.env.L3_MAX_RETRIES || '1', 10));
 // 并发数提升：4 → 8（在有代理或高带宽环境下可进一步调高至 12）
 const PAGE_CONCURRENCY      = Math.max(1, parseInt(process.env.STEP3_PAGE_CONCURRENCY || '8', 10));
+
+/** SIGTERM / 超时杀进程时尽快刷盘，供 master 降级落库 */
+let step3Abort = false;
+let step3LeadsRef = null;
+function flushStep3Checkpoint(reason) {
+    if (!outputFile || !Array.isArray(step3LeadsRef) || step3LeadsRef.length === 0) return false;
+    try {
+        fs.writeFileSync(outputFile, JSON.stringify(step3LeadsRef, null, 2));
+        console.warn(`[step3] checkpoint flushed (${reason}): ${step3LeadsRef.length} leads → ${outputFile}`);
+        return true;
+    } catch (e) {
+        console.warn(`[step3] checkpoint flush failed:`, e?.message || e);
+        return false;
+    }
+}
+process.on('SIGTERM', () => {
+    if (step3Abort) return;
+    step3Abort = true;
+    console.warn('[step3] SIGTERM — flushing checkpoint then exit so master can persist partial data');
+    flushStep3Checkpoint('SIGTERM');
+    try { flushDomainCache(); } catch (_) { /* ignore */ }
+    try { flushL3Cache(); } catch (_) { /* ignore */ }
+    process.exit(0);
+});
+process.on('SIGINT', () => {
+    if (step3Abort) return;
+    step3Abort = true;
+    flushStep3Checkpoint('SIGINT');
+    process.exit(0);
+});
 
 // ── 域名抓取缓存（本地文件，跳过 30 天内已爬取的域名）─────────────────────────
 // 避免 cron 每次重跑都对同一家公司 Playwright，既浪费时间又增加被封风险
@@ -663,10 +694,15 @@ async function extractContactForLead(lead, contexts) {
 
 async function run() {
     let leads = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
+    step3LeadsRef = leads;
     if (SKIP_L3_INFERENCE) {
         console.log('[step3] SKIP_L3_INFERENCE=true, skipping L3 inference and only extracting contacts.');
     } else {
         leads = await inferL3SupplyChain(leads);
+        step3LeadsRef = leads;
+        // L3 完成后立刻落盘：即便后续 Playwright 被超时杀掉，master 也能用已有推断结果落库
+        flushStep3Checkpoint('post-L3');
+        if (step3Abort) return;
     }
 
     let browser;
@@ -756,17 +792,28 @@ async function run() {
 
     console.log(`[step3] Contact extraction over ${leads.length} leads, page concurrency=${PAGE_CONCURRENCY}, page timeout=${PLAYWRIGHT_TIMEOUT}ms`);
     const overallStart = Date.now();
+    let contactDone = 0;
+    const CHECKPOINT_EVERY = Math.max(1, parseInt(process.env.STEP3_CHECKPOINT_EVERY || '5', 10));
     const enriched = await pMap(
         leads,
-        (lead) => extractContactForLead(lead, { desktop: desktopCtx, mobile: mobileCtx }),
+        async (lead) => {
+            if (step3Abort) return lead;
+            const row = await extractContactForLead(lead, { desktop: desktopCtx, mobile: mobileCtx });
+            contactDone += 1;
+            if (contactDone % CHECKPOINT_EVERY === 0) {
+                flushStep3Checkpoint(`contact-${contactDone}/${leads.length}`);
+            }
+            return row;
+        },
         { concurrency: PAGE_CONCURRENCY },
     );
 
-    await browser.close();
+    try { await browser.close(); } catch (_) { /* ignore */ }
     flushDomainCache(); // 持久化本次抓取结果到缓存文件
 
     // pMap may return Error instances if any worker threw — keep success rows only.
     const finalLeads = enriched.filter(x => x && !(x instanceof Error));
+    step3LeadsRef = finalLeads;
     const contactHit = finalLeads.filter(l => l.primary_email || l.primary_phone).length;
 
     fs.writeFileSync(outputFile, JSON.stringify(finalLeads, null, 2));
