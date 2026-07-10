@@ -226,7 +226,8 @@ Rules:
 6. purchase_cycle: "weekly" | "monthly" | "quarterly" | "annual" — best estimate.
 7. reason_codes: non-empty array from ["BOM_INFERENCE","ENTITY_ROLE_MANUFACTURER","ENTITY_ROLE_WHOLESALER","ENTITY_ROLE_RETAILER","ENTITY_ROLE_SERVICE","SUPPLY_CHAIN_GRAPH"].${reverseVerifyBlock}
 
-Output strict JSON only:
+Output strict JSON only. results[] MUST be the same length and order as Input (results[i] describes Input[i]).
+Copy each company's "name" EXACTLY from Input — do not translate, shorten, or invent names.
 {"results":[{"name":"Exact Company Name","entity_role":"...","confidence_tier":"...","primary_materials_top3":["...","...","..."],"procurement_items":[{"category":"...","priority":1,"source":"bom","type":"explicit"}],"intent_summary":"...","purchase_cycle":"...","reason_codes":["..."]${reverseVerifyJsonHint}}]}
 
 Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet || '').slice(0, 120) })))}`;
@@ -330,38 +331,24 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
             if (!r.name && (r.company_name || r.company)) {
                 r.name = r.company_name || r.company;
             }
+        }
+
+        // 严格按输入顺序合并：results[i] ↔ batch[i]（prompt 已要求同序同长、name 原样回传）。
+        // 不再跨位按名称乱配，避免 A 的推断写到 B。
+        const n = Math.min(results.length, batch.length);
+        for (let i = 0; i < n; i++) {
+            const r = results[i];
+            if (!r || typeof r !== 'object') continue;
             const rNorm = normName(r.name);
-            let leadIdx = batch.findIndex(
-                (l, i) => !usedLeadIdx.has(i) && normName(l.company_name) === rNorm,
-            );
-            // 名称对不上时：同序位兜底（LLM 常改写/截断公司名导致 find 全 miss → merged 0）
-            if (leadIdx < 0 && ri < batch.length && !usedLeadIdx.has(ri)) {
-                leadIdx = ri;
-                nameMiss += 1;
-            }
-            if (leadIdx < 0) continue;
-            if (applyL3Result(batch[leadIdx], r)) {
-                usedLeadIdx.add(leadIdx);
+            const bNorm = normName(batch[i].company_name);
+            if (rNorm && bNorm && rNorm !== bNorm) nameMiss += 1;
+            if (applyL3Result(batch[i], r)) {
+                usedLeadIdx.add(i);
                 merged += 1;
             }
         }
 
-        // 仍有空位且 results 更短：按 index 把剩余 result 填到未占用 lead（极少见）
-        if (merged === 0 && results.length > 0) {
-            console.warn(
-                `[step3] L3 batch ${batchIndex}/${batchTotal}: name-match all missed; ` +
-                `results=${results.length} sample_names=${JSON.stringify(results.slice(0, 3).map((x) => x?.name))} ` +
-                `batch_names=${JSON.stringify(batch.slice(0, 3).map((l) => l.company_name))}`,
-            );
-            for (let i = 0; i < Math.min(results.length, batch.length); i++) {
-                if (usedLeadIdx.has(i)) continue;
-                if (applyL3Result(batch[i], results[i])) {
-                    usedLeadIdx.add(i);
-                    merged += 1;
-                    nameMiss += 1;
-                }
-            }
-        } else if (results.length === 0) {
+        if (results.length === 0) {
             const keys = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
                 ? Object.keys(parsed).slice(0, 8)
                 : [];
@@ -369,11 +356,17 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                 `[step3] L3 batch ${batchIndex}/${batchTotal}: empty results ` +
                 `(parsed_type=${Array.isArray(parsed) ? 'array' : typeof parsed}, keys=${JSON.stringify(keys)})`,
             );
+        } else if (merged === 0) {
+            console.warn(
+                `[step3] L3 batch ${batchIndex}/${batchTotal}: order-merge got 0; ` +
+                `results=${results.length} sample_names=${JSON.stringify(results.slice(0, 3).map((x) => x?.name))} ` +
+                `batch_names=${JSON.stringify(batch.slice(0, 3).map((l) => l.company_name))}`,
+            );
         }
 
         console.log(
             `[step3] L3 batch ${batchIndex}/${batchTotal} merged ${merged}/${batch.length}` +
-            (nameMiss ? ` (index_fallback=${nameMiss})` : '') +
+            (nameMiss ? ` (name_drift=${nameMiss})` : '') +
             ` (${Date.now() - startedAt}ms)`,
         );
     }, { concurrency: L3_CONCURRENCY });

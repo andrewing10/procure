@@ -22,13 +22,17 @@ const INTENT_SCORE = {
 
 const MATCH_SCORE = { high: 40, medium: 22, low: 8, none: 0 };
 
-/** 标题/公司名像文档、指南、聚合页而非买家公司 */
+/** 标题/公司名像文档、指南、聚合页、平台、展会而非买家公司 */
 const JUNK_TITLE_RE =
-  /\[?\s*pdf\s*\]?|glossary|guidelines?\b|shipping policy|terms of sale|citizen petition|api\s*docs?|developer docs|importing into the|country requirements|trade facilitation act|comprehensive overview|market size|cagr of|job(s)?\b|vacancies|work from home|wikipedia|how to\b|what is\b|meaning of\b/i;
+  /\[?\s*pdf\s*\]?|glossary|guidelines?\b|shipping policy|terms of sale|citizen petition|api\s*docs?|developer docs|importing into the|country requirements|trade facilitation act|comprehensive overview|market size|cagr of|job(s)?\b|vacancies|work from home|wikipedia|how to\b|what is\b|meaning of\b|highest paying|trade mission|rfp\b|visitor registration|apps on google play|online electronic store|industry directory|contract manufacturing services providers/i;
 
-/** 域名像目录站 / 媒体 / 占位，而非公司官网 */
+/** 平台 / 展会 / 媒体 / 海关门户（非目标买家） */
+const PLATFORM_TITLE_RE =
+  /\b(carousell|facebook|linkedin|google play|youtube|trade show|trade fair|forum\s*&\s*market|exhibition|expo\b|itb\b|atf\b|switch trade)\b|海关|singapore customs|customs\.gov|贸易展|展会/i;
+
+/** 域名像目录站 / 媒体 / 占位 / 平台，而非公司官网 */
 const JUNK_HOST_RE =
-  /\b(seair\.co\.in|importinfo\.com|importyeti\.com|volza\.com|panjiva\.com|trademo\.com|usetorg\.com|indexbox\.io|govtrack\.us|zoom\.us|example\.com|wixpress\.com|sentry-next|freepik|shutterstock)\b/i;
+  /\b(seair\.co\.in|importinfo\.com|importyeti\.com|volza\.com|panjiva\.com|trademo\.com|usetorg\.com|indexbox\.io|govtrack\.us|zoom\.us|example\.com|wixpress\.com|sentry-next|freepik|shutterstock|carousell\.com|globalspec\.com|highergov\.com|rxglobal\.com|customs\.gov\.sg|google\.com|play\.google)\b/i;
 
 const PLACEHOLDER_EMAIL_RE =
   /^(user@example\.com|user@domain\.com|info@domain\.com|xxx@organisation\.com|noreply@|no-reply@)/i;
@@ -79,6 +83,7 @@ function junkPenalty(lead) {
   const pathHint = String(lead.link || lead.source_url || lead.domain || '').toLowerCase();
 
   if (JUNK_TITLE_RE.test(title)) pen += 35;
+  if (PLATFORM_TITLE_RE.test(title)) pen += 40;
   if (/\.pdf(\?|#|$)/i.test(pathHint) || /\[pdf\]/i.test(title)) pen += 25;
   if (host && JUNK_HOST_RE.test(host)) pen += 40;
   if (PLACEHOLDER_EMAIL_RE.test(String(lead.primary_email || lead.phone || ''))) pen += 30;
@@ -91,6 +96,10 @@ function junkPenalty(lead) {
   // 无可用域名且无电话 → 富化价值低
   if (!hasUsableDomain(lead.domain) && !(lead.phone || lead.primary_phone) && !lead.place_id) {
     pen += 12;
+  }
+  // 合同制造 / OEM 目录页（搜买家时常是噪声；供应商模式仍可保留信号，此处只轻罚）
+  if (/\b(contract manufacturing|odm services|oem\b|factory outlet)\b/i.test(title)) {
+    pen += 18;
   }
   return pen;
 }

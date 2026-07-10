@@ -1,6 +1,7 @@
 require('dotenv').config();
 const fs    = require('fs');
 const { callGeminiJson } = require('./v8_lib_concurrency');
+const { sanitizeDiscoveryCategory } = require('./v8_lib_category_sanitize');
 
 const [inputFile, outputFile, countryCode, ...catArgs] = process.argv.slice(2);
 const category = catArgs.join(' ') || 'Industrial';
@@ -76,24 +77,15 @@ async function run() {
     const tld         = `site:.${cc} OR site:.com.${cc}`;
 
     /**
-     * 品类词净化：去掉"买家/buyer"类后缀和"...buyers in X"型语境词，
-     * 让 V8 搜索基于真实产品名而非营销短语。
+     * 品类词净化：口语查询 + 买家后缀 + 国家前缀。
      * 原词保留在 category 里用于 DB 记录；搜索全程用 categoryClean。
      *
      * 例：
-     *   "居銮红酒买家"        → "居銮红酒"
+     *   "新加坡有没有电视机" → "电视机"
+     *   "居銮红酒买家"       → "居銮红酒"
      *   "LED lighting buyers in Singapore" → "LED lighting"
-     *   "护肝片买家"          → "护肝片"
-     *   "mattress buyer"      → "mattress"
      */
-    const categoryClean = category
-      // 英文：去掉 "buyers in/from/at Country" 型末尾修饰语
-      .replace(/\s+buyers?\s+(?:in|from|at|within|across|for)\s+.+$/i, '')
-      // 中文：去掉"买家/进口商/购买者/采购商/采购方"后缀
-      .replace(/[\s]*(买家|进口商|购买者|采购商|采购方|采购代理)\s*$/i, '')
-      // 英文：去掉末尾 " buyer/buyers/importer/importers/purchaser" 词
-      .replace(/[\s]+(buyer|buyers|importer|importers|purchaser|purchasers)\s*$/i, '')
-      .trim() || category;
+    const categoryClean = sanitizeDiscoveryCategory(category);
 
     if (categoryClean !== category) {
         console.log(`[step0] category cleaned: "${category}" → "${categoryClean}"`);

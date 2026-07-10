@@ -12,6 +12,7 @@ const {
 } = require('./v8_zhimao_contract');
 const { readFunnelDoc, deleteFunnelFile } = require('./v8_lib_funnel');
 const { processEnrichmentBatch } = require('./v8_lib_enrichment_supabase');
+const { sanitizeDiscoveryCategory } = require('./v8_lib_category_sanitize');
 
 // Self-heal: ensure Playwright Chromium binary is present before the first job runs.
 // Render's build and runtime filesystems are separate; the browser cache from buildCommand
@@ -211,9 +212,15 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
     const pillar0Json = pillar0 ? JSON.stringify(pillar0) : '';
     const domainBlacklist = mergeDomainBlacklist(reweightPolicies);
 
+    // 口语查询清洗：DB 仍存原始 category；pipeline / L3 reverse 用净化品类
+    const categoryClean = sanitizeDiscoveryCategory(category) || category;
+    if (categoryClean !== category) {
+      console.log(`[worker] category sanitized for pipeline: "${category}" → "${categoryClean}"`);
+    }
+
     const child = spawn(
       'node',
-      ['zhimao_v8_ultimate_master.js', countryIso, category],
+      ['zhimao_v8_ultimate_master.js', countryIso, categoryClean],
       {
         stdio: 'inherit',
         // 自成进程组：看门狗需要时可 process.kill(-pid) 连同 master 用 execSync spawn 的
@@ -231,7 +238,8 @@ function runPipeline(countryIso, category, jobId, sweepCount = 1, meta = {}, rew
           DISCOVERY_DOMAIN_BLACKLIST: JSON.stringify(domainBlacklist),
           PILLAR0_PAYLOAD: pillar0Json,
           DISCOVERY_COUNTRY_ISO: countryIso || '',
-          DISCOVERY_CATEGORY: category || '',
+          DISCOVERY_CATEGORY: categoryClean || '',
+          DISCOVERY_CATEGORY_RAW: category || '',
           // proxy_hint 桥接：Render env (USE_PROXY/BRD_USER/BRD_PASS) 优先；
           // 若 Render 未配置，则从 action_payload.proxy_hint 读取（由 zhimao submit 注入）
           ...(() => {
