@@ -23,6 +23,7 @@
  */
 
 const https = require('https');
+const { offCategoryReason, resolveCategory } = require('./v8_lib_category_relevance');
 
 /**
  * 宽松 JSON 解析：剥 markdown fence、截断补全括号。
@@ -243,14 +244,28 @@ async function callGeminiJson(promptText, {
     claudeApiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '',
     claudeModel  = DEFAULT_CLAUDE_MODEL,
     disableFallback = false,
+    /** 绝对截止时间戳（Date.now()）；到点后不再试下一个模型/provider，避免 fallback 链再卡 60s+ */
+    softDeadlineMs = 0,
 } = {}) {
     if (!apiKey) throw new Error('GEMINI_KEY required');
+
+    const remainingMs = () => (softDeadlineMs > 0 ? softDeadlineMs - Date.now() : Infinity);
+    const assertBudget = (phase) => {
+        const left = remainingMs();
+        if (left <= 1_500) {
+            throw new Error(`soft_deadline_${phase}: ${Math.max(0, Math.round(left))}ms left`);
+        }
+        return left;
+    };
 
     // ── 1. 尝试 Gemini（主模型 + 回退链）────────────────────────────────────────
     let geminiError = null;
     const modelsToTry = [model, ...GEMINI_MODEL_FALLBACK_CHAIN].filter((m, i, a) => m && a.indexOf(m) === i);
     for (const tryModel of modelsToTry) {
         try {
+            const left = assertBudget(`before_${tryModel}`);
+            const attemptTimeout = Math.min(timeoutMs, Math.max(5_000, left - 500));
+            const attemptRetries = left < timeoutMs ? 0 : maxRetries;
             const reqBody = JSON.stringify({
                 contents: [{ parts: [{ text: promptText }] }],
                 generationConfig: { temperature, responseMimeType: 'application/json' },
@@ -260,8 +275,8 @@ async function callGeminiJson(promptText, {
                 path: `/v1beta/models/${tryModel}:generateContent?key=${apiKey}`,
                 method: 'POST',
                 body: reqBody,
-                timeoutMs,
-                maxRetries,
+                timeoutMs: attemptTimeout,
+                maxRetries: attemptRetries,
                 label: `${label}/${tryModel}`,
             });
             if (r.error) throw new Error(`gemini_failed: ${r.error.message}`);
@@ -281,6 +296,10 @@ async function callGeminiJson(promptText, {
             }
         } catch (err) {
             geminiError = err;
+            if (/soft_deadline_/.test(String(err.message || ''))) {
+                console.warn(`[${label}] soft deadline hit (${err.message.slice(0, 80)}) — skip remaining Gemini/Claude/OpenAI`);
+                throw err;
+            }
             if (isGeminiModelUnavailableError(err) || /gemini_text_not_json/.test(String(err.message || ''))) {
                 console.warn(`[${label}] Gemini model ${tryModel} failed (${err.message.slice(0, 100)}), trying next…`);
                 continue;
@@ -298,6 +317,7 @@ async function callGeminiJson(promptText, {
         );
         for (const tryClaudeModel of claudeModelsToTry) {
             try {
+                const left = assertBudget(`before_claude_${tryClaudeModel}`);
                 console.warn(`[${label}] → Falling back to Claude ${tryClaudeModel}...`);
                 const claudeBody = JSON.stringify({
                     model: tryClaudeModel,
@@ -316,8 +336,8 @@ async function callGeminiJson(promptText, {
                         'anthropic-version': '2023-06-01',
                     },
                     body: claudeBody,
-                    timeoutMs: timeoutMs + 5_000,
-                    maxRetries: 2,
+                    timeoutMs: Math.min(timeoutMs + 5_000, Math.max(5_000, left - 500)),
+                    maxRetries: left < timeoutMs ? 0 : 2,
                     label: `${label}/claude-fallback`,
                 });
                 if (r.error) throw new Error(`claude_failed: ${r.error.message}`);
@@ -335,6 +355,10 @@ async function callGeminiJson(promptText, {
             } catch (clErr) {
                 claudeError = clErr;
                 const msg = String(clErr.message || '');
+                if (/soft_deadline_/.test(msg)) {
+                    console.warn(`[${label}] soft deadline during Claude — abort fallbacks`);
+                    throw clErr;
+                }
                 // 模型不存在 → 试下一个；其他错误 → 中断 Claude 链路转 OpenAI
                 if (msg.includes('not_found') || msg.includes('404') || msg.includes('claude_text_not_json')) {
                     console.warn(`[${label}] Claude model ${tryClaudeModel} not available (${msg.slice(0, 80)}), trying next…`);
@@ -350,6 +374,7 @@ async function callGeminiJson(promptText, {
     if (disableFallback || !openaiApiKey) {
         throw geminiError;
     }
+    const oaLeft = assertBudget('before_openai');
     console.warn(`[${label}] → Falling back to OpenAI ${openaiModel}...`);
     try {
         // GPT-5 reasoning 系列实测约束（2026-05-20 procure/scripts/test-gpt55-temperature.cjs）：
@@ -378,8 +403,8 @@ async function callGeminiJson(promptText, {
             method: 'POST',
             headers: { Authorization: `Bearer ${openaiApiKey}` },
             body: oaBody,
-            timeoutMs: timeoutMs + 10_000,
-            maxRetries: 2,
+            timeoutMs: Math.min(timeoutMs + 10_000, Math.max(5_000, oaLeft - 500)),
+            maxRetries: oaLeft < timeoutMs ? 0 : 2,
             label: `${label}/openai-fallback`,
         });
         if (r.error) throw new Error(`openai_failed: ${r.error.message}`);
@@ -400,10 +425,14 @@ async function callGeminiJson(promptText, {
 // Local heuristics that mirror the LLM "anti-pollution / anti-blog / anti-platform"
 // rules but at zero cost. Filtering ~30-50% of obvious noise before Gemini cuts
 // step2 wall time and quota usage proportionally.
-const LISTICLE_RE = /\b(top\s*\d+|best\s+\w+|how\s+to\b|guide\s+to\b|review[s]?:?\b|vs\.?\b|things\s+you\s+should|^\d+\s+(best|top))\b/i;
+const LISTICLE_RE = /\b(top\s*\d+|best\s+\w+|how\s+to\b|guide\s+to\b|review[s]?:?\b|vs\.?\b|things\s+you\s+should|^\d+\s+(best|top)|rankings?\b|jun\s+20\d{2}\s+rankings?|minimum\s+\d+\s*kg|起订)\b/i;
+
+// 榜单 / 访谈 / 商会目录 / 媒体内容（非买家实体）— 结构性噪声，与品类无关，始终硬丢
+const DIRECTORY_NOISE_RE =
+  /\b(membership\s+directory|list\s+of\s+companies|company\s+directory|industry\s+directory|chamber\s+of\s+commerce|amcham\b|content\s+creator\s+interview|questions\s+with\b|interview\s+with\b|top\s+manufacturing\s+companies|manufacturing\s+companies\s+in\s+\w+\s*-\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)?\s*20\d{2}\s*rankings?)\b|会员名录|企业名录|商会名录|专访|访谈/i;
 
 // 新闻/媒体文章特征（标题级别即可拦截，无需等 Gemini）
-const NEWS_TITLE_RE = /\b(breaking\s+news|press\s+release|media\s+release|news\s+report|daily\s+news|weekly\s+news|记者|报道|报章|新闻|报导|早报|联合早报|副刊|采访|专访|通讯社)\b/i;
+const NEWS_TITLE_RE = /\b(breaking\s+news|press\s+release|media\s+release|news\s+report|daily\s+news|weekly\s+news|记者|报道|报章|新闻|报导|早报|联合早报|副刊|采访|专访|通讯社|smart\s*local|mothership)\b/i;
 // 已结业/永久关闭特征（snippet 级别）
 const CLOSED_BIZ_RE = /\b(permanently\s+clos|closed\s+down|ceased\s+operat|no\s+longer\s+operat|out\s+of\s+business|went\s+bankrupt|liquidat|已结业|已停业|停止营业|结业清货|倒闭|停办)\b/i;
 
@@ -485,10 +514,15 @@ function loadDomainBlacklistFromEnv() {
 function preFilterRawLeads(rawItems, opts) {
     if (!Array.isArray(rawItems)) return { kept: [], dropped: 0, reasons: {} };
     const supplierMode = !!(opts && opts.supplierMode);
+    const category = resolveCategory(opts && opts.category);
     const kept = [];
     const domainBlacklist = loadDomainBlacklistFromEnv();
     const blacklistSet = new Set(domainBlacklist);
-    const reasons = { listicle: 0, platform: 0, cn_supplier: 0, no_signal: 0, news_media: 0, closed_biz: 0, policy_domain: 0 };
+    const reasons = {
+      listicle: 0, platform: 0, cn_supplier: 0, no_signal: 0,
+      news_media: 0, closed_biz: 0, policy_domain: 0,
+      directory: 0, off_category: 0,
+    };
     for (const r of rawItems) {
         const title = String(r.title || '').trim();
         const snippet = String(r.snippet || '').trim();
@@ -504,6 +538,12 @@ function preFilterRawLeads(rawItems, opts) {
 
         if (!title && !snippet) { reasons.no_signal += 1; continue; }
         if (LISTICLE_RE.test(title) || LISTICLE_RE.test(snippet)) { reasons.listicle += 1; continue; }
+        if (DIRECTORY_NOISE_RE.test(combined)) { reasons.directory += 1; continue; }
+        // 垂直错配：对照用户品类（搜护肤时不丢护肤 OEM；搜白菜时丢汽车站）
+        if (offCategoryReason(combined, category)) {
+          reasons.off_category += 1;
+          continue;
+        }
         // 供应商模式：保留带 link 的供应商目录站结果（step1 已对目录 pillar 置 link=null，
         // 此处仅 factory-direct organic 带 link，故 supplierMode 下不按 PLATFORM_HOSTS 一刀切）。
         if (!supplierMode && PLATFORM_HOSTS.some(h => link.includes(h))) { reasons.platform += 1; continue; }

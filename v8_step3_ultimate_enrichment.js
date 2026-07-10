@@ -57,13 +57,17 @@ const PLAYWRIGHT_TIMEOUT  = parseInt(process.env.PLAYWRIGHT_TIMEOUT || '10000', 
 //   STEP3_PAGE_CONCURRENCY           → Playwright contact extraction parallelism
 // batch size 减小到 5（默认）：更短 prompt = Gemini 响应更快，减少超时率
 // 如需高吞吐可在 .env 中设 BOM_BATCH_SIZE=10（需稳定的 Gemini Pro 配额）
-// 默认 8：15 时 Gemini 常截断 JSON → Claude 兜底（+30–40s/batch）
-const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '8',  10));
+// 默认 5：8 时 Gemini 常截断 JSON → Claude 兜底（+30–60s/batch 且伤准）
+const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '5',  10));
 const L3_CONCURRENCY        = Math.max(1, parseInt(process.env.L3_CONCURRENCY || '3',  10));
 // L3 timeout 提升到 60s：gemini-2.5-flash 通常 10-20s，但高负载时可达 50s+
 const L3_TIMEOUT_MS         = Math.max(5_000, parseInt(process.env.L3_TIMEOUT_MS || '60000', 10));
 // 默认重试 1：超时场景下 3 次会把单 batch 拖到数分钟，易触发整步 STEP_TIMEOUT
 const L3_MAX_RETRIES        = Math.max(0, parseInt(process.env.L3_MAX_RETRIES || '1', 10));
+// L3 墙钟：默认 0=关闭（不跳过 batch，保准确率）。
+// 仅当显式设 L3_WALL_MS>0 时，才对 LLM fallback 链加 softDeadline，并在预算耗尽时跳过尚未开始的 batch。
+// 保准优先：用更小 BOM_BATCH_SIZE 降截断，而不是靠跳过推断。
+const L3_WALL_MS            = Math.max(0, parseInt(process.env.L3_WALL_MS || '0', 10));
 // 并发数提升：4 → 8（在有代理或高带宽环境下可进一步调高至 12）
 const PAGE_CONCURRENCY      = Math.max(1, parseInt(process.env.STEP3_PAGE_CONCURRENCY || '8', 10));
 
@@ -187,14 +191,30 @@ async function inferL3SupplyChain(leads) {
     for (let i = 0; i < toInfer.length; i += BOM_BATCH_SIZE) {
         batches.push(toInfer.slice(i, i + BOM_BATCH_SIZE));
     }
-    console.log(`[step3] L3 supply-chain inference for ${toInfer.length} entities (cache_hit=${l3CacheHits}/${leads.length}) in ${batches.length} batch(es) of ${BOM_BATCH_SIZE}, concurrency=${L3_CONCURRENCY}, timeout=${L3_TIMEOUT_MS}ms`);
+    console.log(
+        `[step3] L3 supply-chain inference for ${toInfer.length} entities ` +
+        `(cache_hit=${l3CacheHits}/${leads.length}) in ${batches.length} batch(es) of ${BOM_BATCH_SIZE}, ` +
+        `concurrency=${L3_CONCURRENCY}, timeout=${L3_TIMEOUT_MS}ms` +
+        (L3_WALL_MS > 0 ? `, wall=${L3_WALL_MS}ms` : ', wall=off'),
+    );
 
     const overallStart = Date.now();
+    const wallDeadline = L3_WALL_MS > 0 ? overallStart + L3_WALL_MS : 0;
+    let skippedByWall = 0;
 
     await pMap(batches, async (batch, idx) => {
         const batchIndex = idx + 1;
         const batchTotal = batches.length;
         const startedAt = Date.now();
+        const leftAtStart = wallDeadline > 0 ? wallDeadline - startedAt : Infinity;
+        // 仅显式开启 L3_WALL_MS 时才跳过未开始的 batch（默认关闭，避免牺牲准确率）
+        if (wallDeadline > 0 && leftAtStart < 8_000) {
+            skippedByWall += 1;
+            console.warn(
+                `[step3] L3 batch ${batchIndex}/${batchTotal} SKIPPED (wall budget ${Math.round(leftAtStart)}ms left) — continue with partial L3`,
+            );
+            return;
+        }
 
         // 业态画像树工程 — 反向验证锚点：
         // expand-query 已经把"用 ${category} 的下游业态画像"作为 personas 输出，step1 用 personas
@@ -267,12 +287,17 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
         try {
             parsed = await callGeminiJson(prompt, {
                 apiKey: GEMINI_KEY, model: GEMINI_MODEL, temperature: 0.2,
-                timeoutMs: L3_TIMEOUT_MS, maxRetries: L3_MAX_RETRIES,
+                timeoutMs: wallDeadline > 0
+                  ? Math.min(L3_TIMEOUT_MS, Math.max(8_000, leftAtStart - 2_000))
+                  : L3_TIMEOUT_MS,
+                maxRetries: L3_MAX_RETRIES,
                 label: `step3/L3.b${batchIndex}`,
                 openaiApiKey: OPENAI_KEY,
                 openaiModel:  OPENAI_MODEL,
                 claudeApiKey: CLAUDE_KEY,
                 claudeModel:  CLAUDE_MODEL,
+                // wall 关闭时不截断 fallback，保证 Claude 仍能救截断 JSON（保准）
+                softDeadlineMs: wallDeadline > 0 ? wallDeadline : 0,
             });
         } catch (e) {
             console.warn(`[step3] L3 batch ${batchIndex}/${batchTotal} FAILED after ${Date.now() - startedAt}ms: ${e.message}`);
@@ -403,7 +428,13 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
     }, { concurrency: L3_CONCURRENCY });
 
     flushL3Cache();
-    console.log(`[step3] L3 inference total wall=${Date.now() - overallStart}ms (cache_hit=${l3CacheHits}/${leads.length})`);
+    const inferred = leads.filter((l) => l.inference_breakdown).length;
+    console.log(
+        `[step3] L3 inference total wall=${Date.now() - overallStart}ms ` +
+        `(cache_hit=${l3CacheHits}/${leads.length}, inferred=${inferred}/${leads.length}` +
+        (skippedByWall ? `, wall_skipped_batches=${skippedByWall}` : '') +
+        `)`,
+    );
     return leads;
 }
 

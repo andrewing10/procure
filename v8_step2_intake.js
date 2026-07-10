@@ -219,10 +219,13 @@ async function run() {
     if (raw.length === 0) { fs.writeFileSync(outputFile, '[]'); return; }
 
     // ── Pre-filter: drop obvious noise BEFORE we spend Gemini quota ──
-    const { kept: filtered, dropped, reasons } = preFilterRawLeads(raw, { supplierMode: IS_SUPPLIER_MODE });
+    const { kept: filtered, dropped, reasons } = preFilterRawLeads(raw, {
+      supplierMode: IS_SUPPLIER_MODE,
+      category: process.env.DISCOVERY_CATEGORY || process.env.DISCOVERY_CATEGORY_RAW || '',
+    });
     if (IS_SUPPLIER_MODE) console.log('[step2] SUPPLIER MODE: anti-pollution/anti-platform/cn_supplier relaxed; industry_match flipped to supplier semantics.');
     if (dropped > 0) {
-        console.log(`[step2] pre-filter dropped ${dropped}/${raw.length} (listicle=${reasons.listicle}, platform=${reasons.platform}, cn_supplier=${reasons.cn_supplier}, no_signal=${reasons.no_signal})`);
+        console.log(`[step2] pre-filter dropped ${dropped}/${raw.length} (listicle=${reasons.listicle}, platform=${reasons.platform}, directory=${reasons.directory || 0}, off_category=${reasons.off_category || 0}, cn_supplier=${reasons.cn_supplier}, news=${reasons.news_media || 0}, no_signal=${reasons.no_signal})`);
     }
     if (filtered.length === 0) {
         console.warn('[step2] pre-filter removed everything; nothing to extract.');

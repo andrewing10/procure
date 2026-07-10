@@ -241,14 +241,22 @@ let overflowLeads = [];
 if (!gracefulCancel && fs.existsSync(fileBus.t2_intake)) {
     try {
         const intakeAll = JSON.parse(fs.readFileSync(fileBus.t2_intake, 'utf8'));
-        const { top, overflow, total } = splitEnrichTopN(intakeAll, ENRICH_TOP_N);
+        const { top, overflow, total, hardRejected, hardReasons } = splitEnrichTopN(
+          intakeAll,
+          ENRICH_TOP_N,
+          process.env.DISCOVERY_CATEGORY || category,
+        );
         overflowLeads = overflow.map((l) => materializeOverflowLead(l, countryCode));
         fs.writeFileSync(fileBus.t2_enrich_top, JSON.stringify(top, null, 2));
         fs.writeFileSync(fileBus.t2_overflow, JSON.stringify(overflowLeads, null, 2));
         step3Input = fileBus.t2_enrich_top;
+        const hardNote = hardRejected
+          ? `, hard_noise_rejected=${hardRejected}${hardReasons ? `(${Object.entries(hardReasons).map(([k, v]) => `${k}:${v}`).join(',')})` : ''}`
+          : '';
         console.log(
             `[master] enrich cap: intake=${total} → top=${top.length} for Step3` +
             (overflowLeads.length ? `, overflow=${overflowLeads.length} deferred (display later)` : '') +
+            hardNote +
             ` (ENRICH_TOP_N=${ENRICH_TOP_N})`,
         );
         const jobId = process.env.DISCOVERY_JOB_ID || '';
@@ -258,6 +266,8 @@ if (!gracefulCancel && fs.existsSync(fileBus.t2_intake)) {
                 enrich_top_n: ENRICH_TOP_N,
                 top_count: top.length,
                 overflow_count: overflowLeads.length,
+                hard_noise_rejected: hardRejected || 0,
+                hard_noise_reasons: hardReasons || {},
             });
         }
     } catch (e) {
