@@ -5,7 +5,7 @@ const cheerio = require('cheerio');
 const { pMap, callGeminiJson } = require('./v8_lib_concurrency');
 const { normalizePurchaseCycle } = require('./v8_l1_field_normalize');
 const { extractSocialUrls } = require('./v8_lib_social_extract');
-const { enrichContactsForLead } = require('./v8_lib_contact_enricher');
+const { enrichContactsForLead, getEnricherWaterfallStats } = require('./v8_lib_contact_enricher');
 const { readIcpContext } = require('./v8_lib_pillar0');
 
 const [inputFile, outputFile] = process.argv.slice(2);
@@ -92,6 +92,43 @@ function flushDomainCache() {
     try { fs.writeFileSync(DOMAIN_CACHE_FILE, JSON.stringify(domainContactCache, null, 2)); } catch {}
 }
 
+// ── L3 推断缓存（跨 sweep 复用，避免对同一公司重复调 Gemini）─────────────────
+// 键 = 公司名(归一化) | 目标品类 | 买家/供应商方向（target_category_match 依赖这两者，必须入键）。
+// 缓存未命中 = 完全维持原 LLM 推断行为；命中则套用上次结果，省掉一次 batch 的 token + 时延。
+const L3_CACHE_FILE = 'zhimao_l3_inference_cache.json';
+const L3_CACHE_TTL_DAYS = parseInt(process.env.L3_CACHE_TTL_DAYS || '30', 10);
+let l3InferenceCache = {};
+try {
+    if (fs.existsSync(L3_CACHE_FILE)) l3InferenceCache = JSON.parse(fs.readFileSync(L3_CACHE_FILE, 'utf8'));
+} catch { l3InferenceCache = {}; }
+
+const normNameL3 = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+function l3CacheKeyFor(lead) {
+    const cat = String(process.env.DISCOVERY_CATEGORY || '').trim().slice(0, 80).toLowerCase();
+    return `${normNameL3(lead.company_name)}|${cat}|${IS_SUPPLIER_MODE ? 'sup' : 'buy'}`;
+}
+function getCachedL3(key) {
+    const entry = l3InferenceCache[key];
+    if (!entry || !entry.v) return null;
+    const ageMs = Date.now() - new Date(entry.cached_at).getTime();
+    if (ageMs > L3_CACHE_TTL_DAYS * 86400 * 1000) return null;
+    return entry.v;
+}
+function setCachedL3(key, value) {
+    if (key && value) l3InferenceCache[key] = { v: value, cached_at: new Date().toISOString() };
+}
+function flushL3Cache() {
+    try { fs.writeFileSync(L3_CACHE_FILE, JSON.stringify(l3InferenceCache)); } catch {}
+}
+// 命中缓存时把已推断字段套回 lead（与下方 LLM 合并路径写入的字段保持一致）。
+function applyCachedL3(lead, c) {
+    lead.entity_role = c.entity_role || 'Service';
+    lead.inferred_bom = Array.isArray(c.inferred_bom) ? c.inferred_bom : [];
+    if (lead.entity_role === 'Manufacturer') lead.confidence_score = (lead.confidence_score || 50) + 20;
+    else if (lead.entity_role === 'Wholesaler' || lead.entity_role === 'Retailer') lead.confidence_score = (lead.confidence_score || 50) + 10;
+    lead.inference_breakdown = c.inference_breakdown;
+}
+
 /**
  * L3 Supply Chain Inference (Gemini).
  *
@@ -101,11 +138,24 @@ function flushDomainCache() {
 async function inferL3SupplyChain(leads) {
     if (leads.length === 0) return leads;
 
-    const batches = [];
-    for (let i = 0; i < leads.length; i += BOM_BATCH_SIZE) {
-        batches.push(leads.slice(i, i + BOM_BATCH_SIZE));
+    // 跨 sweep 复用：命中 L3 缓存的 lead 直接套用上次推断，不再调 LLM（缓存未命中=维持原行为）。
+    const toInfer = [];
+    let l3CacheHits = 0;
+    for (const lead of leads) {
+        const cached = getCachedL3(l3CacheKeyFor(lead));
+        if (cached) { applyCachedL3(lead, cached); l3CacheHits += 1; }
+        else toInfer.push(lead);
     }
-    console.log(`[step3] L3 supply-chain inference for ${leads.length} entities in ${batches.length} batch(es) of ${BOM_BATCH_SIZE}, concurrency=${L3_CONCURRENCY}, timeout=${L3_TIMEOUT_MS}ms`);
+    if (toInfer.length === 0) {
+        console.log(`[step3] L3 inference: all ${leads.length} entities served from cache (0 LLM calls)`);
+        return leads;
+    }
+
+    const batches = [];
+    for (let i = 0; i < toInfer.length; i += BOM_BATCH_SIZE) {
+        batches.push(toInfer.slice(i, i + BOM_BATCH_SIZE));
+    }
+    console.log(`[step3] L3 supply-chain inference for ${toInfer.length} entities (cache_hit=${l3CacheHits}/${leads.length}) in ${batches.length} batch(es) of ${BOM_BATCH_SIZE}, concurrency=${L3_CONCURRENCY}, timeout=${L3_TIMEOUT_MS}ms`);
 
     const overallStart = Date.now();
 
@@ -260,12 +310,19 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                     published_at: now,
                 },
             };
+            // 写 L3 缓存：只存合并后用得到的字段，下次同公司+品类直接复用
+            setCachedL3(l3CacheKeyFor(lead), {
+                entity_role: lead.entity_role,
+                inferred_bom: lead.inferred_bom,
+                inference_breakdown: lead.inference_breakdown,
+            });
             merged += 1;
         }
         console.log(`[step3] L3 batch ${batchIndex}/${batchTotal} merged ${merged}/${batch.length} (${Date.now() - startedAt}ms)`);
     }, { concurrency: L3_CONCURRENCY });
 
-    console.log(`[step3] L3 inference total wall=${Date.now() - overallStart}ms`);
+    flushL3Cache();
+    console.log(`[step3] L3 inference total wall=${Date.now() - overallStart}ms (cache_hit=${l3CacheHits}/${leads.length})`);
     return leads;
 }
 
@@ -370,18 +427,21 @@ function httpsGetStep3(url) {
     });
 }
 
-async function lookupContactViaGooglePlaces(companyName, countryIso) {
+async function lookupContactViaGooglePlaces(companyName, countryIso, knownPlaceId = null) {
     if (!GMAPS_KEY || !companyName) return null;
     try {
-        const q = encodeURIComponent(`${companyName}${countryIso ? ' ' + countryIso : ''}`);
-        const findUrl = `https://maps.googleapis.com/maps/api/place/findplacefromtext/json`
-            + `?input=${q}&inputtype=textquery`
-            + `&fields=place_id,name,business_status`
-            + `&key=${GMAPS_KEY}`;
-        const findRes = await httpsGetStep3(findUrl);
-        if (findRes.status !== 'OK' || !findRes.candidates?.length) return null;
-
-        const placeId = findRes.candidates[0].place_id;
+        // step1 maps pillar 已带 place_id 时直接查详情，省掉一次 findplacefromtext 调用（去重复 Places 计费）。
+        let placeId = knownPlaceId || null;
+        if (!placeId) {
+            const q = encodeURIComponent(`${companyName}${countryIso ? ' ' + countryIso : ''}`);
+            const findUrl = `https://maps.googleapis.com/maps/api/place/findplacefromtext/json`
+                + `?input=${q}&inputtype=textquery`
+                + `&fields=place_id,name,business_status`
+                + `&key=${GMAPS_KEY}`;
+            const findRes = await httpsGetStep3(findUrl);
+            if (findRes.status !== 'OK' || !findRes.candidates?.length) return null;
+            placeId = findRes.candidates[0].place_id;
+        }
         if (!placeId) return null;
 
         const detUrl = `https://maps.googleapis.com/maps/api/place/details/json`
@@ -404,18 +464,10 @@ async function extractContactForLead(lead, contexts) {
     lead.primary_email = lead.primary_email || lead.email || null;
     lead.primary_phone = lead.primary_phone || lead.phone || null;
 
-    // step1 已带齐联系方式时跳过 GMaps / Playwright
-    if (lead.primary_email && lead.primary_phone) {
-        score += 30;
-        if (lead.pillar?.includes('LBS')) score += 15;
-        lead.confidence_score = Math.min(score, 100);
-        return lead;
-    }
-
     // ── ❶ Google Places API 预填充（比 Playwright 快 10-50x，节省代理配额）────
     // 只对还缺电话/官网的 lead 执行，且必须有公司名
     if (GMAPS_KEY && lead.company_name && (!lead.primary_phone || !lead.domain)) {
-        const gmapsResult = await lookupContactViaGooglePlaces(lead.company_name, lead.country_iso || '');
+        const gmapsResult = await lookupContactViaGooglePlaces(lead.company_name, lead.country_iso || '', lead.place_id || null);
         if (gmapsResult) {
             if (gmapsResult.phone && !lead.primary_phone) {
                 lead.primary_phone = gmapsResult.phone;
@@ -520,28 +572,35 @@ async function extractContactForLead(lead, contexts) {
     // 仍放它进 L1 → 用户看到"信息薄 0 + 优质 30 分"的欺骗卡。
     // 现接入 v8_lib_contact_enricher 的 5 层管道：直连 → 代理 → BFS → LLM → Serper
     // 任一层抓到就回填 primary_email/primary_phone；总 budget ~30s 控成本。
-    if (!lead.primary_email && !lead.primary_phone && lead.domain) {
+    // B2：无官网域名但有社媒/主页 URL 的私域线索也要触发（走主页深抽取路径）。
+    const hasProfileUrls = Array.isArray(lead.social_profile_urls) && lead.social_profile_urls.length > 0;
+    if (!lead.primary_email && !lead.primary_phone && (lead.domain || hasProfileUrls)) {
         try {
             const enr = await enrichContactsForLead({
                 domain: lead.domain,
                 company_name: lead.company_name,
                 primary_email: lead.primary_email,
                 primary_phone: lead.primary_phone,
+                social_profile_urls: lead.social_profile_urls,
+                profile_url: lead.profile_url,
+                source_url: lead.source_url,
             });
+            // B2/B3：开放渠道即便没填 primary_*（社媒主页常只有 IG/LinkedIn/官网外链）也要保留，
+            // 供 buildL1Row 合成 contact_channels —— 故挂载移出 filled 门。
+            if (Array.isArray(enr.channels) && enr.channels.length) lead._enricher_channels = enr.channels;
+            lead._enricher_via = enr.via;
             if (enr.filled) {
                 if (!lead.primary_email && enr.primary_email) lead.primary_email = enr.primary_email;
                 if (!lead.primary_phone && enr.primary_phone) lead.primary_phone = enr.primary_phone;
                 if (enr.primary_whatsapp) lead.primary_whatsapp = enr.primary_whatsapp;
-                lead._enricher_via = enr.via;
                 if (enr.llm_persons && enr.llm_persons.length > 0) {
                     lead._enricher_persons = enr.llm_persons;
                 }
                 lead.confidence_score = Math.min((lead.confidence_score || 0) + 25, 100);
-                // 写缓存避免下次重抓
-                setCachedContact(lead.domain, lead.primary_email, lead.primary_phone);
+                // 写缓存避免下次重抓（仅 domain 路径有意义）
+                if (lead.domain) setCachedContact(lead.domain, lead.primary_email, lead.primary_phone);
                 console.log(`[step3] 5-layer enricher filled (${enr.via}): ${lead.company_name} | ${lead.primary_email || ''} | ${lead.primary_phone || ''}`);
             } else {
-                lead._enricher_via = enr.via; // 'no_domain' | 'none' 等
                 if (enr.any_blocked) lead._enricher_any_blocked = true;
             }
         } catch (e) {
@@ -662,6 +721,30 @@ async function run() {
 
     fs.writeFileSync(outputFile, JSON.stringify(finalLeads, null, 2));
     console.log(`[step3] Done — ${finalLeads.length} enriched leads (contact_hit=${contactHit}, hit_rate=${Math.round(contactHit/finalLeads.length*100)}%) in ${Date.now() - overallStart}ms → ${outputFile}`);
+
+    // ── B4 瀑布富化 funnel 打点 + 降级告警（RC-4，设计单源 §B4）────────────────
+    try {
+        const wf = getEnricherWaterfallStats();
+        if (wf.leads > 0) {
+            const layerStr = Object.entries(wf.layers)
+                .map(([k, v]) => `${k}=${v.hit}/${v.attempted}${v.hit_rate != null ? `(${Math.round(v.hit_rate * 100)}%)` : ''}`)
+                .join(' ');
+            console.log(
+                `[step3] enricher-waterfall: leads=${wf.leads} filled=${wf.filled}(${wf.fill_rate != null ? Math.round(wf.fill_rate * 100) : '–'}%) ` +
+                `cost=${wf.cost_units}u(avg ${wf.avg_cost_per_lead}/lead) | ${layerStr}`,
+            );
+            // 降级告警：某层因缺 key/能力被迫跳过 → 命中率塌陷的根因，明确暴露而非静默
+            const deg = wf.degraded;
+            if (deg.llm_text_no_key > 0 || deg.vision_no_capability > 0 || deg.serper_no_key > 0) {
+                console.warn(
+                    `[step3] ⚠️ enricher-degraded: llm_no_key=${deg.llm_text_no_key} vision_no_capability=${deg.vision_no_capability} serper_no_key=${deg.serper_no_key} ` +
+                    `— 对应富化层失效，contact 命中率会下降；请检查 GEMINI/SCREENSHOTONE/SERPER 配置。`,
+                );
+            }
+        }
+    } catch (e) {
+        console.warn('[step3] enricher-waterfall stats failed:', e && e.message ? e.message : String(e));
+    }
 }
 
 run().catch(e => { console.error('[step3] fatal:', e); process.exit(1); });

@@ -31,6 +31,17 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 // 2026-05-23 双仓镜像：B2B 买家邮箱质量裁判（NON_BUYER_HOSTS / placeholder / brand-match）
 //   见 AGENTS.md "NON_BUYER_EMAIL_HOSTS 双仓镜像" + zhimao apps/web/lib/skills/emailQuality.ts
 const { filterBuyerEmails, isBuyerEmail } = require('./v8_lib_email_quality');
+// 开放渠道探测（双仓镜像 apps/web/lib/skills/channelSpec.ts）：email/phone/whatsapp 之外的渠道
+const { detectChannels, classifyUrl } = require('./v8_lib_channel_spec');
+
+// email/phone/whatsapp 的 source → 渠道置信度。
+const CONTACT_SOURCE_CONFIDENCE = {
+  mailto_link: 0.95,
+  tel_link: 0.95,
+  whatsapp_link: 0.9,
+  plain_regex: 0.5,
+  deobfuscated: 0.55,
+};
 
 // ─── 常量 ───────────────────────────────────────────────────────────────
 const CHROME_UA =
@@ -343,6 +354,22 @@ function extractContactsFromHtmlV2(html, baseUrl) {
   out.whatsapps = [...whatsappMap.values()].slice(0, 8).map((x) => x.value);
   out.contactLinks = [...linkSet].slice(0, 6);
 
+  // ── 开放渠道集合（不写死字段）：email/phone/whatsapp 映射 + detectChannels + 联系表单 ──
+  const channelSeen = new Set();
+  const channels = [];
+  const pushChannel = (c) => {
+    const key = `${c.type}::${String(c.value).toLowerCase()}`;
+    if (channelSeen.has(key)) return;
+    channelSeen.add(key);
+    channels.push(c);
+  };
+  for (const e of emailMap.values()) pushChannel({ type: 'email', value: e.value, source: e.source === 'mailto_link' ? 'href' : 'regex', confidence: CONTACT_SOURCE_CONFIDENCE[e.source] || 0.5 });
+  for (const p of phoneMap.values()) pushChannel({ type: 'phone', value: p.value, source: p.source === 'tel_link' ? 'href' : 'regex', confidence: CONTACT_SOURCE_CONFIDENCE[p.source] || 0.5 });
+  for (const w of whatsappMap.values()) pushChannel({ type: 'whatsapp', value: w.value, source: 'href', confidence: CONTACT_SOURCE_CONFIDENCE[w.source] || 0.9 });
+  for (const c of detectChannels(html, baseUrl, 4)) pushChannel(c);
+  for (const link of out.contactLinks.slice(0, 4)) pushChannel({ type: 'contact_form', value: link, source: 'href', confidence: 0.5 });
+  out.channels = channels;
+
   return out;
 }
 
@@ -360,6 +387,12 @@ async function bfsContactPages(domain, discoveredLinks, accumulator, opts = {}) 
     for (const e of got.emails) accumulator.emails.add(e);
     for (const p of got.phones) accumulator.phones.add(p);
     for (const w of got.whatsapps) accumulator.whatsapps.add(w);
+    if (accumulator.channels instanceof Map) {
+      for (const c of got.channels || []) {
+        const key = `${c.type}::${String(c.value).toLowerCase()}`;
+        if (!accumulator.channels.has(key)) accumulator.channels.set(key, c);
+      }
+    }
   }
 }
 
@@ -611,6 +644,194 @@ async function serperFallbackForDomain(domain, companyName) {
   return { emails: [...allEmails], phones: [] };
 }
 
+// ─── B4 瀑布式可观测层（RC-4，2026-06-19，设计单源 §4A.1 / §B4）──────────────
+// 现有管线已是「成本递增 + run-if-empty 短路」的瀑布（static→bfs→llm→vision→serper）。
+// 这里补 per-source 命中率/成本计量 funnel + 缺 key 降级告警，让"信息薄/0 结果"可观测、可告警。
+//
+// 每层成本单位（相对）：免费抓取=0；文本 LLM=1；Serper=1；视觉截图+多模态=5（最贵）。
+const WATERFALL_LAYER_COST = { home: 0, bfs: 0, llm_text: 1, vision: 5, serper: 1 };
+
+// B6-route：单条成本预算上限（成本单位）。昂贵层（视觉=5）在累计成本将超预算时跳过，
+// 控住「每条 lead 抓取成本」。默认已调为 2（业主授权直接落地）：批量 worker 默认砍掉视觉层
+// （最贵+最慢，22s 截图超时，命中靠后），用静态/BFS/文本 LLM/Serper 换广度与吞吐。
+//   · 静态(0)+BFS(0)+文本LLM(1)+Serper(1) 仍在预算内，正常运行；视觉(5)被预算闸门跳过。
+//   · 需要为高价值小批量重新启用视觉：设 CONTACT_ENRICH_COST_BUDGET=7（容纳完整瀑布）。
+const CONTACT_ENRICH_COST_BUDGET = Number(process.env.CONTACT_ENRICH_COST_BUDGET || 2);
+
+// 进程级滚动聚合：worker 每批结束读 getEnricherWaterfallStats() 打点 / 告警。
+const _waterfallAgg = {
+  leads: 0,
+  filled: 0,
+  cost_units: 0,
+  // 每层：attempted=进入该层的次数；hit=该层贡献了新联系方式的次数
+  layers: {
+    home:   { attempted: 0, hit: 0 },
+    bfs:    { attempted: 0, hit: 0 },
+    llm_text:{ attempted: 0, hit: 0 },
+    vision: { attempted: 0, hit: 0 },
+    serper: { attempted: 0, hit: 0 },
+  },
+  // 降级告警：某层因缺 key / capability 缺失而被迫跳过的次数
+  degraded: { llm_text_no_key: 0, vision_no_capability: 0, serper_no_key: 0 },
+};
+
+function _recordLayer(result, layer, attempted, hitContacts, reason) {
+  const cost = attempted ? (WATERFALL_LAYER_COST[layer] || 0) : 0;
+  result.waterfall.push({ layer, attempted, hit: hitContacts > 0, contacts: hitContacts, cost, reason: reason || null });
+  result._cost_units += cost;
+  if (_waterfallAgg.layers[layer]) {
+    if (attempted) _waterfallAgg.layers[layer].attempted += 1;
+    if (hitContacts > 0) _waterfallAgg.layers[layer].hit += 1;
+  }
+}
+
+/** worker 读取：每层 attempted/hit/命中率 + 总成本 + 降级计数；用于打点与「命中率塌陷」告警。 */
+function getEnricherWaterfallStats() {
+  const layers = {};
+  for (const [k, v] of Object.entries(_waterfallAgg.layers)) {
+    layers[k] = { ...v, hit_rate: v.attempted > 0 ? +(v.hit / v.attempted).toFixed(3) : null };
+  }
+  return {
+    leads: _waterfallAgg.leads,
+    filled: _waterfallAgg.filled,
+    fill_rate: _waterfallAgg.leads > 0 ? +(_waterfallAgg.filled / _waterfallAgg.leads).toFixed(3) : null,
+    cost_units: _waterfallAgg.cost_units,
+    avg_cost_per_lead: _waterfallAgg.leads > 0 ? +(_waterfallAgg.cost_units / _waterfallAgg.leads).toFixed(2) : null,
+    layers,
+    degraded: { ..._waterfallAgg.degraded },
+  };
+}
+
+/** 测试 / 批次边界用：清零进程级聚合。 */
+function resetEnricherWaterfallStats() {
+  _waterfallAgg.leads = 0;
+  _waterfallAgg.filled = 0;
+  _waterfallAgg.cost_units = 0;
+  for (const k of Object.keys(_waterfallAgg.layers)) _waterfallAgg.layers[k] = { attempted: 0, hit: 0 };
+  _waterfallAgg.degraded = { llm_text_no_key: 0, vision_no_capability: 0, serper_no_key: 0 };
+}
+
+// ─── B2：社媒主页深抽取（无官网域名的私域线索） ───────────────────────────
+/** 一次最多抓取几个主页，控成本/时延。 */
+const PROFILE_FETCH_CAP = Math.min(Math.max(Number(process.env.PROFILE_FETCH_CAP || 3), 1), 6);
+
+/** 从 lead 收集候选社媒/主页 URL（去重、http(s)、截断）。 */
+function collectProfileUrls(lead) {
+  const out = [];
+  const seen = new Set();
+  const push = (u) => {
+    const s = String(u == null ? '' : u).trim();
+    if (!s || !/^https?:\/\//i.test(s)) return;
+    const key = s.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(s.slice(0, 500));
+  };
+  if (Array.isArray(lead.social_profile_urls)) for (const u of lead.social_profile_urls) push(u);
+  push(lead.profile_url);
+  push(lead.source_url);
+  return out.slice(0, PROFILE_FETCH_CAP);
+}
+
+/**
+ * 抓取若干社媒/主页，抽取 email/phone/whatsapp + 开放渠道并并入 accumulator。
+ * 主页 URL 本身也会作为一条渠道（classifyUrl）；社媒主页里链出的官网会被识别为 website 渠道。
+ */
+async function enrichFromProfileUrls(profileUrls, lead, result, accumulator) {
+  const addChannel = (c) => {
+    if (!c || !c.type || !c.value) return;
+    const key = `${c.type}::${String(c.value).toLowerCase()}`;
+    if (!accumulator.channels.has(key)) accumulator.channels.set(key, c);
+  };
+  const before = accumulator.emails.size + accumulator.phones.size + accumulator.whatsapps.size;
+  for (const url of profileUrls) {
+    const selfChan = classifyUrl(url, null);
+    if (selfChan) addChannel(selfChan);
+    const res = await fetchHtml(url, { timeoutMs: 9000 });
+    result.fetch_log.push({ url, status: res.status, via: res.via });
+    if (!res.ok) {
+      if (res.via === 'blocked') result.any_blocked = true;
+      continue;
+    }
+    const got = extractContactsFromHtmlV2(res.html, res.finalUrl || url);
+    for (const e of got.emails) accumulator.emails.add(e);
+    for (const p of got.phones) accumulator.phones.add(p);
+    for (const w of got.whatsapps) accumulator.whatsapps.add(w);
+    for (const c of got.channels || []) addChannel(c);
+  }
+  const hit = accumulator.emails.size + accumulator.phones.size + accumulator.whatsapps.size - before;
+  _recordLayer(result, 'profile', true, hit, null);
+}
+
+/**
+ * 收口：邮箱质量门 + primary_* 回填 + 开放渠道集合最终对齐（与 email 质量门一致）。
+ * 抽取自 enrichContactsForLead 尾段，供 domain 路径与 no-domain profile 路径共用。
+ */
+function finalizeEnrich(result, accumulator, host) {
+  const addChannel = (c) => {
+    if (!c || !c.type || !c.value) return;
+    const key = `${c.type}::${String(c.value).toLowerCase()}`;
+    if (!accumulator.channels.has(key)) accumulator.channels.set(key, c);
+  };
+
+  if (accumulator.emails.size > 0) {
+    const verdict = filterBuyerEmails([...accumulator.emails], host);
+    accumulator.emails = new Set(verdict.accepted);
+    result.email_filter = {
+      total_collected: verdict.accepted.length + verdict.rejected.length + verdict.warnings.length,
+      accepted: verdict.accepted.length,
+      warnings: verdict.warnings,
+      rejected: verdict.rejected,
+    };
+    if (verdict.rejected.length > 0) {
+      result.fetch_log.push({
+        url: `email_quality_gate`,
+        status: 200,
+        via: 'filter',
+        dropped: verdict.rejected.map((r) => `${r.email}=${r.reason}`),
+      });
+    }
+  }
+
+  if (!result.primary_email && accumulator.emails.size > 0) {
+    result.primary_email = [...accumulator.emails][0];
+  }
+  if (result.primary_email) {
+    const v = isBuyerEmail(result.primary_email, host);
+    if (!v.ok) {
+      result.fetch_log.push({
+        url: `email_quality_gate`,
+        status: 200,
+        via: 'filter',
+        cleared_primary: { email: result.primary_email, reason: v.reason },
+      });
+      result.primary_email = null;
+    }
+  }
+  if (!result.primary_phone && accumulator.phones.size > 0) {
+    result.primary_phone = [...accumulator.phones][0];
+  }
+  if (accumulator.whatsapps.size > 0) {
+    result.primary_whatsapp = [...accumulator.whatsapps][0];
+  }
+
+  const keptEmails = new Set([...accumulator.emails].map((e) => String(e).toLowerCase()));
+  for (const [key, c] of [...accumulator.channels.entries()]) {
+    if (c.type === 'email' && !keptEmails.has(String(c.value).toLowerCase())) {
+      accumulator.channels.delete(key);
+    }
+  }
+  for (const e of accumulator.emails) addChannel({ type: 'email', value: e, source: 'regex', confidence: 0.6 });
+  for (const p of accumulator.phones) addChannel({ type: 'phone', value: p, source: 'regex', confidence: 0.6 });
+  for (const w of accumulator.whatsapps) addChannel({ type: 'whatsapp', value: w, source: 'href', confidence: 0.85 });
+  result.channels = [...accumulator.channels.values()];
+
+  result.filled = Boolean(result.primary_email || result.primary_phone || result.primary_whatsapp);
+  _waterfallAgg.cost_units += result._cost_units;
+  if (result.filled) _waterfallAgg.filled += 1;
+  return result;
+}
+
 // ─── 主入口：enrichContactsForLead ───────────────────────────────────────
 /**
  * 给一个 lead 做联系方式兜底补全。
@@ -637,13 +858,47 @@ async function enrichContactsForLead(lead) {
     via: 'none',
     fetch_log: [],
     llm_persons: [],
+    // 开放渠道集合（不写死字段）：email/phone/whatsapp 之外的所有可达渠道
+    channels: [],
     any_blocked: false,
+    // B4 瀑布可观测：每层 attempted/hit/cost；_cost_units 累计本 lead 成本
+    waterfall: [],
+    _cost_units: 0,
+  };
+  _waterfallAgg.leads += 1;
+
+  const accumulator = {
+    emails: new Set(),
+    phones: new Set(),
+    whatsapps: new Set(),
+    channels: new Map(), // key `${type}::${value}` -> {type,value,source,confidence}
+  };
+  const accSize = () => accumulator.emails.size + accumulator.phones.size + accumulator.whatsapps.size;
+  const addChannel = (c) => {
+    if (!c || !c.type || !c.value) return;
+    const key = `${c.type}::${String(c.value).toLowerCase()}`;
+    if (!accumulator.channels.has(key)) accumulator.channels.set(key, c);
   };
 
   const rawDomain = String(lead.domain || '').trim();
   if (!rawDomain) {
-    result.via = 'no_domain';
-    return result;
+    // B2：无官网域名 → 若有社媒/主页 URL，走主页深抽取路径；否则 no_domain。
+    const profileUrls = collectProfileUrls(lead);
+    if (profileUrls.length === 0) {
+      result.via = 'no_domain';
+      return result;
+    }
+    await enrichFromProfileUrls(profileUrls, lead, result, accumulator);
+    // host：优先用主页里链出的官网域名做邮箱品牌门，否则留空（质量门自动放宽）。
+    let profHost = '';
+    for (const c of accumulator.channels.values()) {
+      if (c.type === 'website') {
+        try { profHost = new URL(c.value).hostname.replace(/^www\./, ''); } catch { /* ignore */ }
+        break;
+      }
+    }
+    if (result.via === 'none') result.via = 'profile';
+    return finalizeEnrich(result, accumulator, profHost);
   }
 
   // 归一域名为 hostname（去掉 https:// / 路径 / www. 前缀均可）
@@ -660,36 +915,36 @@ async function enrichContactsForLead(lead) {
   }
   host = host.replace(/^www\./, '');
 
-  const accumulator = {
-    emails: new Set(),
-    phones: new Set(),
-    whatsapps: new Set(),
-  };
-
   // ── ① + ② 阶段：首页 ───────────────────────────────────────────────
   const homeUrl = `https://${host}/`;
   const homeRes = await fetchHtml(homeUrl, { timeoutMs: 8000 });
   result.fetch_log.push({ url: homeUrl, status: homeRes.status, via: homeRes.via });
   let discoveredLinks = [];
+  let beforeHome = accSize();
   if (homeRes.ok) {
     const got = extractContactsFromHtmlV2(homeRes.html, homeRes.finalUrl);
     for (const e of got.emails) accumulator.emails.add(e);
     for (const p of got.phones) accumulator.phones.add(p);
     for (const w of got.whatsapps) accumulator.whatsapps.add(w);
+    for (const c of got.channels || []) addChannel(c);
     discoveredLinks = got.contactLinks;
     if (accumulator.emails.size > 0 || accumulator.phones.size > 0) result.via = 'home';
   } else if (homeRes.via === 'blocked') {
     result.any_blocked = true;
   }
+  _recordLayer(result, 'home', true, accSize() - beforeHome, homeRes.ok ? null : homeRes.via);
 
   // ── ③ 阶段：BFS contact 子页（即使首页已有也跑，能挖到更多角色邮箱） ─
+  const beforeBfs = accSize();
   await bfsContactPages(host, discoveredLinks, accumulator, { timeoutMs: 7000 });
+  _recordLayer(result, 'bfs', true, accSize() - beforeBfs, null);
   if (result.via === 'none' && (accumulator.emails.size > 0 || accumulator.phones.size > 0)) {
     result.via = 'bfs';
   }
 
   // ── ④ 阶段：LLM 兜底（仅静态全空时调用，控本） ────────────────────
   if (accumulator.emails.size === 0 && accumulator.phones.size === 0 && homeRes.ok) {
+    const beforeLlm = accSize();
     const visibleText = htmlToVisibleText(homeRes.html);
     const llm = await llmExtractContactFromText({
       visibleText,
@@ -710,12 +965,22 @@ async function enrichContactsForLead(lead) {
         }
       }
       if (accumulator.emails.size > 0 || accumulator.phones.size > 0) result.via = 'llm';
+    } else if (llm.reason === 'no_gemini_key') {
+      // 降级告警：未配 Gemini key → 文本 LLM 层名存实亡，命中率会塌陷
+      _waterfallAgg.degraded.llm_text_no_key += 1;
     }
+    _recordLayer(result, 'llm_text', true, accSize() - beforeLlm, llm.ok ? null : (llm.reason || 'llm_miss'));
   }
 
   // ── ⑤ 阶段：Vision 截图抽取兜底（ADV-2，仅当文本 LLM 也空 + 截图能力可用） ─
   // capability_missing（无 SCREENSHOTONE_API_KEY）静默跳过，保留 ⑥ Serper 兜底机会
   if (accumulator.emails.size === 0 && accumulator.phones.size === 0) {
+    const beforeVision = accSize();
+    // B6-route 单条成本预算：视觉层最贵（5u），将超预算则跳过，避免单条 lead 成本失控。
+    if (result._cost_units + WATERFALL_LAYER_COST.vision > CONTACT_ENRICH_COST_BUDGET) {
+      result.fetch_log.push({ url: homeUrl, status: 0, via: 'vision_cost_budget_skip' });
+      _recordLayer(result, 'vision', false, 0, 'cost_budget_exceeded');
+    } else {
     let pageScreenshot;
     try {
       // 延迟 require，避免 Render worker 启动时 v8_lib_page_screenshot 找不到也阻塞主流程
@@ -766,69 +1031,32 @@ async function enrichContactsForLead(lead) {
       } catch {
         result.fetch_log.push({ url: homeUrl, status: 0, via: 'vision_exception' });
       }
+      _recordLayer(result, 'vision', true, accSize() - beforeVision, null);
     } else {
       result.fetch_log.push({ url: homeUrl, status: 0, via: 'vision_capability_missing' });
+      _waterfallAgg.degraded.vision_no_capability += 1;
+      _recordLayer(result, 'vision', false, 0, 'capability_missing');
     }
+    } // end cost-budget else (B6-route)
   }
 
   // ── ⑥ 阶段：Serper 同域名邮箱搜索（仍然全空时的最后一搏） ──────────
   if (accumulator.emails.size === 0 && accumulator.phones.size === 0) {
+    const beforeSerper = accSize();
+    const serperKeyMissing = !(process.env.SERPER_API_KEY || '').trim();
     const serper = await serperFallbackForDomain(host, lead.company_name);
     for (const e of serper.emails) accumulator.emails.add(e);
     if (accumulator.emails.size > 0) result.via = 'serper';
+    if (serperKeyMissing) _waterfallAgg.degraded.serper_no_key += 1;
+    _recordLayer(result, 'serper', true, accSize() - beforeSerper, serperKeyMissing ? 'no_serper_key' : null);
   }
 
-  // ── ⑦ 收口：B2B 买家邮箱质量裁判（双仓镜像；2026-05-23 加） ──────────
+  // ── ⑦ 收口：B2B 买家邮箱质量裁判 + primary_* 回填 + 开放渠道对齐 ──────────
   // 5 层 BFS / Serper / LLM 可能抓回 support@bebee.com / chairman@sec.gov /
-  // jane.doe@... 这种 placeholder/aggregator/政府/媒体邮箱 — 历史上质量门只看
-  // lead.domain 漏掉这一类，本回放到收口处用 filterBuyerEmails 二次过滤：
-  //   · accepted    — 同主域 or 免费邮箱（warn）
-  //   · rejected    — placeholder / aggregator / brand mismatch
-  // 全 reject 时 primary_email 一律置 null，filled 退化为 phone-only 或全 false。
-  if (accumulator.emails.size > 0) {
-    const verdict = filterBuyerEmails([...accumulator.emails], host);
-    accumulator.emails = new Set(verdict.accepted);
-    result.email_filter = {
-      total_collected: verdict.accepted.length + verdict.rejected.length + verdict.warnings.length,
-      accepted: verdict.accepted.length,
-      warnings: verdict.warnings,
-      rejected: verdict.rejected,
-    };
-    if (verdict.rejected.length > 0) {
-      result.fetch_log.push({
-        url: `email_quality_gate`,
-        status: 200,
-        via: 'filter',
-        dropped: verdict.rejected.map((r) => `${r.email}=${r.reason}`),
-      });
-    }
-  }
-
-  // 写回结果（按优先级：原 lead 已有的不覆盖；mailto/tel 类源在 extractContactsFromHtmlV2 已排序过）
-  if (!result.primary_email && accumulator.emails.size > 0) {
-    result.primary_email = [...accumulator.emails][0];
-  }
-  // 已有 primary_email 但本轮过滤把它毙了 → 也清空，避免下游用旧 placeholder
-  if (result.primary_email) {
-    const v = isBuyerEmail(result.primary_email, host);
-    if (!v.ok) {
-      result.fetch_log.push({
-        url: `email_quality_gate`,
-        status: 200,
-        via: 'filter',
-        cleared_primary: { email: result.primary_email, reason: v.reason },
-      });
-      result.primary_email = null;
-    }
-  }
-  if (!result.primary_phone && accumulator.phones.size > 0) {
-    result.primary_phone = [...accumulator.phones][0];
-  }
-  if (accumulator.whatsapps.size > 0) {
-    result.primary_whatsapp = [...accumulator.whatsapps][0];
-  }
-  result.filled = Boolean(result.primary_email || result.primary_phone || result.primary_whatsapp);
-  return result;
+  // jane.doe@... 这种 placeholder/aggregator/政府/媒体邮箱 — finalizeEnrich 内
+  // 用 filterBuyerEmails 二次过滤；全 reject 时 primary_email 置 null。
+  // （收口逻辑抽到 finalizeEnrich，与 B2 no-domain 主页路径共用单源。）
+  return finalizeEnrich(result, accumulator, host);
 }
 
 module.exports = {
@@ -839,6 +1067,12 @@ module.exports = {
   llmExtractContactFromImage,
   serperFallbackForDomain,
   enrichContactsForLead,
+  // B2：社媒主页深抽取（导出供单测）
+  collectProfileUrls,
+  enrichFromProfileUrls,
+  finalizeEnrich,
+  getEnricherWaterfallStats,
+  resetEnricherWaterfallStats,
   htmlToVisibleText,
   // 内部工具（暴露用于测试）
   isLikelyValidEmail,

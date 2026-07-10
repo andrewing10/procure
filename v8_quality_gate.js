@@ -335,7 +335,7 @@ function getHost(raw) {
  * @param {string} [params.primaryEmail] — 可选：辅助 MED 协会判定（local-part 比对 ASSOC_EMAIL_LOCAL_RE）
  * @param {string} [params.category]    — 可选：搜索品类，用于卖方 MED 档双重锁检测
  */
-function inferEntityType({ domain, snippet, companyName, primaryEmail, category }) {
+function inferEntityType({ domain, snippet, companyName, primaryEmail, category, supplierMode }) {
     const host = getHost(domain);
     const name = companyName || '';
     const snip = snippet || '';
@@ -363,11 +363,16 @@ function inferEntityType({ domain, snippet, companyName, primaryEmail, category 
     }
 
     // 4. 卖方伪装检测（制造商、货运、信息服务）
-    //    4a. HIGH: snippet 第一人称声明自己是制造/生产商（不需要 category）
-    if (SELLER_SNIPPET_SELF_DECLARE_RE.test(snip)) return 'aggregator';
+    //    ⚠ 4a/4b 是「找买家」方向专属过滤：把自称制造商/生产商的卖家剔除出买家池。
+    //    供应商模式（find_suppliers）下我们正想要这些制造商/工厂/出口商，必须跳过，
+    //    否则 evaluateLeadSupplier 委托 evaluateLead 时会把目标供应商误判为 aggregator。
+    if (!supplierMode) {
+        //    4a. HIGH: snippet 第一人称声明自己是制造/生产商（不需要 category）
+        if (SELLER_SNIPPET_SELF_DECLARE_RE.test(snip)) return 'aggregator';
 
-    //    4b. MED: 公司名含制造角色词 + ≥2 个品类关键词共现（需 category 联动）
-    if (hasSellerNameCategoryMatch(name, category || null)) return 'aggregator';
+        //    4b. MED: 公司名含制造角色词 + ≥2 个品类关键词共现（需 category 联动）
+        if (hasSellerNameCategoryMatch(name, category || null)) return 'aggregator';
+    }
 
     //    4c. 精确物流商（"freight forwarder" / "customs broker" 等精确短语）
     if (LOGISTICS_SPECIFIC_RE.test(name) || LOGISTICS_SPECIFIC_RE.test(snip)) return 'aggregator';
@@ -748,6 +753,9 @@ const REJECT_REASONS = Object.freeze({
  */
 function evaluateLead(lead, opts) {
     const category = opts && opts.category != null ? String(opts.category) : null;
+    // supplierMode：find_suppliers 方向下跳过 inferEntityType 的卖方伪装降级（4a/4b），
+    // 因为制造商/工厂/出口商正是目标，不应被当 aggregator 剔除。
+    const supplierMode = Boolean(opts && opts.supplierMode);
 
     // ─── A 公司名级 ────────────────────────────────────────────────────
     if (!lead || !lead.company_name) {
@@ -779,6 +787,7 @@ function evaluateLead(lead, opts) {
         companyName: lead.company_name,
         primaryEmail: lead.primary_email || null,
         category: category || null,
+        supplierMode,
     });
     if (entityType === 'social') {
         return { qualified: false, grade: 'unqualified', reason: REJECT_REASONS.ENTITY_TYPE_SOCIAL };
@@ -918,7 +927,7 @@ function evaluateLeadSupplier(lead, category, negativeKeywords) {
     const isSupplierSignal = SUPPLIER_POSITIVE_RE.test(text);
 
     // ── 纯目录/协会（供应商模式下仍排除）────────────────────────────────────────
-    const domainEntityType = inferEntityType({ domain: lead.domain, snippet: lead.snippet, companyName: lead.company_name, category });
+    const domainEntityType = inferEntityType({ domain: lead.domain, snippet: lead.snippet, companyName: lead.company_name, category, supplierMode: true });
     const isDirectory = domainEntityType === 'aggregator' && !isSupplierSignal;
 
     if (isDirectory) {
@@ -926,7 +935,9 @@ function evaluateLeadSupplier(lead, category, negativeKeywords) {
     }
 
     // ── 委托买家评分函数处理其余字段（联系方式/域名/垃圾检测等） ────────────────
-    const base = evaluateLead(lead, category);
+    // 签名对齐：evaluateLead 第二参为 opts 对象 { category }（旧代码传字符串 → 豁免失效）。
+    // supplierMode:true 让委托调用跳过卖方伪装降级，保住目标制造商/工厂/出口商。
+    const base = evaluateLead(lead, { category, supplierMode: true });
     if (!base.qualified) return base;
 
     // 有供应商信号 → 升级 qualified → premium（等同于「高置信目标」）

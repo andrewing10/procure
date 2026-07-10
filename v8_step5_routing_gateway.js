@@ -161,10 +161,23 @@ const TARGET_COUNTRY_ISO = String(process.env.DISCOVERY_COUNTRY_ISO || '').toUpp
 // 比 industry_match 更强、更直接。
 //
 // REVERSE_VERIFY_MODE：
-//   strict   → 丢 low + none（默认在 default category 时启用，建议生产）
+//   strict   → 丢 low + none（设计建议生产值；切默认前必须先 A/B，见下）
 //   balanced → 仅丢 none
 //   off      → 不拦截（用户取消反向验证、调试用）
-const REVERSE_VERIFY_MODE = String(process.env.REVERSE_VERIFY_MODE || 'balanced').toLowerCase();
+//
+// RC-2/RC-3（2026-06-19，设计单源 §B3）：默认已切 strict —— 业主授权直接落地。
+// strict = 丢 reverse-verify low+none（设计推荐生产值），反向验证是"该公司是否会买此品类"
+// 的最强、最直接信号，比 industry_match 更可靠，故作为主闸门收紧到 strict。
+// 仍保留两个逐 job 杠杆用于回退 / 进一步收紧：
+//   REVERSE_VERIFY_MODE=balanced           逐 job 回退到只丢 none（信息薄/小众品类临时放宽）
+//   REVERSE_VERIFY_INCLUDE_UNSET=1         strict 下把 L3 失败(unset) 也按 low 处理（RC-2b，更激进，默认关）
+// 一致性约定（RC-3）：ICP_MATCH_THRESHOLD 维持 soft（轻闸门），由 strict 反向验证担任主质量闸门，
+//   避免两道闸门同时收紧造成对小众真买家的双重误杀。
+const REVERSE_VERIFY_MODE = String(process.env.REVERSE_VERIFY_MODE || 'strict').toLowerCase();
+// RC-2b 杠杆：strict 模式下是否把 unset（L3 未产出反向验证）也判失败丢弃。默认关。
+const REVERSE_DROP_UNSET =
+  REVERSE_VERIFY_MODE === 'strict' &&
+  /^(1|true|yes|on)$/i.test(String(process.env.REVERSE_VERIFY_INCLUDE_UNSET || ''));
 const reverseStats = { high: 0, medium: 0, low: 0, none: 0, unset: 0 };
 const TARGET_CATEGORY_FROM_ENV = String(process.env.DISCOVERY_CATEGORY || '').trim();
 
@@ -228,8 +241,15 @@ const validLeads = leads
     // 2026-05-23：传 category（DISCOVERY_CATEGORY）启用 CATEGORY_B2C_WHITELIST，
     //   面粉→bakery / 化妆品→spa / 海鲜→restaurant 等真买家不再被一刀切；
     //   见 v8_quality_gate.js BIZ_ANTI_GROUPS + CATEGORY_B2C_WHITELIST 双仓镜像段。
-    const evalFn = IS_SUPPLIER_MODE ? evaluateLeadSupplier : evaluateLead;
-    const { qualified, grade } = evalFn(lead, TARGET_CATEGORY_FROM_ENV, NEGATIVE_KEYWORDS);
+    // 根因修复（数据质量）：evaluateLead 的第二参是 opts 对象 { category }，
+    // 旧代码 evalFn(lead, "<category string>", ...) 让 opts.category=undefined → category=null
+    // → CATEGORY_B2C_WHITELIST 豁免在生产买家路径整段失效（面粉→bakery / 海鲜→restaurant /
+    // 化妆品→spa 真买家被 biz_type_blacklisted 误杀）。回归脚本用对象签名调用所以一直全过，
+    // 掩盖了该 caller bug。evaluateLeadSupplier 用位置参 (lead, category, negativeKeywords)，
+    // 各自按正确签名分支调用。
+    const { qualified, grade } = IS_SUPPLIER_MODE
+      ? evaluateLeadSupplier(lead, TARGET_CATEGORY_FROM_ENV, NEGATIVE_KEYWORDS)
+      : evaluateLead(lead, { category: TARGET_CATEGORY_FROM_ENV });
 
     // ── 业态画像树反向验证闸门 ───────────────────────────────────────────────
     // 仅在用户输入了 TARGET_CATEGORY 且 REVERSE_VERIFY_MODE != 'off' 时生效。
@@ -250,7 +270,9 @@ const validLeads = leads
       reverseStats[rm] += 1;
       const reverseDrop =
         (REVERSE_VERIFY_MODE === 'strict'   && (rm === 'low' || rm === 'none')) ||
-        (REVERSE_VERIFY_MODE === 'balanced' && rm === 'none');
+        (REVERSE_VERIFY_MODE === 'balanced' && rm === 'none') ||
+        // RC-2b：strict + REVERSE_VERIFY_INCLUDE_UNSET=1 时，L3 失败也按 low 处理
+        (REVERSE_DROP_UNSET && rm === 'unset');
       if (reverseDrop) {
         lead._quality_grade = 'unqualified';
         lead.reject_codes = Array.isArray(lead.reject_codes)
@@ -265,8 +287,17 @@ const validLeads = leads
       }
       if (rm === 'medium' || rm === 'low') lead.needs_human_review = true;
     } else if (TARGET_CATEGORY_FROM_ENV && !isSeedSource && !IS_SUPPLIER_MODE) {
-      // L3 没填反向验证（SKIP_L3_INFERENCE 或 LLM 失败）→ 计入 unset，不拦截
+      // L3 没填反向验证（SKIP_L3_INFERENCE 或 LLM 失败）→ 计入 unset。
+      // RC-2b：strict + REVERSE_VERIFY_INCLUDE_UNSET=1 时按 low 处理并丢弃；否则不拦截（默认）。
       reverseStats.unset += 1;
+      if (REVERSE_DROP_UNSET) {
+        lead._quality_grade = 'unqualified';
+        lead.reject_codes = Array.isArray(lead.reject_codes)
+          ? [...lead.reject_codes, 'REVERSE_VERIFY_FAIL']
+          : ['REVERSE_VERIFY_FAIL'];
+        gradeStats.unqualified = (gradeStats.unqualified || 0) + 1;
+        return false;
+      }
     }
 
     gradeStats[grade] = (gradeStats[grade] || 0) + 1;
