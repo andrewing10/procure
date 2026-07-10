@@ -96,6 +96,11 @@ services:
       # Step2 后只对最好的 N 条跑 Step3；溢出轻量入库排后展示
       - key: ENRICH_TOP_N
         value: "30"
+      # L3 批次过大易 JSON 截断；8 更稳
+      - key: BOM_BATCH_SIZE
+        value: "8"
+      - key: L3_CONCURRENCY
+        value: "4"
       # ── P1-D：原子领单 + cancel LISTEN ──
       - key: DATABASE_URL
         sync: false

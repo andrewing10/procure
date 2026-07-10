@@ -22,6 +22,17 @@ const INTENT_SCORE = {
 
 const MATCH_SCORE = { high: 40, medium: 22, low: 8, none: 0 };
 
+/** 标题/公司名像文档、指南、聚合页而非买家公司 */
+const JUNK_TITLE_RE =
+  /\[?\s*pdf\s*\]?|glossary|guidelines?\b|shipping policy|terms of sale|citizen petition|api\s*docs?|developer docs|importing into the|country requirements|trade facilitation act|comprehensive overview|market size|cagr of|job(s)?\b|vacancies|work from home|wikipedia|how to\b|what is\b|meaning of\b/i;
+
+/** 域名像目录站 / 媒体 / 占位，而非公司官网 */
+const JUNK_HOST_RE =
+  /\b(seair\.co\.in|importinfo\.com|importyeti\.com|volza\.com|panjiva\.com|trademo\.com|usetorg\.com|indexbox\.io|govtrack\.us|zoom\.us|example\.com|wixpress\.com|sentry-next|freepik|shutterstock)\b/i;
+
+const PLACEHOLDER_EMAIL_RE =
+  /^(user@example\.com|user@domain\.com|info@domain\.com|xxx@organisation\.com|noreply@|no-reply@)/i;
+
 function intentBoost(signal) {
   const key = String(signal || '').toUpperCase();
   if (INTENT_SCORE[key] != null) return INTENT_SCORE[key];
@@ -46,9 +57,47 @@ function hasUsableDomain(d) {
   return /[a-z]/.test(cleaned) || /^[\d.]+$/.test(cleaned);
 }
 
+function hostOf(lead) {
+  const raw = String(lead?.domain || lead?.link || lead?.source_url || '').trim();
+  if (!raw) return '';
+  try {
+    const href = raw.startsWith('http') ? raw : `http://${raw}`;
+    return new URL(href).hostname.replace(/^www\./, '').toLowerCase();
+  } catch {
+    return raw.toLowerCase().replace(/^www\./, '').split('/')[0];
+  }
+}
+
+/**
+ * 垃圾/非买家惩罚（负分）。把 PDF 指南、聚合站、占位邮箱等压出 Top-N。
+ */
+function junkPenalty(lead) {
+  if (!lead || typeof lead !== 'object') return 0;
+  let pen = 0;
+  const title = `${lead.company_name || ''} ${lead.snippet || ''} ${lead.title || ''}`;
+  const host = hostOf(lead);
+  const pathHint = String(lead.link || lead.source_url || lead.domain || '').toLowerCase();
+
+  if (JUNK_TITLE_RE.test(title)) pen += 35;
+  if (/\.pdf(\?|#|$)/i.test(pathHint) || /\[pdf\]/i.test(title)) pen += 25;
+  if (host && JUNK_HOST_RE.test(host)) pen += 40;
+  if (PLACEHOLDER_EMAIL_RE.test(String(lead.primary_email || lead.phone || ''))) pen += 30;
+  // 纯国家代码 / 过短公司名（如 "SG"、"+ SG"）
+  const name = String(lead.company_name || '').trim();
+  if (name.length > 0 && name.length <= 3) pen += 25;
+  if (/^(sg|us|uk|jp|cn)\b/i.test(name) && name.length < 12 && !/\b(inc|ltd|llc|corp|co)\b/i.test(name)) {
+    pen += 15;
+  }
+  // 无可用域名且无电话 → 富化价值低
+  if (!hasUsableDomain(lead.domain) && !(lead.phone || lead.primary_phone) && !lead.place_id) {
+    pen += 12;
+  }
+  return pen;
+}
+
 /**
  * 预富化排序分（0–100 量级）。Step3 前尚无 confidence_score / L3，
- * 用 industry_match + 信号源 + pillar + 域名/电话等可观测字段。
+ * 用 industry_match + 信号源 + pillar + 域名/电话等可观测字段，并扣垃圾分。
  */
 function preEnrichRankScore(lead) {
   if (!lead || typeof lead !== 'object') return 0;
@@ -66,7 +115,9 @@ function preEnrichRankScore(lead) {
   if (lead.source_url || lead.link) score += 3;
   if (Array.isArray(lead.social_profile_urls) && lead.social_profile_urls.length) score += 4;
 
-  return Math.min(100, Math.round(score));
+  score -= junkPenalty(lead);
+
+  return Math.max(0, Math.min(100, Math.round(score)));
 }
 
 function compareLeads(a, b) {
@@ -146,4 +197,5 @@ module.exports = {
   readEnrichTopNFromEnv,
   materializeOverflowLead,
   hasUsableDomain,
+  junkPenalty,
 };

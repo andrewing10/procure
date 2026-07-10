@@ -68,10 +68,12 @@ async function enqueueDeferredContacts(supabase, leads, discoveryJobId = null) {
  * 乐观 claim：pending → processing（多 worker 下可能少量重复，可接受）。
  */
 async function claimEnrichmentBatch(supabase, batchSize = BATCH_SIZE) {
+  // 跳过已达重试上限的行；retry_count 为 null 视为 0
   const { data: pending, error } = await supabase
     .from('discovery_enrichment_queue')
     .select('id, discovery_job_id, company_name, domain, country_iso, payload_json, retry_count')
     .eq('status', 'pending')
+    .or(`retry_count.is.null,retry_count.lt.${MAX_RETRIES}`)
     .order('created_at', { ascending: true })
     .limit(batchSize);
 
@@ -109,7 +111,14 @@ async function markQueueRow(supabase, id, status, errorMessage = null) {
       .eq('id', id)
       .maybeSingle();
     patch.retry_count = Number(data?.retry_count ?? 0) + 1;
-    if (patch.retry_count < MAX_RETRIES) {
+    const msg = String(errorMessage || '');
+    // no_contact / 垃圾域名：立刻死信，禁止 4s 无限重试空转
+    const deadNow =
+      /no_contact/i.test(msg) ||
+      /unusable_domain|garbage.?host|no.?usable.?domain/i.test(msg);
+    if (deadNow || patch.retry_count >= MAX_RETRIES) {
+      patch.status = 'failed';
+    } else {
       patch.status = 'pending';
     }
   }

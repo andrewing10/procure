@@ -57,7 +57,8 @@ const PLAYWRIGHT_TIMEOUT  = parseInt(process.env.PLAYWRIGHT_TIMEOUT || '10000', 
 //   STEP3_PAGE_CONCURRENCY           → Playwright contact extraction parallelism
 // batch size 减小到 5（默认）：更短 prompt = Gemini 响应更快，减少超时率
 // 如需高吞吐可在 .env 中设 BOM_BATCH_SIZE=10（需稳定的 Gemini Pro 配额）
-const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '5',  10));
+// 默认 8：15 时 Gemini 常截断 JSON → Claude 兜底（+30–40s/batch）
+const BOM_BATCH_SIZE        = Math.max(1, parseInt(process.env.BOM_BATCH_SIZE || '8',  10));
 const L3_CONCURRENCY        = Math.max(1, parseInt(process.env.L3_CONCURRENCY || '3',  10));
 // L3 timeout 提升到 60s：gemini-2.5-flash 通常 10-20s，但高负载时可达 50s+
 const L3_TIMEOUT_MS         = Math.max(5_000, parseInt(process.env.L3_TIMEOUT_MS || '60000', 10));
@@ -246,16 +247,19 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
             return;
         }
 
-        const results = Array.isArray(parsed?.results) ? parsed.results : [];
+        const results = Array.isArray(parsed?.results)
+            ? parsed.results
+            : (Array.isArray(parsed) ? parsed : []);
         const now = new Date().toISOString();
         // 归一化比较：去除多余空格、大小写统一，防止 Gemini 返回名称与原始名称
         // 细微差异（首字母大写/尾部空格）导致 find 失败，inference_breakdown 丢失。
         const normName = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+        const usedLeadIdx = new Set();
         let merged = 0;
-        for (const r of results) {
-            const rNorm = normName(r.name);
-            const lead = batch.find(l => normName(l.company_name) === rNorm);
-            if (!lead) continue;
+        let nameMiss = 0;
+
+        const applyL3Result = (lead, r) => {
+            if (!lead || !r || typeof r !== 'object') return false;
             lead.entity_role = r.entity_role || 'Service';
             lead.inferred_bom = Array.isArray(r.primary_materials_top3)
                 ? r.primary_materials_top3.map(s => String(s).trim().toLowerCase())
@@ -316,9 +320,62 @@ Input: ${JSON.stringify(batch.map(l => ({ name: l.company_name, snip: (l.snippet
                 inferred_bom: lead.inferred_bom,
                 inference_breakdown: lead.inference_breakdown,
             });
-            merged += 1;
+            return true;
+        };
+
+        for (let ri = 0; ri < results.length; ri++) {
+            const r = results[ri];
+            if (!r || typeof r !== 'object') continue;
+            // LLM 偶发用 company_name 而非 name
+            if (!r.name && (r.company_name || r.company)) {
+                r.name = r.company_name || r.company;
+            }
+            const rNorm = normName(r.name);
+            let leadIdx = batch.findIndex(
+                (l, i) => !usedLeadIdx.has(i) && normName(l.company_name) === rNorm,
+            );
+            // 名称对不上时：同序位兜底（LLM 常改写/截断公司名导致 find 全 miss → merged 0）
+            if (leadIdx < 0 && ri < batch.length && !usedLeadIdx.has(ri)) {
+                leadIdx = ri;
+                nameMiss += 1;
+            }
+            if (leadIdx < 0) continue;
+            if (applyL3Result(batch[leadIdx], r)) {
+                usedLeadIdx.add(leadIdx);
+                merged += 1;
+            }
         }
-        console.log(`[step3] L3 batch ${batchIndex}/${batchTotal} merged ${merged}/${batch.length} (${Date.now() - startedAt}ms)`);
+
+        // 仍有空位且 results 更短：按 index 把剩余 result 填到未占用 lead（极少见）
+        if (merged === 0 && results.length > 0) {
+            console.warn(
+                `[step3] L3 batch ${batchIndex}/${batchTotal}: name-match all missed; ` +
+                `results=${results.length} sample_names=${JSON.stringify(results.slice(0, 3).map((x) => x?.name))} ` +
+                `batch_names=${JSON.stringify(batch.slice(0, 3).map((l) => l.company_name))}`,
+            );
+            for (let i = 0; i < Math.min(results.length, batch.length); i++) {
+                if (usedLeadIdx.has(i)) continue;
+                if (applyL3Result(batch[i], results[i])) {
+                    usedLeadIdx.add(i);
+                    merged += 1;
+                    nameMiss += 1;
+                }
+            }
+        } else if (results.length === 0) {
+            const keys = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+                ? Object.keys(parsed).slice(0, 8)
+                : [];
+            console.warn(
+                `[step3] L3 batch ${batchIndex}/${batchTotal}: empty results ` +
+                `(parsed_type=${Array.isArray(parsed) ? 'array' : typeof parsed}, keys=${JSON.stringify(keys)})`,
+            );
+        }
+
+        console.log(
+            `[step3] L3 batch ${batchIndex}/${batchTotal} merged ${merged}/${batch.length}` +
+            (nameMiss ? ` (index_fallback=${nameMiss})` : '') +
+            ` (${Date.now() - startedAt}ms)`,
+        );
     }, { concurrency: L3_CONCURRENCY });
 
     flushL3Cache();

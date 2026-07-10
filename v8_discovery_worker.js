@@ -569,23 +569,33 @@ async function lane(laneId) {
   }
 }
 
+// ENRICH_IDLE_IN_DISCOVERY_WORKER=0（默认）时不抢 enrichment 队列，交给 dedicated enrich worker。
+// 旧逻辑无条件 processEnrichmentBatch → 与 procure-enrichment 双跑，出现 .tmp_eq_out_ 空转。
+const ENRICH_IDLE_IN_DISCOVERY =
+  String(process.env.ENRICH_IDLE_IN_DISCOVERY_WORKER || '0').trim() === '1';
+
 /**
- * 单例后台维护循环：心跳 + 释放 stale 认领 + enrichment_queue。
+ * 单例后台维护循环：心跳 + 释放 stale 认领；可选 enrichment_queue。
  * 这些是全局性工作，只跑一份，不随并发车道数翻倍。
  */
 async function housekeeping() {
+  if (!ENRICH_IDLE_IN_DISCOVERY) {
+    console.log('[worker] enrichment_queue idle consume OFF (ENRICH_IDLE_IN_DISCOVERY_WORKER!=1)');
+  }
   while (true) {
     try {
       // Heartbeat so admin panel shows last-seen time.
       await writeHeartbeat();
       await releaseStaleClaims(supabase, 900);
-      try {
-        const eq = await processEnrichmentBatch(supabase, 5);
-        if (eq.processed > 0) {
-          console.log(`[worker] enrichment_queue processed=${eq.processed}`);
+      if (ENRICH_IDLE_IN_DISCOVERY) {
+        try {
+          const eq = await processEnrichmentBatch(supabase, 5);
+          if (eq.processed > 0) {
+            console.log(`[worker] enrichment_queue processed=${eq.processed}`);
+          }
+        } catch (e) {
+          console.warn('[worker] enrichment_queue tick failed:', e?.message || e);
         }
-      } catch (e) {
-        console.warn('[worker] enrichment_queue tick failed:', e?.message || e);
       }
     } catch (e) {
       console.error('[worker] housekeeping error:', e instanceof Error ? e.message : e);

@@ -60,8 +60,11 @@ async function processEnrichmentBatch(supabase, limit = 5) {
       });
       const enriched = JSON.parse(fs.readFileSync(outFile, 'utf8'));
       const hit = Array.isArray(enriched) && enriched.some((l) => l.primary_email || l.primary_phone);
+      const retries = Number(row.retry_count || 0) + (hit ? 0 : 1);
+      // no_contact：直接 failed 死信，不再回 pending（避免 4s 空转）
       await supabase.from('discovery_enrichment_queue').update({
         status: hit ? 'done' : 'failed',
+        retry_count: hit ? Number(row.retry_count || 0) : retries,
         error_message: hit ? null : 'no_contact_found',
         updated_at: new Date().toISOString(),
       }).eq('id', row.id);
